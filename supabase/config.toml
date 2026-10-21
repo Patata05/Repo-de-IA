@@ -1,0 +1,8 @@
+# Configuración del proyecto Supabase
+project_id = "inventario-oficina"
+
+[db]
+port = 54322
+
+[db.migrations]
+enabled = true
