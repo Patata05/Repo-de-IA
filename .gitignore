@@ -5,3 +5,5 @@ out
 .env
 .env.local
 .env*.local
+
+*.tsbuildinfo

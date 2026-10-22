@@ -39,6 +39,56 @@ function colorFor(name: string) {
   return AVATAR_COLORS[total % AVATAR_COLORS.length];
 }
 
+function formatWhen(value: string | null | undefined) {
+  if (!value) return "Sin fecha";
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return "Sin fecha";
+  return new Intl.DateTimeFormat("es-MX", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(time);
+}
+
+function earliest(values: Array<string | null | undefined>) {
+  const times = values.map((value) => Date.parse(value ?? "")).filter((time) => Number.isFinite(time));
+  if (!times.length) return null;
+  return new Date(Math.min(...times)).toISOString();
+}
+
+function latest(values: Array<string | null | undefined>) {
+  const times = values.map((value) => Date.parse(value ?? "")).filter((time) => Number.isFinite(time));
+  if (!times.length) return null;
+  return new Date(Math.max(...times)).toISOString();
+}
+
+function buildInventoryCards(rows: InventarioRow[]) {
+  const byOrigin = new Map<string, InventarioRow[]>();
+  for (const row of rows) {
+    const origen = textOf(row.origen);
+    if (!/^Inventario \d+$/i.test(origen)) continue;
+    const name = origen.replace(/^inventario/i, "Inventario");
+    byOrigin.set(name, [...(byOrigin.get(name) ?? []), row]);
+  }
+
+  const groups = byOrigin.size
+    ? [...byOrigin.entries()].sort(
+        (a, b) => Number(a[0].match(/\d+/)?.[0] ?? 0) - Number(b[0].match(/\d+/)?.[0] ?? 0),
+      )
+    : [1, 2, 3].map((number, index) => {
+        const size = Math.max(1, Math.ceil(rows.length / 3));
+        return [`Inventario ${number}`, rows.slice(index * size, (index + 1) * size)] as const;
+      });
+
+  return groups.map(([name, slice]) => ({
+    name,
+    created: formatWhen(earliest(slice.map((row) => row.created_at))),
+    updated: formatWhen(latest(slice.map((row) => row.updated_at))),
+  }));
+}
+
 function buildFolders(rows: InventarioRow[], by: "persona" | "area"): FolderCard[] {
   const groups = new Map<string, InventarioRow[]>();
   for (const row of rows) {
@@ -165,7 +215,7 @@ function SideRail({
           >
             <span className="rail-notch-clip">
               <svg className="rail-notch" viewBox="0 0 76 108" preserveAspectRatio="none">
-                <path fill="#ffffff" />
+                <path />
               </svg>
             </span>
             <span className="rail-bubble" />
@@ -229,6 +279,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [rail, setRail] = useState("inventario");
   const [draft, setDraft] = useState("");
   const [infoOpen, setInfoOpen] = useState(false);
+  const [dark, setDark] = useState(false);
   const [messages, setMessages] = useState<Array<{ id: number; from: "bot" | "user"; text: string }>>([
     {
       id: 1,
@@ -242,6 +293,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const tableRef = useRef<HTMLDivElement>(null);
   const personFolders = useMemo(() => buildFolders(rows, "persona"), [rows]);
   const areaFolders = useMemo(() => buildFolders(rows, "area"), [rows]);
+  const inventoryCards = useMemo(() => buildInventoryCards(rows), [rows]);
   const folders = rail === "areas" ? areaFolders : personFolders;
   const featuredId = selectedId ?? folders[0]?.id ?? "";
 
@@ -257,40 +309,64 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   }, [folders, query, rail, rows, selectedId]);
 
   useEffect(() => {
-    const nodes = [quickRef.current, tableRef.current].filter((node): node is HTMLDivElement => Boolean(node));
-    const cleanups = nodes.map((el) => {
-      let target = el.scrollLeft;
+    const saved = window.localStorage.getItem("inventario-tema") === "oscuro";
+    document.documentElement.classList.toggle("theme-dark", saved);
+    setDark(saved);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("theme-dark", dark);
+  }, [dark]);
+
+  const toggleDark = () => {
+    setDark((current) => {
+      const next = !current;
+      window.localStorage.setItem("inventario-tema", next ? "oscuro" : "claro");
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    const bindings: Array<[HTMLElement | null | undefined, HTMLElement | null | undefined]> = [
+      [quickRef.current, quickRef.current],
+      [tableRef.current?.querySelector("thead") as HTMLElement | null, tableRef.current],
+    ];
+    const cleanups = bindings.flatMap(([wheelTarget, scrollTarget]) => {
+      if (!wheelTarget || !scrollTarget) return [];
+      let target = scrollTarget.scrollLeft;
       let frame = 0;
 
       const tick = () => {
-        const diff = target - el.scrollLeft;
+        const diff = target - scrollTarget.scrollLeft;
         if (Math.abs(diff) < 0.6) {
-          el.scrollLeft = target;
+          scrollTarget.scrollLeft = target;
           frame = 0;
           return;
         }
-        el.scrollLeft += diff * 0.14;
+        scrollTarget.scrollLeft += diff * 0.14;
         frame = window.requestAnimationFrame(tick);
       };
 
       const onWheel = (event: WheelEvent) => {
-        if (el.scrollWidth <= el.clientWidth) return;
+        if (scrollTarget.scrollWidth <= scrollTarget.clientWidth) return;
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
         if (!delta) return;
-        const max = el.scrollWidth - el.clientWidth;
-        if (!frame) target = el.scrollLeft;
+        const max = scrollTarget.scrollWidth - scrollTarget.clientWidth;
+        if (!frame) target = scrollTarget.scrollLeft;
         const next = Math.min(max, Math.max(0, target + delta));
-        if (next === target && next === el.scrollLeft) return;
+        if (next === target && next === scrollTarget.scrollLeft) return;
         target = next;
         if (!frame) frame = window.requestAnimationFrame(tick);
         event.preventDefault();
       };
 
-      el.addEventListener("wheel", onWheel, { passive: false });
-      return () => {
-        el.removeEventListener("wheel", onWheel);
-        if (frame) window.cancelAnimationFrame(frame);
-      };
+      wheelTarget.addEventListener("wheel", onWheel, { passive: false });
+      return [
+        () => {
+          wheelTarget.removeEventListener("wheel", onWheel);
+          if (frame) window.cancelAnimationFrame(frame);
+        },
+      ];
     });
     return () => cleanups.forEach((cleanup) => cleanup());
   }, [rail]);
@@ -369,6 +445,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             aria-label="Buscar en el inventario"
           />
         </form>
+        <button
+          type="button"
+          className={dark ? "theme-switch is-on" : "theme-switch"}
+          aria-pressed={dark}
+          aria-label={dark ? "Desactivar modo oscuro" : "Activar modo oscuro"}
+          onClick={toggleDark}
+        >
+          <span>Oscuro</span>
+          <span className="theme-switch-track" aria-hidden="true">
+            <span className="theme-switch-thumb" />
+          </span>
+        </button>
       </header>
       <div className="app-body">
       <SideRail
@@ -384,9 +472,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       <main key={rail} className="view-panel">
         <div className="heading">
           <h1>{RAIL_ITEMS.find((item) => item.id === rail)?.label ?? "Inventario"}</h1>
-          <span>
-            {rail === "avisos" ? "0 avisos" : rail === "archivos" ? "Asistente" : `${visible.length} registros`}
-          </span>
+          {rail === "archivos" ? null : (
+            <span>{rail === "avisos" ? "0 avisos" : `${visible.length} registros`}</span>
+          )}
         </div>
 
         {rail === "avisos" ? (
@@ -487,7 +575,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           />
           <aside className="chat-board" id="inventario-info" aria-label="Resumen del inventario">
             <div className="chat-board-head">
-              <h2>En el inventario</h2>
+              <h2 className="chat-board-title">En el inventario</h2>
               <button type="button" className="chat-board-close" aria-label="Cerrar informacion" onClick={() => setInfoOpen(false)}>
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M7 7l10 10M17 7L7 17" />
@@ -545,6 +633,29 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           </div>
         ) : null}
 
+        {rail === "inventario" ? (
+          <section className="inventory-cards" aria-label="Inventarios">
+            {inventoryCards.map((card, index) => (
+              <article className="inventory-card" key={card.name}>
+                <header className="inventory-card-head">
+                  <span className="inventory-card-index">{String(index + 1).padStart(2, "0")}</span>
+                  <strong>{card.name}</strong>
+                </header>
+                <dl>
+                  <div>
+                    <dt>Creacion</dt>
+                    <dd>{card.created}</dd>
+                  </div>
+                  <div>
+                    <dt>Actualizacion</dt>
+                    <dd>{card.updated}</dd>
+                  </div>
+                </dl>
+              </article>
+            ))}
+          </section>
+        ) : null}
+
         {rail !== "avisos" && rail !== "archivos" ? (
         <section className="sheet">
           <h2>{rail === "personas" ? "Asignaciones" : rail === "equipos" ? "Equipos" : "Todos los articulos"}</h2>
@@ -567,7 +678,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             <span className="avatar" style={{ background: colorFor(textOf(row.persona)) }}>
                               {initials(textOf(row.persona))}
                             </span>
-                            {textOf(row.persona)}
+                            <span>{textOf(row.persona)}</span>
                           </span>
                         ) : (
                           textOf(row[key])
