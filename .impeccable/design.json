@@ -1,0 +1,293 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-29T18:30:00-06:00",
+  "title": "Design System: Inventario de oficina",
+  "extensions": {
+    "colorMeta": {
+      "blue-gray-ground": {
+        "role": "neutral",
+        "displayName": "Base azul grisácea",
+        "canonical": "#d7e1eb"
+      },
+      "blue-gray-ground-dark": {
+        "role": "neutral",
+        "displayName": "Base azul grisácea oscura",
+        "canonical": "#263a4f"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Tinta azul",
+        "canonical": "#1d3045"
+      },
+      "ink-dark": {
+        "role": "neutral",
+        "displayName": "Tinta azul clara",
+        "canonical": "#edf4fa"
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Pizarra",
+        "canonical": "#455d75"
+      },
+      "muted-dark": {
+        "role": "neutral",
+        "displayName": "Pizarra clara",
+        "canonical": "#bac9d8"
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Azul pizarra",
+        "canonical": "#315d85"
+      },
+      "accent-dark": {
+        "role": "primary",
+        "displayName": "Azul hielo",
+        "canonical": "#a9c8e5"
+      },
+      "highlight": {
+        "role": "neutral",
+        "displayName": "Luz de panel",
+        "canonical": "#e9f1f8"
+      },
+      "highlight-dark": {
+        "role": "neutral",
+        "displayName": "Luz de panel oscura",
+        "canonical": "#f0f6fc"
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Lámina translúcida",
+        "canonical": "rgba(245, 249, 253, 0.72)"
+      },
+      "panel-dark": {
+        "role": "neutral",
+        "displayName": "Lámina translúcida oscura",
+        "canonical": "rgba(25, 43, 62, 0.78)"
+      },
+      "panel-strong": {
+        "role": "neutral",
+        "displayName": "Lámina reforzada",
+        "canonical": "rgba(247, 250, 253, 0.88)"
+      },
+      "panel-strong-dark": {
+        "role": "neutral",
+        "displayName": "Lámina reforzada oscura",
+        "canonical": "rgba(19, 34, 52, 0.9)"
+      },
+      "panel-soft": {
+        "role": "neutral",
+        "displayName": "Lámina suave",
+        "canonical": "rgba(226, 235, 244, 0.64)"
+      },
+      "panel-soft-dark": {
+        "role": "neutral",
+        "displayName": "Lámina suave oscura",
+        "canonical": "rgba(39, 59, 80, 0.78)"
+      },
+      "panel-border": {
+        "role": "neutral",
+        "displayName": "Borde de luz",
+        "canonical": "rgba(255, 255, 255, 0.66)"
+      },
+      "panel-border-dark": {
+        "role": "neutral",
+        "displayName": "Borde de luz oscuro",
+        "canonical": "rgba(224, 238, 250, 0.17)"
+      },
+      "focus": {
+        "role": "primary",
+        "displayName": "Foco azul",
+        "canonical": "#285d8c"
+      },
+      "focus-dark": {
+        "role": "primary",
+        "displayName": "Foco azul claro",
+        "canonical": "#c4e0fa"
+      }
+    },
+    "lightModePalette": {
+      "page": "#F3F5F0",
+      "sidebar": "#E6ECE4",
+      "sidebarBottom": "#EDF1EA",
+      "surface": "#FCFDFB",
+      "surfaceRaised": "#F6F8F3",
+      "surfaceSoft": "#E8EEE7",
+      "border": "#D7E1D8",
+      "text": "#20352C",
+      "muted": "#4C6254",
+      "mutedStrong": "#40594B",
+      "primary": "#28634F",
+      "activeNavigation": "#28634F",
+      "teal": "#12685D",
+      "amber": "#81570F",
+      "purple": "#705598",
+      "red": "#A44E54",
+      "focus": "#28634F",
+      "chatUserBorder": "rgba(40, 99, 79, 0.28)",
+      "chatUserBackground": "rgba(40, 99, 79, 0.12)"
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Encabezado de vista",
+        "purpose": "Identifica la sección activa con Segoe UI en negrita."
+      },
+      "title": {
+        "displayName": "Título de tarjeta",
+        "purpose": "Nombra cada resumen de inventario."
+      },
+      "body": {
+        "displayName": "Texto operativo",
+        "purpose": "Búsqueda y lectura de los registros existentes."
+      },
+      "label": {
+        "displayName": "Etiqueta compacta",
+        "purpose": "Metadatos y encabezados de tabla."
+      }
+    },
+    "shadows": [
+      {
+        "name": "panel-light",
+        "value": "0 14px 34px rgba(35, 54, 75, 0.14)",
+        "purpose": "Separación ambiental de paneles en el tema claro."
+      },
+      {
+        "name": "panel-dark",
+        "value": "0 16px 38px rgba(4, 13, 23, 0.28)",
+        "purpose": "Separación ambiental de paneles en el tema oscuro."
+      },
+      {
+        "name": "group-hover",
+        "value": "0 18px 38px rgba(30, 52, 74, 0.18)",
+        "purpose": "Elevación transitoria de una tarjeta de grupo."
+      },
+      {
+        "name": "mobile-summary-open",
+        "value": "0 18px 40px rgba(18, 31, 64, 0.18)",
+        "purpose": "Separar el resumen cuando se superpone al contenido."
+      }
+    ],
+    "motion": [
+      {
+        "name": "rail-indicator",
+        "value": "0.85s cubic-bezier(0.37, 0.02, 0.2, 1)",
+        "purpose": "Desplazamiento del indicador de navegación."
+      },
+      {
+        "name": "view-entry",
+        "value": "0.45s cubic-bezier(0.22, 1, 0.36, 1)",
+        "purpose": "Entrada breve de una vista."
+      },
+      {
+        "name": "panel-hover",
+        "value": "180ms ease",
+        "purpose": "Respuesta de elevación de las tarjetas de inventario."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact",
+        "value": "980px"
+      },
+      {
+        "name": "small",
+        "value": "720px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "search-field",
+      "description": "Búsqueda en la cabecera persistente.",
+      "html": "<label class=\"ds-search\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"6.5\"/><path d=\"M16 16 20.5 20.5\"/></svg><input type=\"search\" placeholder=\"Buscar etiqueta, artículo, marca...\" aria-label=\"Buscar en el inventario\"></label>",
+      "css": ".ds-search { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border: 1px solid var(--glass-border); border-radius: 999px; background: var(--glass-panel); color: var(--glass-ink); } .ds-search svg { width: 18px; height: 18px; flex: none; fill: none; stroke: var(--glass-muted); stroke-width: 2; } .ds-search input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--glass-ink); font: 15px 'Segoe UI', sans-serif; } .ds-search:focus-within { outline: 2px solid var(--glass-focus); outline-offset: 3px; }"
+    },
+    {
+      "name": "Responsive Navigation",
+      "kind": "nav",
+      "refersTo": "navigation-rail",
+      "description": "Six-section rail at desktop widths and a fixed bottom bar on mobile.",
+      "html": "<nav class=\"ds-rail\" aria-label=\"Navegación\"><button class=\"ds-rail-button\" aria-current=\"page\" aria-label=\"Inventario\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"4\" y=\"4\" width=\"6.5\" height=\"6.5\" rx=\"1.4\"/><rect x=\"13.5\" y=\"4\" width=\"6.5\" height=\"6.5\" rx=\"1.4\"/><rect x=\"4\" y=\"13.5\" width=\"6.5\" height=\"6.5\" rx=\"1.4\"/><rect x=\"13.5\" y=\"13.5\" width=\"6.5\" height=\"6.5\" rx=\"1.4\"/></svg></button></nav>",
+      "css": ".ds-rail { display: flex; flex-direction: column; width: 64px; padding: 14px 0 12px; border: 1px solid var(--glass-border); border-radius: 32px; background: var(--glass-panel-strong); box-shadow: var(--glass-shadow); } .ds-rail-button { display: grid; width: 100%; height: 72px; place-items: center; border: 0; background: transparent; color: var(--glass-muted); } .ds-rail-button svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; } .ds-rail-button[aria-current='page'] { color: var(--glass-ink); } .ds-rail-button:focus-visible { outline: 2px solid var(--glass-focus); outline-offset: -4px; border-radius: 16px; } @media (max-width: 720px) { .ds-rail { flex-direction: row; width: 100%; padding: 5px; border-radius: 20px; backdrop-filter: blur(22px) saturate(135%); } .ds-rail-button { height: 48px; } } @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .ds-rail { background: var(--glass-panel-strong); } }"
+    },
+    {
+      "name": "Group Selector",
+      "kind": "card",
+      "refersTo": "group-card",
+      "description": "Selectable person or area card; the selected group becomes the foreground layer.",
+      "html": "<button class=\"ds-group is-active\"><span class=\"ds-group-kicker\">Persona</span><strong>Grupo seleccionado</strong></button>",
+      "css": ".ds-group { display: flex; width: 272px; height: 160px; flex-direction: column; justify-content: flex-end; gap: 8px; padding: 18px; border: 1px solid var(--glass-border); border-radius: 20px; background: var(--glass-panel); box-shadow: var(--glass-shadow); color: var(--glass-ink); text-align: left; backdrop-filter: blur(18px) saturate(125%); cursor: pointer; } .ds-group-kicker { color: var(--glass-muted); font: 700 11px 'Segoe UI', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; } .ds-group strong { font: 700 16px/1.2 'Segoe UI', sans-serif; } .ds-group.is-active { border-color: rgba(220, 236, 250, 0.62); background: linear-gradient(145deg, rgba(47, 82, 116, 0.92), rgba(31, 57, 82, 0.92)); color: #fff; } .ds-group:hover { transform: translateY(-2px); box-shadow: 0 18px 38px rgba(30, 52, 74, 0.18); } .ds-group:focus-visible { outline: 2px solid var(--glass-focus); outline-offset: 3px; }"
+    },
+    {
+      "name": "Inventory Summary Card",
+      "kind": "card",
+      "refersTo": "inventory-card",
+      "description": "Compact inventory summary with creation and update dates.",
+      "html": "<article class=\"ds-inventory\"><header><span>01</span><strong>Inventario 1</strong></header><dl><div><dt>Creación</dt><dd>Fecha disponible</dd></div><div><dt>Actualización</dt><dd>Fecha disponible</dd></div></dl></article>",
+      "css": ".ds-inventory { display: flex; flex-direction: column; gap: 14px; padding: 16px; border: 1px solid var(--glass-border); border-radius: 20px; background: var(--glass-panel); box-shadow: var(--glass-shadow); color: var(--glass-ink); backdrop-filter: blur(20px) saturate(130%); } .ds-inventory header { display: flex; align-items: center; gap: 12px; } .ds-inventory header span { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 14px; background: var(--glass-accent); color: #fff; font: 700 13px 'Segoe UI', sans-serif; } .ds-inventory strong { font: 700 18px 'Segoe UI', sans-serif; letter-spacing: -0.03em; } .ds-inventory dl { display: grid; gap: 0; margin: 0; } .ds-inventory dl div { display: flex; justify-content: space-between; gap: 12px; padding-top: 10px; } .ds-inventory dl div + div { margin-top: 10px; border-top: 1px solid var(--glass-border); } .ds-inventory dt { color: var(--glass-muted); font: 700 12px 'Segoe UI', sans-serif; text-transform: uppercase; } .ds-inventory dd { margin: 0; font-size: 13px; }"
+    },
+    {
+      "name": "Record Table",
+      "kind": "custom",
+      "refersTo": "record-sheet",
+      "description": "Legible inventory table in a reinforced sheet with horizontal scrolling.",
+      "html": "<section class=\"ds-sheet\"><h2>Todos los artículos</h2><div class=\"ds-table-wrap\"><table><thead><tr><th>Etiqueta</th><th>Artículo</th><th>Marca</th></tr></thead><tbody><tr><td>Etiqueta existente</td><td>Artículo existente</td><td>Marca existente</td></tr></tbody></table></div></section>",
+      "css": ".ds-sheet { padding: 18px 18px 4px; overflow: hidden; border: 1px solid var(--glass-border); border-radius: 20px; background: var(--glass-panel-strong); box-shadow: var(--glass-shadow); color: var(--glass-ink); backdrop-filter: blur(22px) saturate(125%); } .ds-sheet h2 { margin: 0 0 12px; font: 700 12px 'Segoe UI', sans-serif; letter-spacing: 0.09em; text-transform: uppercase; } .ds-table-wrap { overflow: auto hidden; border-radius: 12px 12px 0 0; } .ds-sheet table { width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; } .ds-sheet th, .ds-sheet td { padding: 14px 8px; border-bottom: 1px solid var(--glass-border); font: 14px 'Segoe UI', sans-serif; text-align: left; white-space: nowrap; } .ds-sheet th { color: var(--glass-muted); font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; } .ds-sheet tbody tr:hover td { background: var(--glass-panel-soft); color: var(--glass-ink); } @media (max-width: 720px) { .ds-sheet { padding: 15px 12px 4px; border-radius: 16px; } .ds-sheet th, .ds-sheet td { padding: 12px 11px; } } @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .ds-sheet { background: var(--glass-panel-strong); } }"
+    },
+    {
+      "name": "Theme Switch",
+      "kind": "button",
+      "description": "Persistent light/dark theme preference.",
+      "html": "<button class=\"ds-theme\" aria-pressed=\"true\"><span>Oscuro</span><span class=\"ds-theme-track\"><span class=\"ds-theme-thumb\"></span></span></button>",
+      "css": ".ds-theme { display: flex; align-items: center; gap: 8px; border: 0; background: transparent; color: var(--glass-ink); font: 700 13px 'Segoe UI', sans-serif; cursor: pointer; } .ds-theme-track { position: relative; width: 42px; height: 24px; border-radius: 999px; background: var(--glass-accent); } .ds-theme-thumb { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--glass-highlight); transition: transform 0.2s ease; } .ds-theme[aria-pressed='true'] .ds-theme-thumb { transform: translateX(18px); } .ds-theme:focus-visible { outline: 2px solid var(--glass-focus); outline-offset: 3px; border-radius: 999px; }"
+    },
+    {
+      "name": "Chat Message",
+      "kind": "custom",
+      "description": "User and assistant messages use distinct alignment and matte surfaces.",
+      "html": "<div class=\"ds-chat\"><p class=\"ds-chat-bubble\">Mensaje del asistente</p><p class=\"ds-chat-bubble ds-chat-user\">Mensaje del usuario</p></div>",
+      "css": ".ds-chat { display: flex; flex-direction: column; gap: 14px; color: var(--glass-ink); font: 14px/1.45 'Segoe UI', sans-serif; } .ds-chat-bubble { align-self: flex-start; max-width: 78%; margin: 0; padding: 12px 14px; border: 1px solid var(--glass-border); border-radius: 18px 18px 18px 6px; background: var(--glass-panel-soft); color: var(--glass-ink); } .ds-chat-user { align-self: flex-end; border: 0; border-radius: 18px 18px 6px 18px; background: #121f40; color: #fff; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Capas de luz",
+    "overview": "Dirección comprometida: “Capas de luz” (operate-b-exposure-record-zone-sheets). La interfaz convierte la consulta del inventario de oficina en una lectura operativa serena: un degradado azul grisáceo suavemente desenfocado sostiene capas translúcidas mate, con reflejos y bordes discretos. La navegación, los resúmenes, el selector de grupos, la tabla y el chat comparten ese material; los datos conservan contraste y estructura antes que el efecto.\n\nEl mismo inventario y los mismos flujos están disponibles en los temas claro y oscuro; si no hay una preferencia guardada, inicia en oscuro. La elección se guarda en el navegador. El efecto de vidrio acompaña la interfaz completa, con láminas más densas en las superficies de lectura.",
+    "keyCharacteristics": [
+      "Fondo azul grisáceo difuminado, con variaciones propias de cada tema.",
+      "Paneles mate translúcidos y bordes claros de baja intensidad; superficies de datos más densas para lectura.",
+      "Segoe UI, títulos compactos y registros presentados en una tabla horizontalmente desplazable.",
+      "Navegación lateral en escritorio y barra inferior en móvil; misma información y comportamiento de consulta."
+    ],
+    "rules": [
+      {
+        "name": "Legibilidad a través de capas",
+        "body": "El degradado y la transparencia son el entorno; el texto, los controles y las filas deben seguir siendo fáciles de distinguir en ambos temas.",
+        "section": "colors"
+      },
+      {
+        "name": "Lectura operativa",
+        "body": "Usa el peso alto para identificar vistas y datos; las etiquetas compactas describen sin competir con los registros.",
+        "section": "typography"
+      },
+      {
+        "name": "Fallback de lámina",
+        "body": "Si el navegador no puede desenfocar el fondo, conserva la superficie reforzada y el contraste; el vidrio no puede ser el único soporte de legibilidad.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do mantener el degradado azul grisáceo desenfocado y las capas translúcidas mate en ambos temas.",
+      "Do conservar la misma información y los mismos flujos de búsqueda, navegación, agrupación, chat y resumen.",
+      "Do mantener la tabla legible, con su ancho mínimo y desplazamiento horizontal en pantallas estrechas.",
+      "Do mantener el tema claro/oscuro y guardar la elección del usuario.",
+      "Do proporcionar paneles de color reforzados cuando no esté disponible el desenfoque de fondo.",
+      "Do conservar el anillo visible de foco de teclado."
+    ],
+    "donts": [
+      "Don't permitir que el desenfoque o la transparencia reduzcan el contraste de textos, controles o filas.",
+      "Don't comprimir la tabla ni retirar campos para hacerla caber en móvil.",
+      "Don't inventar registros, métricas o capacidades CRUD; la apariencia no cambia la fuente de datos ni los flujos existentes."
+    ]
+  }
+}
