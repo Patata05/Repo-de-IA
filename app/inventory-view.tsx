@@ -22,6 +22,7 @@ import {
   Moon,
   MoreVertical,
   Paperclip,
+  Pencil,
   Plus,
   RotateCcw,
   Search,
@@ -49,18 +50,29 @@ import {
   Suspense,
 } from "react";
 import { createPortal } from "react-dom";
-import type { InventarioRow } from "@/lib/supabase";
+import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import {
+  addInventarioBulkAction,
   deleteInventarioManyAction,
   restoreInventarioManyAction,
 } from "@/app/actions";
 import AddProductModal from "@/components/add-product-modal";
+import ChatViewer from "@/components/chat-viewer";
 import ProductDetailModal from "@/components/product-detail-modal";
+import {
+  askInventoryChat,
+  type ChatApiItem,
+  type ChatQrPayload,
+} from "@/lib/chat-api";
+import { parseInventarioImportFile } from "@/lib/import-inventario-file";
+import { formatInventarioQrText, INVENTARIO_QR_RENDER } from "@/lib/inventario-qr";
 import {
   buildSearchIndex,
   indexMatchesPrepared,
   prepareSearch,
+  rowMatchesPrepared,
 } from "@/lib/inventario-search";
+import QRCode from "qrcode";
 
 const ReportsView = lazy(() => import("@/components/reports-view"));
 
@@ -71,16 +83,31 @@ const CHAT_QUICK_ACTIONS = [
   { label: "Ideas de consulta", prompt: "¿Qué puedo preguntarte del inventario?", icon: Lightbulb },
 ] as const;
 
-type ChatMessage = { id: number; from: "bot" | "user"; text: string; at?: number };
+type ViewerOverview = "full" | "stats" | "areas" | "recent";
+
+type ChatMessage = {
+  id: number;
+  from: "bot" | "user";
+  text: string;
+  at?: number;
+  resultItems?: ChatApiItem[];
+  qr?: ChatQrPayload[];
+  /** Resumen del visor (solo si el usuario lo pide en el chat). */
+  viewerOverview?: ViewerOverview;
+};
+type ChatQrCard = ChatQrPayload & { dataUrl: string };
 type ChatSession = {
   id: string;
   title: string;
   updatedAt: string;
   messages: ChatMessage[];
   starred?: boolean;
+  resultItems?: ChatApiItem[];
+  qr?: ChatQrPayload[];
 };
 
 const CHAT_SESSIONS_KEY = "inventario-chat-sessions";
+const CHAT_ACTIVE_KEY = "inventario-chat-active";
 const MAX_CHAT_SESSIONS = 50;
 const CHAT_USER_COLLAPSE_AT = 160;
 const PERSONA_SIN_ASIGNAR_ID = "__SIN_ASIGNAR__";
@@ -113,13 +140,354 @@ function loadChatSessions(): ChatSession[] {
 
 function saveChatSessions(sessions: ChatSession[]) {
   try {
-    window.localStorage.setItem(
-      CHAT_SESSIONS_KEY,
-      JSON.stringify(sessions.slice(0, MAX_CHAT_SESSIONS)),
-    );
+    const cleaned = sessions
+      .filter((session) => session?.id && Array.isArray(session.messages) && session.messages.length > 0)
+      .slice(0, MAX_CHAT_SESSIONS);
+    window.localStorage.setItem(CHAT_SESSIONS_KEY, JSON.stringify(cleaned));
   } catch {
     /* quota / private mode */
   }
+}
+
+/** Une memoria + localStorage para no pisar historial en carreras de hydrate. */
+function mergeChatSessions(
+  memory: ChatSession[],
+  ...extra: ChatSession[]
+): ChatSession[] {
+  const byId = new Map<string, ChatSession>();
+  for (const session of loadChatSessions()) {
+    if (session?.id) byId.set(session.id, session);
+  }
+  for (const session of memory) {
+    if (session?.id) byId.set(session.id, session);
+  }
+  for (const session of extra) {
+    if (session?.id) byId.set(session.id, session);
+  }
+  return Array.from(byId.values())
+    .filter((session) => Array.isArray(session.messages) && session.messages.length > 0)
+    .sort((a, b) => {
+      const ta = Date.parse(a.updatedAt) || 0;
+      const tb = Date.parse(b.updatedAt) || 0;
+      return tb - ta;
+    })
+    .slice(0, MAX_CHAT_SESSIONS);
+}
+
+function loadActiveChatId(): string | null {
+  try {
+    return window.localStorage.getItem(CHAT_ACTIVE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveActiveChatId(id: string | null) {
+  try {
+    if (id) window.localStorage.setItem(CHAT_ACTIVE_KEY, id);
+    else window.localStorage.removeItem(CHAT_ACTIVE_KEY);
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+async function buildChatQrCards(payloads: ChatQrPayload[]): Promise<ChatQrCard[]> {
+  const cards = await Promise.all(
+    payloads.map(async (qr) => {
+      try {
+        // Payload compacto INV:… (mismo que ficha) → menos módulos
+        const text = /^INV:/i.test(qr.text || "")
+          ? qr.text
+          : formatInventarioQrText({ etiqueta: qr.etiqueta }) || qr.text;
+        const dataUrl = await QRCode.toDataURL(text, INVENTARIO_QR_RENDER);
+        return { ...qr, text, dataUrl };
+      } catch {
+        return { ...qr, dataUrl: "" };
+      }
+    }),
+  );
+  return cards.filter((c) => c.dataUrl);
+}
+
+function rowToChatApiItem(row: InventarioRow): ChatApiItem {
+  return {
+    id: row.id,
+    etiqueta: row.etiqueta,
+    articulo: row.articulo,
+    marca: row.marca,
+    modelo: row.modelo,
+    serie: row.serie,
+    area: row.area,
+    persona: row.persona,
+    cantidad: row.cantidad,
+    estado: row.estado,
+    origen: row.origen,
+    observaciones: row.observaciones,
+  };
+}
+
+function isQrBotMessage(message: ChatMessage) {
+  if (message.from !== "bot") return false;
+  if (Array.isArray(message.qr) && message.qr.length > 0) return true;
+  return /\bqr\b|c[oó]digos?\s*qr|qr\s*generado|imagen del qr|visor derecho|etiqueta\s+\*{0,2}\d+/i.test(
+    message.text || "",
+  );
+}
+
+function messageHasSideData(message: ChatMessage) {
+  return (
+    message.from === "bot" &&
+    ((Array.isArray(message.resultItems) && message.resultItems.length > 0) ||
+      (Array.isArray(message.qr) && message.qr.length > 0) ||
+      Boolean(message.viewerOverview))
+  );
+}
+
+/** Normaliza texto para tolerar typos (sin acentos, minúsculas). */
+function normalizeChatIntent(raw: string) {
+  return String(raw || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectViewerOverview(userText: string): ViewerOverview | undefined {
+  // Solo el mensaje del usuario (la respuesta del bot puede listar capacidades).
+  const user = normalizeChatIntent(userText);
+  if (!user || /^(hola|buenas|hey|hi|hello)\b/.test(user)) return undefined;
+
+  // "cuántos registros tiene GARCIA…" / por persona o área → NO es overview global.
+  const stop = new Set([
+    "cuantos",
+    "cuantas",
+    "cuanto",
+    "cuanta",
+    "registros",
+    "registro",
+    "articulos",
+    "articulo",
+    "equipos",
+    "equipo",
+    "tiene",
+    "tienen",
+    "hay",
+    "del",
+    "de",
+    "la",
+    "el",
+    "los",
+    "las",
+    "un",
+    "una",
+    "me",
+    "dame",
+    "muestra",
+    "ver",
+    "quiero",
+    "persona",
+    "personas",
+    "area",
+    "areas",
+  ]);
+  const extraTokens = user
+    .split(/\s+/)
+    .map((t) => t.replace(/[^a-z0-9áéíóúñ]/gi, ""))
+    .filter((t) => t.length > 1 && !stop.has(t));
+  const asksSpecificOwner =
+    (/\b(tiene|tienen)\b/.test(user) && /\bcuant[oa]s?\b/.test(user)) ||
+    (/\bcuant[oa]s?\b/.test(user) && extraTokens.length >= 2);
+
+  // Resumen / inventario general (tolera: generla, genral, "en general", etc.)
+  if (
+    /\bresumen(\s+en\s+vivo)?\b|\bresumen\s+del\s+inventario\b|\bpanorama\b|\bdashboard\b/.test(
+      user,
+    ) ||
+    (/\binventari[oa]\b|\binventario\b/.test(user) &&
+      /\b(gen\w*|completo|total|todo|general|generla|genral)\b/.test(user)) ||
+    /^(dame|muestra|ver|quiero)\s+(el\s+)?inventari[oa]\s*$/.test(user)
+  ) {
+    return "full";
+  }
+  if (
+    /\bregistros?\s+recientes\b|\bregsitros?\s+recientes\b|\bultimos?\s+registros\b|\bmuestra\s+recientes\b|\bdame\s+(los\s+|lso\s+)?registros?\s+recientes\b|\bdame\s+recientes\b|\bultimos?\s+articulos\b|\brecientes\b/.test(
+      user,
+    )
+  ) {
+    return "recent";
+  }
+  if (
+    /\blista\s+de\s+areas\b|\bcuantas\s+areas\b|\bareas\s+del\s+inventario\b|\btop\s+areas\b|\bdame\s+(las\s+)?areas\b|\bmuestra\s+(las\s+)?areas\b|\bpor\s+area\b|\bdesglose\s+por\s+area\b|\bareas?\s*$/.test(
+      user,
+    ) ||
+    /^(areas?|por\s+areas?)$/.test(user)
+  ) {
+    return "areas";
+  }
+  if (
+    !asksSpecificOwner &&
+    /\binventario\s+total\b|\btotal\s+del\s+inventario\b|\btotal\s+exacto\b|\bconteo\s+total\b|\bcuantos\s+(articulos|registros|hay)(\s+(hay|en\s+total|en\s+el\s+inventario))?\s*$/.test(
+      user,
+    )
+  ) {
+    return "stats";
+  }
+  return undefined;
+}
+
+function findQrOwnerMessage(messages: ChatMessage[]) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (messageHasSideData(message) || isQrBotMessage(message)) return message;
+  }
+  return null;
+}
+
+function extractEtiquetasFromText(text: string): string[] {
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const tag = String(raw || "").trim();
+    if (!tag) return;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    tags.push(tag);
+  };
+  for (const match of text.matchAll(/\|\s*([A-Za-z0-9/_-]{3,})\s*\|/g)) {
+    if (/^(etiqueta|art[ií]culo|area|área|persona|estado)$/i.test(match[1])) continue;
+    push(match[1]);
+  }
+  for (const match of text.matchAll(/etiqueta\s+\*{0,2}([A-Za-z0-9/_-]+)\*{0,2}/gi)) {
+    push(match[1]);
+  }
+  return tags;
+}
+
+function buildQrSideFromRows(rows: InventarioRow[]): {
+  resultItems: ChatApiItem[];
+  qr: ChatQrPayload[];
+} {
+  const resultItems: ChatApiItem[] = [];
+  const qr: ChatQrPayload[] = [];
+  for (const row of rows) {
+    const text = formatInventarioQrText(row);
+    if (!text) continue;
+    resultItems.push(rowToChatApiItem(row));
+    qr.push({
+      text,
+      etiqueta: row.etiqueta,
+      articulo: row.articulo,
+      id: row.id,
+      persona: row.persona,
+      area: row.area,
+      origen: row.origen,
+    });
+  }
+  return { resultItems, qr };
+}
+
+function resolveQrRowsFromPrompt(
+  userText: string,
+  botText: string,
+  inventory: InventarioRow[],
+  max = 7,
+): InventarioRow[] {
+  const fromBot = extractEtiquetasFromText(botText);
+  if (fromBot.length) {
+    const rows: InventarioRow[] = [];
+    for (const tag of fromBot.slice(0, max)) {
+      const row = inventory.find(
+        (item) =>
+          String(item.etiqueta ?? "")
+            .trim()
+            .toLowerCase() === tag.toLowerCase(),
+      );
+      if (row) rows.push(row);
+    }
+    if (rows.length) return rows;
+  }
+
+  const limitMatch =
+    userText.match(
+      /(?:dame|genera|quiero|necesito)?\s*(\d{1,2})\s*(?:c[oó]digos?\s*)?qr/i,
+    ) || userText.match(/(\d{1,2})\s*c[oó]digos?/i);
+  const limit = Math.max(1, Math.min(max, Number(limitMatch?.[1] || 5) || 5));
+  const queryMatch =
+    userText.match(
+      /(?:de|del|en)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9][\wÁÉÍÓÚÜÑáéíóúüñ ./-]{1,40})/i,
+    ) ||
+    botText.match(
+      /de\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\wÁÉÍÓÚÜÑáéíóúüñ ./-]{1,40})/i,
+    );
+  const query = String(queryMatch?.[1] || "")
+    .replace(/\s*\(.*$/, "")
+    .trim();
+  if (!query) return [];
+
+  const needle = prepareSearch(query);
+  if (!needle) return [];
+  return inventory
+    .filter((row) => rowMatchesPrepared(row, needle))
+    .slice(0, limit);
+}
+
+function recoverSideFromChat(
+  messages: ChatMessage[],
+  inventory: InventarioRow[],
+): { resultItems: ChatApiItem[]; qr: ChatQrPayload[] } | null {
+  const attachedOwner = [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.from === "bot" &&
+        ((Array.isArray(message.resultItems) && message.resultItems.length > 0) ||
+          (Array.isArray(message.qr) && message.qr.length > 0)),
+    );
+  if (attachedOwner) {
+    return {
+      resultItems: attachedOwner.resultItems || [],
+      qr: attachedOwner.qr || [],
+    };
+  }
+
+  const qrOwner = findQrOwnerMessage(messages);
+  if (!qrOwner || !inventory.length) return null;
+
+  const ownerIndex = messages.findIndex((message) => message.id === qrOwner.id);
+  const prevUser = [...messages.slice(0, Math.max(ownerIndex, 0))]
+    .reverse()
+    .find((message) => message.from === "user");
+  const rows = resolveQrRowsFromPrompt(
+    prevUser?.text || "",
+    qrOwner.text || "",
+    inventory,
+  );
+  if (!rows.length) return null;
+  const side = buildQrSideFromRows(rows);
+  if (!side.qr.length) return null;
+  return side;
+}
+
+function resolveSessionSide(
+  session: ChatSession,
+  inventory: InventarioRow[],
+): { resultItems: ChatApiItem[]; qr: ChatQrPayload[] } {
+  if (
+    (Array.isArray(session.resultItems) && session.resultItems.length) ||
+    (Array.isArray(session.qr) && session.qr.length)
+  ) {
+    return {
+      resultItems: session.resultItems || [],
+      qr: session.qr || [],
+    };
+  }
+  const recovered = recoverSideFromChat(session.messages, inventory);
+  return recovered
+    ? { resultItems: recovered.resultItems, qr: recovered.qr }
+    : { resultItems: [], qr: [] };
 }
 
 function chatTitleFromMessages(messages: ChatMessage[]) {
@@ -131,6 +499,161 @@ function chatTitleFromMessages(messages: ChatMessage[]) {
 function formatChatTime(at?: number) {
   const date = new Date(at || Date.now());
   return date.toLocaleTimeString("es-MX", { hour: "numeric", minute: "2-digit" });
+}
+
+async function copyChatText(text: string) {
+  const value = String(text ?? "");
+  if (!value) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    /* fallback abajo */
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.left = "-9999px";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function ChatUserEditBox({
+  initialText,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  initialText: string;
+  onChange: (value: string) => void;
+  onSubmit: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const editorRef = useRef<HTMLDivElement>(null);
+  const valueRef = useRef(initialText);
+  const [canSend, setCanSend] = useState(() => Boolean(initialText.trim()));
+
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el) return;
+    el.textContent = initialText;
+    valueRef.current = initialText;
+    setCanSend(Boolean(initialText.trim()));
+    el.focus();
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    // solo al montar el editor
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="chat-user-edit">
+      <div
+        ref={editorRef}
+        className="chat-bubble chat-user-edit-input"
+        contentEditable
+        role="textbox"
+        aria-label="Editar mensaje"
+        suppressContentEditableWarning
+        onInput={(event) => {
+          const next = event.currentTarget.textContent ?? "";
+          valueRef.current = next;
+          setCanSend(Boolean(next.trim()));
+          onChange(next);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          }
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            onSubmit(valueRef.current);
+          }
+        }}
+      />
+      <div className="chat-user-edit-actions">
+        <button type="button" className="chat-user-edit-cancel" onClick={onCancel}>
+          Cancelar
+        </button>
+        <button
+          type="button"
+          className="chat-user-edit-send"
+          disabled={!canSend}
+          onClick={() => onSubmit(valueRef.current)}
+        >
+          Enviar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Separa prosa y tablas markdown: primero el texto, tabla al final. */
+function reorderChatProseThenTable(text: string) {
+  const lines = String(text || "").split(/\r?\n/);
+  const prose: string[] = [];
+  const table: string[] = [];
+  let inTable = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isTableRow =
+      /^\|/.test(trimmed) || /^[\|\s:\-]+$/.test(trimmed);
+    if (isTableRow) {
+      inTable = true;
+      table.push(line);
+      continue;
+    }
+    if (inTable && trimmed === "") {
+      table.push(line);
+      continue;
+    }
+    inTable = false;
+    prose.push(line);
+  }
+  const head = prose.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const tail = table.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!tail) return head;
+  if (!head) return tail;
+  return `${head}\n\n${tail}`;
+}
+
+/** Si el detalle va al visor, quita tablas del chat (deja solo la incidencia). */
+function stripChatMarkdownTables(text: string) {
+  const lines = String(text || "").split(/\r?\n/);
+  const out: string[] = [];
+  let inTable = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isTableRow =
+      /^\|/.test(trimmed) || /^[\|\s:\-]+$/.test(trimmed);
+    if (isTableRow) {
+      inTable = true;
+      continue;
+    }
+    if (inTable && trimmed === "") {
+      inTable = false;
+      continue;
+    }
+    inTable = false;
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function renderChatRichText(text: string) {
@@ -1139,11 +1662,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const [draft, setDraft] = useState("");
   const [expandedUserMsgs, setExpandedUserMsgs] = useState<number[]>([]);
+  const [editingUserMsgId, setEditingUserMsgId] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [pendingAttach, setPendingAttach] = useState<{
     kind: "image" | "file";
     name: string;
+    file?: File;
   } | null>(null);
+  const [pendingChatImport, setPendingChatImport] = useState<NewInventarioItem[] | null>(
+    null,
+  );
+  const [chatQrByMsg, setChatQrByMsg] = useState<Record<number, ChatQrCard[]>>({});
   const [infoOpen, setInfoOpen] = useState(false);
   const [dark, setDark] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -1151,6 +1681,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const chatHydratedRef = useRef(false);
   const chatLogRef = useRef<HTMLDivElement>(null);
+  const chatStageRef = useRef<HTMLDivElement>(null);
+  const viewerRailRef = useRef<HTMLElement>(null);
   const viewPanelRef = useRef<HTMLElement>(null);
   const chatAttachRef = useRef<HTMLDivElement>(null);
   const chatImageInputRef = useRef<HTMLInputElement>(null);
@@ -1159,36 +1691,83 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const messagesRef = useRef<ChatMessage[]>([]);
   const activeChatIdRef = useRef<string | null>(null);
   const chatStarted = messages.some((message) => message.from === "user");
-  const lastBotMessageId = [...messages].reverse().find((m) => m.from === "bot")?.id ?? null;
-
-  /** Solo diseño (estilo Gemini): tarjetas laterales placeholder */
-  const chatSideCards = useMemo(
-    () =>
-      [
-        {
-          id: "c1",
-          source: "inventario.local",
-          title: "Equipos sin área asignada",
-          snippet: "Revisión pendiente · 12 coincidencias en S/O",
-          tone: "rose",
-        },
-        {
-          id: "c2",
-          source: "conteo.activo",
-          title: "Artículos marcados Inactivo",
-          snippet: "Hoy · posible baja o reparación",
-          tone: "amber",
-        },
-        {
-          id: "c3",
-          source: "serie.dup",
-          title: "Series repetidas en el lote",
-          snippet: "Importación · verificar etiquetas",
-          tone: "blue",
-        },
-      ] as const,
-    [],
+  const hasAnySidePanel = useMemo(
+    () => messages.some((message) => messageHasSideData(message)),
+    [messages],
   );
+
+  const sideCompanions = useMemo(
+    () =>
+      messages
+        .filter((message) => messageHasSideData(message))
+        .map((message) => ({
+          messageId: message.id,
+          resultItems: Array.isArray(message.resultItems)
+            ? message.resultItems
+            : [],
+          qrCards: chatQrByMsg[message.id] || [],
+          overview: message.viewerOverview,
+        })),
+    [messages, chatQrByMsg],
+  );
+
+  const chatTurns = useMemo(() => {
+    const turns: Array<
+      | { kind: "single"; message: ChatMessage }
+      | { kind: "pair"; user: ChatMessage; bot: ChatMessage }
+    > = [];
+    for (let i = 0; i < messages.length; i += 1) {
+      const message = messages[i];
+      const next = messages[i + 1];
+      if (
+        message.from === "user" &&
+        next?.from === "bot" &&
+        messageHasSideData(next)
+      ) {
+        turns.push({ kind: "pair", user: message, bot: next });
+        i += 1;
+        continue;
+      }
+      turns.push({ kind: "single", message });
+    }
+    return turns;
+  }, [messages]);
+
+  // Genera imágenes QR por cada mensaje que tenga payload (o refresca si no es INV:).
+  useEffect(() => {
+    let cancelled = false;
+    const pending = messages.filter((message) => {
+      if (
+        !messageHasSideData(message) ||
+        !Array.isArray(message.qr) ||
+        !message.qr.length
+      ) {
+        return false;
+      }
+      const cached = chatQrByMsg[message.id];
+      if (!cached?.length) return true;
+      return cached.some((card) => card.text && !/^INV:/i.test(card.text));
+    });
+    if (!pending.length) return;
+    void Promise.all(
+      pending.map(async (message) => {
+        const cards = await buildChatQrCards(message.qr || []);
+        return [message.id, cards] as const;
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      setChatQrByMsg((prev) => {
+        const next = { ...prev };
+        for (const [id, cards] of entries) {
+          if (cards.length) next[id] = cards;
+        }
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [messages, chatQrByMsg]);
 
   useLayoutEffect(() => {
     setRail(loadSavedRail());
@@ -1205,8 +1784,22 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
   useEffect(() => {
     const loaded = loadChatSessions();
-    chatHydratedRef.current = true;
     setChatSessions(loaded);
+    chatHydratedRef.current = true;
+    const activeId = loadActiveChatId();
+    if (!activeId) return;
+    const session = loaded.find((item) => item.id === activeId);
+    if (!session?.messages?.length) {
+      // Activo vacío o huérfano: no borres el historial, solo limpia el puntero.
+      saveActiveChatId(null);
+      return;
+    }
+    activeChatIdRef.current = session.id;
+    messagesRef.current = session.messages;
+    setActiveChatId(session.id);
+    setMessages(session.messages);
+    const maxId = session.messages.reduce((max, message) => Math.max(max, message.id), 0);
+    chatId.current = maxId + 1;
   }, []);
 
   useEffect(() => {
@@ -1610,17 +2203,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (cancelled) return;
       setTableRenderLimit((n) => Math.min(n + TABLE_CHUNK_ROWS, visible.length));
     };
-    let idleId = 0;
-    let timeoutId = 0;
-    if (typeof window !== "undefined" && "requestIdleCallback" in window) {
-      idleId = window.requestIdleCallback(grow, { timeout: 48 });
-    } else {
-      timeoutId = window.setTimeout(grow, 16);
+
+    if (typeof window.requestIdleCallback === "function") {
+      const idleId = window.requestIdleCallback(grow, { timeout: 48 });
+      return () => {
+        cancelled = true;
+        window.cancelIdleCallback(idleId);
+      };
     }
+
+    const timeoutId = window.setTimeout(grow, 16);
     return () => {
       cancelled = true;
-      if (idleId) window.cancelIdleCallback(idleId);
-      if (timeoutId) window.clearTimeout(timeoutId);
+      window.clearTimeout(timeoutId);
     };
   }, [needsTableData, tableRenderLimit, visible.length]);
 
@@ -1745,9 +2340,136 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   }, [rail, folders.length]);
 
   useEffect(() => {
+    if (rail !== "archivos") return;
+    const frame = window.requestAnimationFrame(() => {
+      const anchor = chatLogRef.current?.querySelector<HTMLElement>(
+        "[data-chat-latest='true']",
+      );
+      if (!anchor) return;
+      // auto: smooth + sync de layout pelean y traban el scroll
+      anchor.scrollIntoView({ block: "start", behavior: "auto", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages.length, rail, hasAnySidePanel]);
+
+  // Columna derecha: cada cuadro sigue el Y de su mensaje.
+  // El scroll general es el del stage (barra a la derecha).
+  useLayoutEffect(() => {
+    if (rail !== "archivos" || !hasAnySidePanel) return;
     const log = chatLogRef.current;
-    if (log) log.scrollTop = log.scrollHeight;
-  }, [messages, rail]);
+    const railEl = viewerRailRef.current;
+    const stageEl = chatStageRef.current;
+    if (!log || !railEl) return;
+
+    const SYNC_NUDGE_PX = -10;
+    const STICKY_TOP_PX = 12;
+    const AFTER_GAP_PX = 28;
+    // Misma reserva siempre; Mostrar más no empuja msgs.
+    const SIDE_SLOT_H = 300;
+    let posRaf = 0;
+    let layoutRaf = 0;
+    const scrollRoot = stageEl ?? log;
+
+    const clearSlots = () => {
+      log.querySelectorAll<HTMLElement>("[data-side-msg]").forEach((el) => {
+        el.style.minHeight = "";
+      });
+    };
+
+    // Texto sube al scrollear; el cuadro baja y se detiene arriba de copiar/like.
+    const positionOnly = () => {
+      const railTop = railEl.getBoundingClientRect().top;
+      const stageTop = (stageEl ?? scrollRoot).getBoundingClientRect().top;
+      for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
+        const id = node.dataset.syncMsg;
+        if (!id) continue;
+        const anchor = log.querySelector<HTMLElement>(`[data-side-msg="${id}"]`);
+        if (!anchor) {
+          node.style.visibility = "hidden";
+          continue;
+        }
+        node.style.visibility = "visible";
+        const msg = anchor.getBoundingClientRect();
+        const actionsEl = anchor.querySelector<HTMLElement>(
+          ".chat-response-actions",
+        );
+        const textEl = anchor.querySelector<HTMLElement>(".chat-response");
+        const panelH = Math.ceil(node.offsetHeight) || SIDE_SLOT_H;
+        const yStart = msg.top - railTop + SYNC_NUDGE_PX;
+        // Tope = arriba de los botones (o fin del texto), no debajo de ellos.
+        const endBottom = actionsEl
+          ? actionsEl.getBoundingClientRect().top - 8
+          : textEl
+            ? textEl.getBoundingClientRect().bottom
+            : msg.bottom;
+        const yEnd = endBottom - railTop - panelH;
+        const ySticky = stageTop + STICKY_TOP_PX - railTop;
+        let y = ySticky;
+        if (y < yStart) y = yStart;
+        if (yEnd >= yStart && y > yEnd) y = yEnd;
+        if (yEnd < yStart) y = yStart;
+        y = Math.round(y);
+        const next = `translate3d(0, ${y}px, 0)`;
+        if (node.style.transform !== next) node.style.transform = next;
+      }
+    };
+
+    const layoutSlots = () => {
+      for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
+        const id = node.dataset.syncMsg;
+        if (!id) continue;
+        const anchor = log.querySelector<HTMLElement>(`[data-side-msg="${id}"]`);
+        if (!anchor) continue;
+        const main =
+          anchor.querySelector<HTMLElement>(".chat-turn-main") ?? anchor;
+        const contentH = Math.ceil(main.offsetHeight);
+        const next = `${Math.max(contentH, SIDE_SLOT_H) + AFTER_GAP_PX}px`;
+        if (anchor.style.minHeight !== next) {
+          anchor.style.boxSizing = "border-box";
+          anchor.style.minHeight = next;
+        }
+      }
+      positionOnly();
+    };
+
+    const schedulePos = () => {
+      if (posRaf) return;
+      posRaf = window.requestAnimationFrame(() => {
+        posRaf = 0;
+        positionOnly();
+      });
+    };
+
+    const scheduleLayout = () => {
+      if (layoutRaf) return;
+      layoutRaf = window.requestAnimationFrame(() => {
+        layoutRaf = 0;
+        layoutSlots();
+      });
+    };
+
+    layoutSlots();
+    scrollRoot.addEventListener("scroll", schedulePos, { passive: true });
+    window.addEventListener("resize", scheduleLayout);
+    const ro = new ResizeObserver(scheduleLayout);
+    ro.observe(railEl);
+    for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
+      ro.observe(node);
+    }
+    for (const anchor of log.querySelectorAll<HTMLElement>("[data-side-msg]")) {
+      ro.observe(anchor.querySelector(".chat-turn-main") ?? anchor);
+    }
+    railEl.addEventListener("click", scheduleLayout);
+    return () => {
+      if (posRaf) window.cancelAnimationFrame(posRaf);
+      if (layoutRaf) window.cancelAnimationFrame(layoutRaf);
+      scrollRoot.removeEventListener("scroll", schedulePos);
+      window.removeEventListener("resize", scheduleLayout);
+      railEl.removeEventListener("click", scheduleLayout);
+      ro.disconnect();
+      clearSlots();
+    };
+  }, [rail, hasAnySidePanel, sideCompanions, messages]);
 
   const toggleDark = () => {
     setDark((current) => {
@@ -1758,20 +2480,111 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     });
   };
 
-  const upsertChatSession = (sessionId: string, nextMessages: ChatMessage[]) => {
+  const upsertChatSession = (
+    sessionId: string,
+    nextMessages: ChatMessage[],
+    side?: { resultItems?: ChatApiItem[]; qr?: ChatQrPayload[] },
+  ) => {
+    // No persistir chats vacíos (p. ej. "Empezar nueva" sin mensajes).
+    if (!nextMessages.length) {
+      setChatSessions((prev) => {
+        const next = mergeChatSessions(prev).filter((session) => session.id !== sessionId);
+        saveChatSessions(next);
+        return next;
+      });
+      return;
+    }
     setChatSessions((prev) => {
-      const base = chatHydratedRef.current ? prev : loadChatSessions();
+      const base = mergeChatSessions(prev);
+      const prevSession = base.find((session) => session.id === sessionId);
       const nextSession: ChatSession = {
         id: sessionId,
         title: chatTitleFromMessages(nextMessages),
         updatedAt: new Date().toISOString(),
         messages: nextMessages,
+        starred: prevSession?.starred,
+        resultItems:
+          side && "resultItems" in side
+            ? side.resultItems || []
+            : prevSession?.resultItems || [],
+        qr: side && "qr" in side ? side.qr || [] : prevSession?.qr || [],
       };
-      const next = [nextSession, ...base.filter((session) => session.id !== sessionId)];
+      const next = mergeChatSessions(base, nextSession);
       saveChatSessions(next);
       return next;
     });
   };
+
+  // Limpia solo resultItems huérfanos (nunca borra payloads QR ni overview).
+  useEffect(() => {
+    if (!activeChatId) return;
+    let changed = false;
+    const nextMessages = messages.map((message) => {
+      if (message.from !== "bot") return message;
+      if (Array.isArray(message.qr) && message.qr.length > 0) return message;
+      if (message.viewerOverview) return message;
+      const hasItems =
+        Array.isArray(message.resultItems) && message.resultItems.length > 0;
+      if (!hasItems || isQrBotMessage(message)) return message;
+      changed = true;
+      return { ...message, resultItems: undefined, qr: undefined };
+    });
+    if (!changed) return;
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    upsertChatSession(activeChatId, nextMessages);
+  }, [activeChatId, messages]);
+
+  // Recupera overview / QR faltantes según lo que pidió el usuario.
+  useEffect(() => {
+    if (!activeChatId || !messages.length) return;
+    let changed = false;
+    let lastSide:
+      | {
+          resultItems: ChatApiItem[];
+          qr: ChatQrPayload[];
+          viewerOverview?: ViewerOverview;
+        }
+      | undefined;
+    const nextMessages = messages.map((message, index) => {
+      if (message.from !== "bot") return message;
+      const prevUser = [...messages.slice(0, index)]
+        .reverse()
+        .find((item) => item.from === "user");
+      const userText = prevUser?.text || "";
+
+      // Resumen / inventario general → panel de totales+áreas+recientes
+      if (!message.viewerOverview && !(Array.isArray(message.qr) && message.qr.length)) {
+        const overview = detectViewerOverview(userText);
+        if (overview) {
+          changed = true;
+          lastSide = { resultItems: [], qr: [], viewerOverview: overview };
+          return {
+            ...message,
+            resultItems: [],
+            qr: undefined,
+            viewerOverview: overview,
+          };
+        }
+      }
+
+      if (!items.length) return message;
+      if (!isQrBotMessage(message)) return message;
+      if (Array.isArray(message.qr) && message.qr.length > 0) return message;
+      if (message.viewerOverview) return message;
+      const rows = resolveQrRowsFromPrompt(userText, message.text || "", items);
+      if (!rows.length) return message;
+      const side = buildQrSideFromRows(rows);
+      if (!side.qr.length) return message;
+      changed = true;
+      lastSide = side;
+      return { ...message, resultItems: side.resultItems, qr: side.qr };
+    });
+    if (!changed) return;
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    upsertChatSession(activeChatId, nextMessages, lastSide);
+  }, [activeChatId, messages, items]);
 
   useEffect(() => {
     if (!attachMenuOpen) return;
@@ -1791,12 +2604,79 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     };
   }, [attachMenuOpen]);
 
-  const sendChat = (value: string) => {
-    const text = value.trim();
+  const isSpreadsheetName = (name: string) =>
+    /\.(xlsx|xls|csv|txt)$/i.test(name);
+
+  const isAffirmativeChat = (value: string) =>
+    /^(sí|si|confirma|confirmo|adelante|ok|dale|importar|hazlo)\b/i.test(
+      value.trim(),
+    );
+
+  const finishBotReply = (
+    sessionId: string,
+    botId: number,
+    reply: string,
+    side?: {
+      resultItems?: ChatApiItem[];
+      qr?: ChatQrPayload[];
+      viewerOverview?: ViewerOverview;
+    },
+  ) => {
+    const finalMessages = messagesRef.current.map((m) =>
+      m.id === botId
+        ? {
+            ...m,
+            text: reply,
+            at: Date.now(),
+            ...(side
+              ? {
+                  resultItems: side.resultItems || [],
+                  qr: side.qr || [],
+                  viewerOverview: side.viewerOverview,
+                }
+              : null),
+          }
+        : m,
+    );
+    messagesRef.current = finalMessages;
+    setMessages(finalMessages);
+    upsertChatSession(sessionId, finalMessages, side);
+  };
+
+  const submitUserEdit = (messageId: number, nextText: string) => {
+    const text = nextText.trim();
     if (!text) return;
+    const idx = messagesRef.current.findIndex((message) => message.id === messageId);
+    if (idx < 0) return;
+    const removedIds = new Set(
+      messagesRef.current.slice(idx).map((message) => message.id),
+    );
+    const kept = messagesRef.current.slice(0, idx);
+    messagesRef.current = kept;
+    setMessages(kept);
+    setChatQrByMsg((prev) => {
+      const next: Record<number, ChatQrCard[]> = {};
+      for (const [key, cards] of Object.entries(prev)) {
+        const id = Number(key);
+        if (!removedIds.has(id)) next[id] = cards;
+      }
+      return next;
+    });
+    setEditingUserMsgId(null);
+    setEditDraft("");
+    const sessionId = activeChatIdRef.current;
+    if (sessionId) upsertChatSession(sessionId, kept);
+    void sendChat(text);
+  };
+
+  const sendChat = async (value: string) => {
+    const text = value.trim();
+    const attach = pendingAttach;
+    if (!text && !attach) return;
     const userId = chatId.current++;
     const botId = chatId.current++;
     setDraft("");
+    setPendingAttach(null);
     const now = Date.now();
     let sessionId = activeChatIdRef.current;
     if (!sessionId) {
@@ -1805,21 +2685,255 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ? crypto.randomUUID()
           : `chat-${Date.now()}`;
       activeChatIdRef.current = sessionId;
+      saveActiveChatId(sessionId);
       setActiveChatId(sessionId);
+    } else {
+      saveActiveChatId(sessionId);
     }
-    const nextMessages: ChatMessage[] = [
+
+    const attachNote = attach
+      ? attach.kind === "image"
+        ? `[Imagen: ${attach.name}]`
+        : `[Archivo: ${attach.name}]`
+      : "";
+    const userText = [attachNote, text].filter(Boolean).join("\n");
+
+    const history = messagesRef.current
+      .filter((m) => m.text.trim())
+      .slice(-12)
+      .map((m) => ({
+        role: (m.from === "user" ? "user" : "assistant") as "user" | "assistant",
+        content: m.text,
+      }));
+
+    const pendingMessages: ChatMessage[] = [
       ...messagesRef.current,
-      { id: userId, from: "user", text, at: now },
+      { id: userId, from: "user", text: userText, at: now },
       {
         id: botId,
         from: "bot",
         at: now + 1,
-        text: "Anotado. En cuanto esté conectado, voy a buscar eso en el inventario.",
+        text: "Consultando el inventario…",
       },
     ];
-    messagesRef.current = nextMessages;
-    setMessages(nextMessages);
-    upsertChatSession(sessionId, nextMessages);
+    messagesRef.current = pendingMessages;
+    setMessages(pendingMessages);
+    upsertChatSession(sessionId, pendingMessages);
+
+    // Confirmar importación Excel/CSV pendiente
+    if (pendingChatImport?.length && isAffirmativeChat(text)) {
+      try {
+        const result = await addInventarioBulkAction(pendingChatImport);
+        setPendingChatImport(null);
+        if (!result.success || !result.data?.length) {
+          finishBotReply(
+            sessionId,
+            botId,
+            result.error || "No se pudo importar el archivo.",
+          );
+          return;
+        }
+        const stamp = new Date().toISOString();
+        setItems((prev) => [
+          ...result.data!.map((row) => ({ ...row, updated_at: stamp })),
+          ...prev,
+        ]);
+        finishBotReply(
+          sessionId,
+          botId,
+          `Listo: importé ${result.data.length} artículo${result.data.length === 1 ? "" : "s"} al inventario.`,
+          {
+            resultItems: result.data.slice(0, 12).map((row) => rowToChatApiItem(row)),
+            qr: [],
+          },
+        );
+      } catch (err: unknown) {
+        setPendingChatImport(null);
+        finishBotReply(
+          sessionId,
+          botId,
+          err instanceof Error ? err.message : "Error al importar el archivo.",
+        );
+      }
+      return;
+    }
+
+    // Adjuntar Excel/CSV → vista previa y pedir confirmación
+    if (attach?.file && isSpreadsheetName(attach.name)) {
+      try {
+        const origen =
+          selectedInventarios[0] && selectedInventarios[0] !== "ALL"
+            ? selectedInventarios[0]
+            : "S/O";
+        const parsed = await parseInventarioImportFile(attach.file, origen);
+        if (!parsed.items.length) {
+          finishBotReply(
+            sessionId,
+            botId,
+            "No encontré filas válidas en el archivo (faltan Etiqueta o Artículo).",
+          );
+          return;
+        }
+        setPendingChatImport(parsed.items);
+        const sample = parsed.items
+          .slice(0, 5)
+          .map((item) => `• ${item.etiqueta} — ${item.articulo}`)
+          .join("\n");
+        const more =
+          parsed.items.length > 5
+            ? `\n… y ${parsed.items.length - 5} más.`
+            : "";
+        finishBotReply(
+          sessionId,
+          botId,
+          `Leí ${parsed.items.length} fila${parsed.items.length === 1 ? "" : "s"} de “${attach.name}” (origen ${origen}).\n${sample}${more}\n\n¿Confirmas importarlas? Responde sí.`,
+        );
+      } catch (err: unknown) {
+        finishBotReply(
+          sessionId,
+          botId,
+          err instanceof Error
+            ? err.message
+            : "No pude leer el Excel/CSV. Usa .xlsx, .xls o .csv.",
+        );
+      }
+      return;
+    }
+
+    let reply = "Sin respuesta del asistente.";
+    let sideItems: ChatApiItem[] = [];
+    let mutated = false;
+    let qrPayloads: ChatQrPayload[] = [];
+    const data = await askInventoryChat(userText || text, history);
+    reply = (data.reply || "").trim() || reply;
+    sideItems = data.items || [];
+    mutated = Boolean(data.mutated);
+    qrPayloads = data.qr || [];
+
+    // Si el usuario pidió QR/códigos y el backend no mandó payloads, armarlos.
+    const intentText = normalizeChatIntent(userText || text);
+    const wantsQr = /\bqr\b|\bcodig\w*\b|\bc[oó]dig\w*\b/.test(intentText) ||
+      /\bqr\b|c[oó]digos?/i.test(userText || text);
+    if (!qrPayloads.length && wantsQr && items.length) {
+      const rows = resolveQrRowsFromPrompt(userText || text, reply, items);
+      if (rows.length) {
+        const recovered = buildQrSideFromRows(rows);
+        qrPayloads = recovered.qr;
+        sideItems = recovered.resultItems;
+      }
+    }
+
+    // Si hay QR, el visor lista exactamente esos (no el lote de búsqueda previo).
+    if (qrPayloads.length) {
+      sideItems = qrPayloads.map((qr) => {
+        const match =
+          (qr.id != null
+            ? sideItems.find((item) => Number(item.id) === Number(qr.id))
+            : undefined) ||
+          sideItems.find(
+            (item) =>
+              String(item.etiqueta || "")
+                .trim()
+                .toLowerCase() ===
+              String(qr.etiqueta || "")
+                .trim()
+                .toLowerCase(),
+          ) ||
+          (qr.id != null
+            ? items.find((row) => Number(row.id) === Number(qr.id))
+            : undefined) ||
+          items.find(
+            (row) =>
+              String(row.etiqueta || "")
+                .trim()
+                .toLowerCase() ===
+              String(qr.etiqueta || "")
+                .trim()
+                .toLowerCase(),
+          );
+        return {
+          id: qr.id ?? match?.id ?? null,
+          etiqueta: qr.etiqueta ?? match?.etiqueta ?? null,
+          articulo: qr.articulo ?? match?.articulo ?? null,
+          persona: qr.persona ?? match?.persona ?? null,
+          area: qr.area ?? match?.area ?? null,
+          origen: qr.origen ?? match?.origen ?? null,
+          marca: match?.marca ?? null,
+          modelo: match?.modelo ?? null,
+          serie: match?.serie ?? null,
+          cantidad: match?.cantidad ?? null,
+          estado: match?.estado ?? null,
+          observaciones: match?.observaciones ?? null,
+        };
+      });
+    }
+
+    // Incidencias del visor: QR ≠ resumen. Prioriza lo que pidió el usuario.
+    const askedOverview = detectViewerOverview(userText || text);
+    const overview = qrPayloads.length ? undefined : askedOverview;
+    // Si pidió resumen, no mezclar lista de búsqueda en el panel.
+    if (overview) {
+      sideItems = [];
+      qrPayloads = [];
+    }
+    const hasNewSide =
+      sideItems.length > 0 || qrPayloads.length > 0 || Boolean(overview);
+
+    if (hasNewSide) {
+      if (qrPayloads.length) {
+        const cards = await buildChatQrCards(qrPayloads);
+        setChatQrByMsg((prev) => ({ ...prev, [botId]: cards }));
+      }
+    }
+
+    if (mutated && sideItems.length) {
+      const stamp = new Date().toISOString();
+      setItems((prev) => {
+        const next = [...prev];
+        for (const item of sideItems) {
+          if (item.id == null) continue;
+          const id = Number(item.id);
+          const patch: InventarioRow = {
+            id,
+            etiqueta: item.etiqueta ?? null,
+            articulo: item.articulo ?? null,
+            marca: item.marca ?? null,
+            modelo: item.modelo ?? null,
+            serie: item.serie ?? null,
+            area: item.area ?? null,
+            persona: item.persona ?? null,
+            cantidad: item.cantidad ?? null,
+            estado: item.estado ?? null,
+            origen: item.origen ?? null,
+            observaciones: item.observaciones ?? null,
+            updated_at: stamp,
+          };
+          const idx = next.findIndex((row) => Number(row.id) === id);
+          if (idx >= 0) next[idx] = { ...next[idx], ...patch };
+          else next.unshift(patch);
+        }
+        return next;
+      });
+    }
+
+    // Chat: primero la incidencia (texto); la tabla va al visor o al final del mensaje.
+    const chatReply = overview
+      ? stripChatMarkdownTables(reply)
+      : reorderChatProseThenTable(reply);
+
+    finishBotReply(
+      sessionId,
+      botId,
+      chatReply || reply,
+      hasNewSide
+        ? {
+            // Si hay resumen/overview, no mandar items: el visor muestra la tabla.
+            resultItems: overview ? [] : sideItems,
+            qr: qrPayloads,
+            viewerOverview: overview,
+          }
+        : undefined,
+    );
   };
 
   const scrollApartadoToTop = useCallback(() => {
@@ -1870,11 +2984,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   }, []);
 
   const openConsultasApartado = useCallback(() => {
-    activeChatIdRef.current = null;
-    messagesRef.current = [];
-    setActiveChatId(null);
-    setMessages([]);
+    // Solo abre el apartado de chat/historial; no borra la conversación activa.
     setDraft("");
+    setPendingAttach(null);
+    setAttachMenuOpen(false);
     changeRail("archivos");
   }, [changeRail]);
 
@@ -1885,11 +2998,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         : `chat-${Date.now()}`;
     activeChatIdRef.current = id;
     messagesRef.current = [];
+    saveActiveChatId(id);
     setActiveChatId(id);
     setMessages([]);
     setDraft("");
     setPendingAttach(null);
     setAttachMenuOpen(false);
+    setChatQrByMsg({});
+    setPendingChatImport(null);
     changeRail("archivos");
   }, [changeRail]);
 
@@ -1900,31 +3016,51 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     (sessionId: string) => {
       const session = chatSessionsRef.current.find((item) => item.id === sessionId);
       if (!session) return;
+      const side = resolveSessionSide(session, items);
+      let nextMessages = session.messages;
+      if (
+        (side.resultItems.length || side.qr.length) &&
+        !nextMessages.some((message) => messageHasSideData(message))
+      ) {
+        const owner =
+          findQrOwnerMessage(nextMessages) ||
+          [...nextMessages].reverse().find((message) => message.from === "bot");
+        if (owner) {
+          nextMessages = nextMessages.map((message) =>
+            message.id === owner.id
+              ? { ...message, resultItems: side.resultItems, qr: side.qr }
+              : message,
+          );
+        }
+      }
       activeChatIdRef.current = session.id;
-      messagesRef.current = session.messages;
+      messagesRef.current = nextMessages;
+      saveActiveChatId(session.id);
       setActiveChatId(session.id);
-      setMessages(session.messages);
-      const maxId = session.messages.reduce((max, message) => Math.max(max, message.id), 0);
+      setMessages(nextMessages);
+      setChatQrByMsg({});
+      const maxId = nextMessages.reduce((max, message) => Math.max(max, message.id), 0);
       chatId.current = maxId + 1;
       setDraft("");
       changeRail("archivos");
     },
-    [changeRail],
+    [changeRail, items],
   );
 
   const deleteChatSession = useCallback((sessionId: string) => {
     setChatSessions((prev) => {
-      const base = chatHydratedRef.current ? prev : loadChatSessions();
-      const next = base.filter((session) => session.id !== sessionId);
+      const next = mergeChatSessions(prev).filter((session) => session.id !== sessionId);
       saveChatSessions(next);
       return next;
     });
     if (activeChatIdRef.current === sessionId) {
       activeChatIdRef.current = null;
       messagesRef.current = [];
+      saveActiveChatId(null);
       setActiveChatId(null);
       setMessages([]);
       setDraft("");
+      setChatQrByMsg({});
     }
   }, []);
 
@@ -2527,12 +3663,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
           {rail === "archivos" ? (
             <div
+              ref={chatStageRef}
               className={
-                chatStarted && lastBotMessageId != null
-                  ? "chat-stage is-conversation with-incidencias"
-                  : chatStarted
-                    ? "chat-stage is-conversation"
-                    : "chat-stage is-home"
+                chatStarted
+                  ? "chat-stage is-conversation has-viewer"
+                  : "chat-stage is-home"
               }
             >
               <section className="chat-shell" aria-label="Chat del inventario">
@@ -2558,19 +3693,74 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                     </div>
                   ) : (
                     <div className="chat-log" ref={chatLogRef} aria-live="polite">
-                      {messages.map((message) => {
-                        const isUser = message.from === "user";
-                        const canCollapse =
-                          isUser && message.text.trim().length > CHAT_USER_COLLAPSE_AT;
-                        const expanded = expandedUserMsgs.includes(message.id);
-
-                        return (
-                          <div
-                            className={isUser ? "chat-row is-user" : "chat-row is-bot"}
-                            key={message.id}
-                          >
-                            {isUser ? (
-                              <>
+                      {(() => {
+                        let latestAnchorIndex = Math.max(chatTurns.length - 1, 0);
+                        for (let i = chatTurns.length - 1; i >= 0; i -= 1) {
+                          const item = chatTurns[i];
+                          if (item.kind === "pair") {
+                            latestAnchorIndex = i;
+                            break;
+                          }
+                          if (item.kind === "single" && item.message.from === "user") {
+                            latestAnchorIndex = i;
+                            break;
+                          }
+                        }
+                        return chatTurns.map((turn, turnIndex) => {
+                        const isLatest = turnIndex === latestAnchorIndex;
+                        const renderUser = (message: ChatMessage) => {
+                          const canCollapse =
+                            message.text.trim().length > CHAT_USER_COLLAPSE_AT;
+                          const expanded = expandedUserMsgs.includes(message.id);
+                          const isEditing = editingUserMsgId === message.id;
+                          if (isEditing) {
+                            return (
+                              <ChatUserEditBox
+                                key={`edit-${message.id}`}
+                                initialText={editDraft || message.text}
+                                onChange={setEditDraft}
+                                onCancel={() => {
+                                  setEditingUserMsgId(null);
+                                  setEditDraft("");
+                                }}
+                                onSubmit={(value) =>
+                                  submitUserEdit(message.id, value)
+                                }
+                              />
+                            );
+                          }
+                          return (
+                            <>
+                              <div className="chat-user-row">
+                                <div
+                                  className="chat-user-actions"
+                                  aria-label="Acciones del mensaje"
+                                >
+                                  <button
+                                    type="button"
+                                    className="chat-user-action"
+                                    title="Copiar"
+                                    aria-label="Copiar mensaje"
+                                    onMouseDown={(event) => event.preventDefault()}
+                                    onClick={() => {
+                                      void copyChatText(message.text);
+                                    }}
+                                  >
+                                    <Copy size={15} strokeWidth={1.8} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="chat-user-action"
+                                    title="Editar"
+                                    aria-label="Editar mensaje"
+                                    onClick={() => {
+                                      setEditingUserMsgId(message.id);
+                                      setEditDraft(message.text);
+                                    }}
+                                  >
+                                    <Pencil size={15} strokeWidth={1.8} />
+                                  </button>
+                                </div>
                                 <div className="chat-user-card">
                                   <p
                                     className={
@@ -2585,7 +3775,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                     <button
                                       type="button"
                                       className="chat-expand-btn"
-                                      aria-label={expanded ? "Mostrar menos" : "Mostrar más"}
+                                      aria-label={
+                                        expanded ? "Mostrar menos" : "Mostrar más"
+                                      }
                                       onClick={() =>
                                         setExpandedUserMsgs((prev) =>
                                           expanded
@@ -2602,65 +3794,107 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                     </button>
                                   ) : null}
                                 </div>
-                                <time className="chat-time" dateTime={new Date(message.at || Date.now()).toISOString()}>
-                                  {formatChatTime(message.at)}
-                                </time>
-                              </>
-                            ) : (
-                              <div className="chat-response-block">
-                                <div className="chat-response">
-                                  {renderChatRichText(message.text)}
-                                </div>
-                                <div className="chat-response-actions" aria-label="Acciones de la respuesta">
-                                  <button
-                                    type="button"
-                                    className="chat-response-action"
-                                    title="Copiar"
-                                    aria-label="Copiar respuesta"
-                                    onClick={() => {
-                                      void navigator.clipboard?.writeText(message.text);
-                                    }}
-                                  >
-                                    <Copy size={15} strokeWidth={1.8} />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chat-response-action"
-                                    title="Compartir"
-                                    aria-label="Compartir respuesta"
-                                  >
-                                    <Share2 size={15} strokeWidth={1.8} />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chat-response-action"
-                                    title="Me gusta"
-                                    aria-label="Me gusta"
-                                  >
-                                    <ThumbsUp size={15} strokeWidth={1.8} />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chat-response-action"
-                                    title="No me gusta"
-                                    aria-label="No me gusta"
-                                  >
-                                    <ThumbsDown size={15} strokeWidth={1.8} />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chat-response-action"
-                                    title="Más"
-                                    aria-label="Más opciones"
-                                  >
-                                    <MoreVertical size={15} strokeWidth={1.8} />
-                                  </button>
-                                </div>
                               </div>
-                            )}
+                              <time
+                                className="chat-time"
+                                dateTime={new Date(message.at || Date.now()).toISOString()}
+                              >
+                                {formatChatTime(message.at)}
+                              </time>
+                            </>
+                          );
+                        };
+
+                        const renderBot = (message: ChatMessage) => (
+                          <div className="chat-response-block">
+                            <div className="chat-response">
+                              {renderChatRichText(message.text)}
+                            </div>
+                            <div
+                              className="chat-response-actions"
+                              aria-label="Acciones de la respuesta"
+                            >
+                              <button
+                                type="button"
+                                className="chat-response-action"
+                                title="Copiar"
+                                aria-label="Copiar respuesta"
+                                onClick={() => {
+                                  void copyChatText(message.text);
+                                }}
+                              >
+                                <Copy size={15} strokeWidth={1.8} />
+                              </button>
+                              <button
+                                type="button"
+                                className="chat-response-action"
+                                title="Compartir"
+                                aria-label="Compartir respuesta"
+                              >
+                                <Share2 size={15} strokeWidth={1.8} />
+                              </button>
+                              <button
+                                type="button"
+                                className="chat-response-action"
+                                title="Me gusta"
+                                aria-label="Me gusta"
+                              >
+                                <ThumbsUp size={15} strokeWidth={1.8} />
+                              </button>
+                              <button
+                                type="button"
+                                className="chat-response-action"
+                                title="No me gusta"
+                                aria-label="No me gusta"
+                              >
+                                <ThumbsDown size={15} strokeWidth={1.8} />
+                              </button>
+                              <button
+                                type="button"
+                                className="chat-response-action"
+                                title="Más"
+                                aria-label="Más opciones"
+                              >
+                                <MoreVertical size={15} strokeWidth={1.8} />
+                              </button>
+                            </div>
                           </div>
                         );
-                      })}
+
+                        if (turn.kind === "pair") {
+                          return (
+                            <section
+                              className="chat-turn"
+                              key={`pair-${turn.user.id}-${turn.bot.id}`}
+                              data-chat-latest={isLatest ? "true" : undefined}
+                              data-side-msg={turn.bot.id}
+                            >
+                              <div className="chat-turn-main">
+                                <div className="chat-turn-query">
+                                  {renderUser(turn.user)}
+                                </div>
+                                <div className="chat-turn-body">
+                                  {renderBot(turn.bot)}
+                                </div>
+                              </div>
+                            </section>
+                          );
+                        }
+
+                        const message = turn.message;
+                        const isUser = message.from === "user";
+                        return (
+                          <div
+                            className={isUser ? "chat-row is-user" : "chat-row is-bot"}
+                            key={message.id}
+                            data-chat-latest={isLatest ? "true" : undefined}
+                          >
+                            {isUser ? renderUser(message) : renderBot(message)}
+                          </div>
+                        );
+                      });
+                      })()}
+                      <div className="chat-log-spacer" aria-hidden="true" />
                     </div>
                   )}
                 </div>
@@ -2686,16 +3920,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                     className="chat-composer is-docked"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      const text = draft.trim();
-                      const attachNote = pendingAttach
-                        ? pendingAttach.kind === "image"
-                          ? `[Imagen: ${pendingAttach.name}]`
-                          : `[Archivo: ${pendingAttach.name}]`
-                        : "";
-                      const payload = [attachNote, text].filter(Boolean).join("\n");
-                      if (!payload) return;
-                      setPendingAttach(null);
-                      sendChat(payload);
+                      if (!draft.trim() && !pendingAttach) return;
+                      void sendChat(draft);
                     }}
                   >
                     <div className="chat-attach-wrap" ref={chatAttachRef}>
@@ -2707,7 +3933,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                         onChange={(event) => {
                           const file = event.target.files?.[0];
                           if (file) {
-                            setPendingAttach({ kind: "image", name: file.name });
+                            setPendingAttach({
+                              kind: "image",
+                              name: file.name,
+                              file,
+                            });
                             setAttachMenuOpen(false);
                           }
                           event.target.value = "";
@@ -2716,11 +3946,16 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                       <input
                         ref={chatFileInputRef}
                         type="file"
+                        accept=".csv,.txt,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         hidden
                         onChange={(event) => {
                           const file = event.target.files?.[0];
                           if (file) {
-                            setPendingAttach({ kind: "file", name: file.name });
+                            setPendingAttach({
+                              kind: "file",
+                              name: file.name,
+                              file,
+                            });
                             setAttachMenuOpen(false);
                           }
                           event.target.value = "";
@@ -2759,7 +3994,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             onClick={() => chatFileInputRef.current?.click()}
                           >
                             <Paperclip size={18} strokeWidth={1.8} aria-hidden="true" />
-                            <span>Subir archivos</span>
+                            <span>Excel / CSV</span>
                           </button>
                         </div>
                       ) : null}
@@ -2787,34 +4022,42 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   </form>
                 </div>
               </section>
-
-              {chatStarted && lastBotMessageId != null ? (
-                <aside className="chat-side-panel" aria-hidden="true">
-                  <div className="chat-side-panel-inner">
-                    {chatSideCards.map((card) => (
-                      <article key={card.id} className={`chat-side-card tone-${card.tone}`}>
-                        <header className="chat-side-card-top">
-                          <span className="chat-side-card-source">
-                            <span className="chat-side-favicon" />
-                            {card.source}
-                          </span>
-                          <span className="chat-side-card-more">
-                            <MoreVertical size={14} />
-                          </span>
-                        </header>
-                        <div className="chat-side-card-body">
-                          <div className="chat-side-card-copy">
-                            <strong>{card.title}</strong>
-                            <p>{card.snippet}</p>
-                          </div>
-                          <span className="chat-side-thumb" />
+              {chatStarted ? (
+                <aside
+                  className={`chat-viewer${hasAnySidePanel ? " is-filled is-sync" : " is-slot"}`}
+                  ref={viewerRailRef}
+                  aria-label="Visor del chatbot"
+                  aria-hidden={!hasAnySidePanel}
+                >
+                  {hasAnySidePanel
+                    ? sideCompanions.map((companion) => (
+                        <div
+                          key={companion.messageId}
+                          className="chat-viewer-sync-item"
+                          data-sync-msg={companion.messageId}
+                        >
+                          <ChatViewer
+                            inventory={items}
+                            resultItems={companion.resultItems}
+                            qrCards={companion.qrCards}
+                            overview={companion.overview}
+                            onSelectItem={(item) => {
+                              const id = Number(item.id);
+                              if (Number.isFinite(id)) {
+                                const match = items.find(
+                                  (row) => Number(row.id) === id,
+                                );
+                                if (match) {
+                                  setSelectedProduct(match);
+                                  return;
+                                }
+                              }
+                              setSelectedProduct(item as InventarioRow);
+                            }}
+                          />
                         </div>
-                      </article>
-                    ))}
-                    <button type="button" className="chat-side-show-all" tabIndex={-1}>
-                      Mostrar todo
-                    </button>
-                  </div>
+                      ))
+                    : null}
                 </aside>
               ) : null}
             </div>
