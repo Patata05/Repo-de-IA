@@ -1,17 +1,19 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import QRCode from "qrcode";
 import {
   Boxes,
   Calendar,
   Check,
+  ChevronDown,
   Copy,
   Edit3,
-  ExternalLink,
   Laptop,
   Loader2,
   MapPin,
   Package,
+  Plus,
   Printer,
   QrCode,
   Save,
@@ -24,6 +26,196 @@ import {
 } from "lucide-react";
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import { updateInventarioAction, deleteInventarioAction } from "@/app/actions";
+import ModalPortal from "@/components/modal-portal";
+import { nextInventarioName } from "@/lib/inventario-origen";
+
+const ESTADO_OPTIONS = ["Activo", "Inactivo"] as const;
+
+function ModernEstadoSelect({
+  id,
+  value,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = value === "Inactivo" ? "Inactivo" : "Activo";
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div
+      className={`report-select form-modern-select estado-modern-select ${open ? "is-open" : ""}`}
+      ref={rootRef}
+    >
+      <button
+        id={id}
+        type="button"
+        className="report-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span
+          className={
+            selected === "Inactivo" ? "estado-badge is-inactivo" : "estado-badge is-activo"
+          }
+        >
+          {selected}
+        </span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <ul className="report-select-menu" role="listbox" aria-labelledby={id}>
+          {ESTADO_OPTIONS.map((option) => {
+            const active = option === selected;
+            return (
+              <li key={option} role="option" aria-selected={active}>
+                <button
+                  type="button"
+                  className={active ? "report-select-option is-active" : "report-select-option"}
+                  onClick={() => {
+                    onChange(option);
+                    setOpen(false);
+                  }}
+                >
+                  <span
+                    className={
+                      option === "Inactivo"
+                        ? "estado-badge is-inactivo"
+                        : "estado-badge is-activo"
+                    }
+                  >
+                    {option}
+                  </span>
+                  {active ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function ModernOrigenSelect({
+  id,
+  value,
+  options,
+  createOption,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  options: readonly string[];
+  createOption?: string | null;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const allOptions = createOption
+    ? [...options.filter((o) => o !== createOption), createOption]
+    : [...options];
+  if (value && !allOptions.includes(value)) allOptions.unshift(value);
+  const selected = allOptions.includes(value) ? value : allOptions[0] || value;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className={`report-select form-modern-select ${open ? "is-open" : ""}`} ref={rootRef}>
+      <button
+        id={id}
+        type="button"
+        className="report-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{selected || "Seleccionar inventario"}</span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <ul className="report-select-menu" role="listbox" aria-labelledby={id}>
+          {allOptions
+            .filter((option) => option !== createOption)
+            .map((option) => {
+              const active = option === selected;
+              return (
+                <li key={option} role="option" aria-selected={active}>
+                  <button
+                    type="button"
+                    className={active ? "report-select-option is-active" : "report-select-option"}
+                    onClick={() => {
+                      onChange(option);
+                      setOpen(false);
+                    }}
+                  >
+                    <span>{option}</span>
+                    {active ? <Check size={14} aria-hidden="true" /> : null}
+                  </button>
+                </li>
+              );
+            })}
+          {createOption ? (
+            <li role="option" aria-selected={selected === createOption}>
+              <button
+                type="button"
+                className={
+                  selected === createOption
+                    ? "report-select-option is-active is-create"
+                    : "report-select-option is-create"
+                }
+                onClick={() => {
+                  onChange(createOption);
+                  setOpen(false);
+                }}
+              >
+                <span>Nuevo conteo · {createOption}</span>
+                {selected === createOption ? (
+                  <Check size={14} aria-hidden="true" />
+                ) : (
+                  <Plus size={14} aria-hidden="true" />
+                )}
+              </button>
+            </li>
+          ) : null}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
 
 interface ProductDetailModalProps {
   product: InventarioRow | null;
@@ -33,9 +225,8 @@ interface ProductDetailModalProps {
   onDeleted: (id: number) => void;
   existingAreas: string[];
   existingPeople: string[];
+  existingOrigens: string[];
 }
-
-const ORIGEN_OPTIONS = ["Compra", "Donación", "Préstamo", "Traslado", "Otro"] as const;
 
 export default function ProductDetailModal({
   product,
@@ -45,14 +236,21 @@ export default function ProductDetailModal({
   onDeleted,
   existingAreas,
   existingPeople,
+  existingOrigens,
 }: ProductDetailModalProps) {
+  const createOrigenOption = useMemo(
+    () => nextInventarioName(existingOrigens),
+    [existingOrigens],
+  );
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleteSubmitting, setIsDeleteSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [etiquetaCopied, setEtiquetaCopied] = useState(false);
   const [showQrExpanded, setShowQrExpanded] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState("");
 
   // Form State para edición
   const [editForm, setEditForm] = useState<NewInventarioItem>({
@@ -65,7 +263,8 @@ export default function ProductDetailModal({
     persona: "",
     cantidad: 1,
     observaciones: "",
-    origen: "Compra",
+    estado: "Activo",
+    origen: "S/O",
   });
 
   // Cargar datos del producto al abrir o cambiar
@@ -81,15 +280,60 @@ export default function ProductDetailModal({
         persona: product.persona || "",
         cantidad: product.cantidad ?? 1,
         observaciones: product.observaciones || "",
-        origen: product.origen || "Compra",
+        estado:
+          String(product.estado ?? "")
+            .trim()
+            .toLowerCase() === "inactivo"
+            ? "Inactivo"
+            : "Activo",
+        origen: product.origen || "S/O",
       });
       setIsEditing(false);
       setIsDeleting(false);
       setErrorMessage(null);
       setCopied(false);
+      setEtiquetaCopied(false);
       setShowQrExpanded(false);
     }
   }, [product, isOpen]);
+
+  // QR local (sin API externa) para que aparezca al instante
+  useEffect(() => {
+    if (!isOpen || !product) {
+      setQrDataUrl("");
+      return;
+    }
+
+    const payload = JSON.stringify({
+      etiqueta: product.etiqueta,
+      articulo: product.articulo,
+      marca: product.marca,
+      modelo: product.modelo,
+      serie: product.serie,
+      area: product.area,
+      persona: product.persona,
+      cantidad: product.cantidad,
+      origen: product.origen,
+    });
+
+    let cancelled = false;
+    QRCode.toDataURL(payload, {
+      width: 240,
+      margin: 2,
+      errorCorrectionLevel: "M",
+      color: { dark: "#0b1220", light: "#ffffff" },
+    })
+      .then((url) => {
+        if (!cancelled) setQrDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setQrDataUrl("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, product]);
 
   // Manejo de ESC
   useEffect(() => {
@@ -111,21 +355,7 @@ export default function ProductDetailModal({
 
   if (!isOpen || !product) return null;
 
-  // Generar URL para el código QR del producto
-  const qrPayload = JSON.stringify({
-    etiqueta: product.etiqueta,
-    articulo: product.articulo,
-    marca: product.marca,
-    modelo: product.modelo,
-    serie: product.serie,
-    area: product.area,
-    persona: product.persona,
-    cantidad: product.cantidad,
-    origen: product.origen,
-  });
-  const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=8&data=${encodeURIComponent(
-    qrPayload
-  )}`;
+  const qrImageUrl = qrDataUrl;
 
   // Formatear fechas
   const formatDate = (isoString?: string | null) => {
@@ -140,6 +370,18 @@ export default function ProductDetailModal({
     }
   };
 
+  const handleCopyEtiqueta = async () => {
+    const tag = String(product.etiqueta ?? "").trim();
+    if (!tag) return;
+    try {
+      await navigator.clipboard.writeText(tag);
+      setEtiquetaCopied(true);
+      setTimeout(() => setEtiquetaCopied(false), 2000);
+    } catch (err) {
+      console.error("Error al copiar etiqueta:", err);
+    }
+  };
+
   // Copiar Ficha Técnica al portapapeles
   const handleCopyFicha = async () => {
     const text = `FICHA DE INVENTARIO
@@ -151,7 +393,7 @@ Serie: ${product.serie || "—"}
 Área: ${product.area || "—"}
 Asignado a: ${product.persona || "Sin asignar"}
 Cantidad: ${product.cantidad ?? 1}
-Origen: ${product.origen || "Compra"}
+Origen: ${product.origen || "S/O"}
 Observaciones: ${product.observaciones || "Ninguna"}
 Registrado: ${formatDate(product.created_at)}`;
 
@@ -269,7 +511,7 @@ Registrado: ${formatDate(product.created_at)}`;
     try {
       const res = await updateInventarioAction(product.id, editForm);
       if (!res.success || !res.data) {
-        setErrorMessage(res.error || "No se pudo actualizar el producto.");
+        setErrorMessage(res.error || "No se pudo actualizar el artículo.");
         setIsSaving(false);
         return;
       }
@@ -292,7 +534,7 @@ Registrado: ${formatDate(product.created_at)}`;
     try {
       const res = await deleteInventarioAction(product.id);
       if (!res.success) {
-        setErrorMessage(res.error || "No se pudo eliminar el producto.");
+        setErrorMessage(res.error || "No se pudo eliminar el artículo.");
         setIsDeleteSubmitting(false);
         return;
       }
@@ -300,13 +542,14 @@ Registrado: ${formatDate(product.created_at)}`;
       onDeleted(product.id);
       onClose();
     } catch (err: unknown) {
-      setErrorMessage(err instanceof Error ? err.message : "Error al eliminar producto.");
+      setErrorMessage(err instanceof Error ? err.message : "Error al eliminar artículo.");
     } finally {
       setIsDeleteSubmitting(false);
     }
   };
 
   return (
+    <ModalPortal>
     <div
       className="product-modal-overlay"
       role="dialog"
@@ -316,35 +559,53 @@ Registrado: ${formatDate(product.created_at)}`;
       <div className="product-modal-card detail-modal-card">
         {/* Encabezado del Detalle */}
         <header className="product-modal-header detail-header">
-          <div className="detail-header-left">
-            <span className="detail-tag-badge">{product.etiqueta}</span>
-            <div>
+          <div className="detail-header-main">
+            <div className="detail-header-title-row">
+              <span className="detail-tag-badge">{product.etiqueta}</span>
               <h2 id="detail-modal-title">{product.articulo}</h2>
-              <div className="detail-subtitle-pills">
-                <span className="detail-pill pill-area">
-                  <MapPin size={12} />
-                  <span>{product.area || "General"}</span>
+            </div>
+            <div className="detail-subtitle-pills">
+              <span className="detail-pill pill-area">
+                <MapPin size={12} />
+                <span>{product.area || "General"}</span>
+              </span>
+              <span className="detail-pill pill-origen">
+                <span>{product.origen || "S/O"}</span>
+              </span>
+              {product.cantidad && product.cantidad > 1 ? (
+                <span className="detail-pill pill-qty">
+                  <Boxes size={12} />
+                  <span>{product.cantidad} unidades</span>
                 </span>
-                <span className="detail-pill pill-origen">
-                  <span>{product.origen || "Compra"}</span>
-                </span>
-                {product.cantidad && product.cantidad > 1 ? (
-                  <span className="detail-pill pill-qty">
-                    <Boxes size={12} />
-                    <span>{product.cantidad} unidades</span>
-                  </span>
-                ) : null}
-              </div>
+              ) : null}
             </div>
           </div>
-          <button
-            type="button"
-            className="product-modal-close"
-            onClick={onClose}
-            aria-label="Cerrar ventana"
-          >
-            <X size={19} />
-          </button>
+          <div className="detail-header-aside">
+            <span
+              className={
+                String(product.estado ?? "")
+                  .trim()
+                  .toLowerCase() === "inactivo"
+                  ? "estado-badge is-inactivo"
+                  : "estado-badge is-activo"
+              }
+              title="Estado del artículo"
+            >
+              {String(product.estado ?? "")
+                .trim()
+                .toLowerCase() === "inactivo"
+                ? "Inactivo"
+                : "Activo"}
+            </span>
+            <button
+              type="button"
+              className="product-modal-close"
+              onClick={onClose}
+              aria-label="Cerrar ventana"
+            >
+              <X size={19} />
+            </button>
+          </div>
         </header>
 
         {/* Mensaje de error si ocurre */}
@@ -394,7 +655,7 @@ Registrado: ${formatDate(product.created_at)}`;
                 ) : (
                   <>
                     <Trash2 size={15} />
-                    <span>Sí, eliminar producto</span>
+                    <span>Sí, eliminar artículo</span>
                   </>
                 )}
               </button>
@@ -523,20 +784,23 @@ Registrado: ${formatDate(product.created_at)}`;
               </div>
 
               <div className="form-field">
-                <label htmlFor="edit-origen">Origen</label>
-                <select
+                <label htmlFor="edit-origen">Origen (inventario del conteo)</label>
+                <ModernOrigenSelect
                   id="edit-origen"
-                  value={editForm.origen || "Compra"}
-                  onChange={(e) =>
-                    setEditForm((prev) => ({ ...prev, origen: e.target.value }))
-                  }
-                >
-                  {ORIGEN_OPTIONS.map((opt) => (
-                    <option key={opt} value={opt}>
-                      {opt}
-                    </option>
-                  ))}
-                </select>
+                  value={editForm.origen || createOrigenOption}
+                  options={existingOrigens}
+                  createOption={createOrigenOption}
+                  onChange={(origen) => setEditForm((prev) => ({ ...prev, origen }))}
+                />
+              </div>
+
+              <div className="form-field">
+                <label htmlFor="edit-estado">Estado del artículo</label>
+                <ModernEstadoSelect
+                  id="edit-estado"
+                  value={editForm.estado === "Inactivo" ? "Inactivo" : "Activo"}
+                  onChange={(estado) => setEditForm((prev) => ({ ...prev, estado }))}
+                />
               </div>
 
               <div className="form-field form-field-full">
@@ -638,7 +902,7 @@ Registrado: ${formatDate(product.created_at)}`;
                   {/* Origen */}
                   <div className="detail-card">
                     <span className="detail-label">Origen</span>
-                    <strong className="detail-value">{product.origen || "Compra"}</strong>
+                    <strong className="detail-value">{product.origen || "S/O"}</strong>
                   </div>
 
                   {/* Fechas de Sistema */}
@@ -680,12 +944,16 @@ Registrado: ${formatDate(product.created_at)}`;
                     <QrCode size={15} /> Código QR de Activo
                   </span>
                   <div className="qr-img-wrapper">
-                    <img
-                      src={qrImageUrl}
-                      alt={`QR ${product.etiqueta}`}
-                      className="qr-img"
-                      loading="lazy"
-                    />
+                    {qrImageUrl ? (
+                      <img
+                        src={qrImageUrl}
+                        alt={`QR ${product.etiqueta}`}
+                        className="qr-img"
+                        decoding="sync"
+                      />
+                    ) : (
+                      <div className="qr-img qr-img-placeholder" aria-hidden="true" />
+                    )}
                   </div>
                   <span className="qr-tag-label">{product.etiqueta}</span>
                   <p className="qr-instruction">
@@ -697,22 +965,22 @@ Registrado: ${formatDate(product.created_at)}`;
                       type="button"
                       className="qr-btn"
                       onClick={handlePrintLabel}
-                      title="Imprimir etiqueta adhesiva para este producto"
+                      disabled={!qrImageUrl}
+                      title="Imprimir etiqueta adhesiva para este artículo"
                     >
                       <Printer size={14} />
                       <span>Imprimir etiqueta</span>
                     </button>
-                    <a
-                      href={qrImageUrl}
-                      download={`QR-${product.etiqueta}.png`}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
                       className="qr-btn"
-                      title="Descargar imagen del código QR"
+                      onClick={handleCopyEtiqueta}
+                      disabled={!product.etiqueta}
+                      title="Copiar etiqueta al portapapeles"
                     >
-                      <ExternalLink size={14} />
-                      <span>Descargar QR</span>
-                    </a>
+                      {etiquetaCopied ? <Check size={14} /> : <Copy size={14} />}
+                      <span>{etiquetaCopied ? "¡Copiada!" : "Copiar etiqueta"}</span>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -721,18 +989,16 @@ Registrado: ${formatDate(product.created_at)}`;
             {/* BARRA DE ACCIONES INFERIOR */}
             <div className="detail-actions-bar">
               <div className="detail-actions-left">
-                {/* Opción Útil: Copiar Ficha */}
                 <button
                   type="button"
                   className="btn-action-tool"
                   onClick={handleCopyFicha}
-                  title="Copiar todos los datos de este producto al portapapeles"
+                  title="Copiar todos los datos de este artículo al portapapeles"
                 >
                   {copied ? <Check size={15} className="text-teal" /> : <Copy size={15} />}
                   <span>{copied ? "¡Copiado!" : "Copiar ficha"}</span>
                 </button>
 
-                {/* Opción Útil: Imprimir */}
                 <button
                   type="button"
                   className="btn-action-tool"
@@ -745,26 +1011,24 @@ Registrado: ${formatDate(product.created_at)}`;
               </div>
 
               <div className="detail-actions-right">
-                {/* Botón Eliminar */}
                 <button
                   type="button"
                   className="btn-action-danger"
                   onClick={() => setIsDeleting(true)}
-                  title="Eliminar este producto de la base de datos"
+                  title="Eliminar este artículo de la base de datos"
                 >
                   <Trash2 size={15} />
                   <span>Eliminar</span>
                 </button>
 
-                {/* Botón Modificar / Editar */}
                 <button
                   type="button"
                   className="btn-action-edit"
                   onClick={() => setIsEditing(true)}
-                  title="Editar la información de este producto"
+                  title="Editar la información de este artículo"
                 >
                   <Edit3 size={15} />
-                  <span>Modificar producto</span>
+                  <span>Modificar artículo</span>
                 </button>
               </div>
             </div>
@@ -772,5 +1036,6 @@ Registrado: ${formatDate(product.created_at)}`;
         )}
       </div>
     </div>
+    </ModalPortal>
   );
 }

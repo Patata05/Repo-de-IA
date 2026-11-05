@@ -3,6 +3,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:lan": "node scripts/dev-lan.mjs",
+    "dev:phone": "node scripts/dev-phone.mjs",
     "build": "next build",
     "start": "next start"
   },
@@ -16,13 +18,16 @@
     "midjourney": "^4.3.18",
     "next": "^15.5.4",
     "openai": "^7.42.0",
+    "qrcode": "^1.5.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^24.6.2",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
     "autoprefixer": "^10.6.1",

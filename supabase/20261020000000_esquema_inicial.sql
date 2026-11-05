@@ -6,17 +6,16 @@
 -- Tabla
 CREATE TABLE IF NOT EXISTS public.inventario (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    etiqueta       VARCHAR(50)  NOT NULL UNIQUE,
+    etiqueta       VARCHAR(50)  NOT NULL,
     articulo       VARCHAR(150) NOT NULL,
     marca          VARCHAR(100),
     modelo         VARCHAR(100),
-    serie          VARCHAR(100) UNIQUE,
+    serie          VARCHAR(100),
     area           VARCHAR(100) NOT NULL,
     persona        VARCHAR(150),
     cantidad       INTEGER      NOT NULL DEFAULT 1 CHECK (cantidad >= 0),
     observaciones  TEXT,
-    origen         VARCHAR(20)  NOT NULL DEFAULT 'Compra'
-                   CHECK (origen IN ('Compra', 'Donación', 'Préstamo', 'Traslado', 'Otro')),
+    origen         VARCHAR(60)  NOT NULL DEFAULT 'S/O',
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
@@ -25,6 +24,10 @@ CREATE TABLE IF NOT EXISTS public.inventario (
 CREATE INDEX IF NOT EXISTS idx_inventario_area     ON public.inventario (area);
 CREATE INDEX IF NOT EXISTS idx_inventario_persona  ON public.inventario (persona);
 CREATE INDEX IF NOT EXISTS idx_inventario_articulo ON public.inventario (articulo);
+-- Etiqueta única dentro del mismo origen; puede repetirse en otro inventario.
+-- Serie puede duplicarse libremente.
+CREATE UNIQUE INDEX IF NOT EXISTS inventario_etiqueta_origen_key
+  ON public.inventario (etiqueta, origen);
 
 -- Función y trigger para updated_at
 CREATE OR REPLACE FUNCTION public.set_updated_at()

@@ -1,16 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import jsQR from "jsqr";
 import {
   Camera,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ClipboardPaste,
   FilePenLine,
+  FileSpreadsheet,
   Image as ImageIcon,
   Loader2,
   Plus,
   QrCode,
   RefreshCw,
+  ScanLine,
   Sparkles,
   Upload,
   VideoOff,
@@ -19,19 +24,210 @@ import {
   ArrowLeft,
 } from "lucide-react";
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
-import { addInventarioAction } from "@/app/actions";
+import { addInventarioAction, addInventarioBulkAction } from "@/app/actions";
+import ModalPortal from "@/components/modal-portal";
+import { parseInventarioImportFile } from "@/lib/import-inventario-file";
+import {
+  existsInOrigen,
+  findByEtiquetaCascade,
+  latestInventarioName,
+  listExistingOrigens,
+  nextInventarioName,
+  ORIGEN_SIN_ORIGEN,
+  rowToFormFields,
+} from "@/lib/inventario-origen";
+
+const ESTADO_OPTIONS = ["Activo", "Inactivo"] as const;
+
+function ModernEstadoSelect({
+  id,
+  value,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = value === "Inactivo" ? "Inactivo" : "Activo";
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div
+      className={`report-select form-modern-select estado-modern-select ${open ? "is-open" : ""}`}
+      ref={rootRef}
+    >
+      <button
+        id={id}
+        type="button"
+        className="report-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span
+          className={
+            selected === "Inactivo" ? "estado-badge is-inactivo" : "estado-badge is-activo"
+          }
+        >
+          {selected}
+        </span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <ul className="report-select-menu" role="listbox" aria-labelledby={id}>
+          {ESTADO_OPTIONS.map((option) => {
+            const active = option === selected;
+            return (
+              <li key={option} role="option" aria-selected={active}>
+                <button
+                  type="button"
+                  className={active ? "report-select-option is-active" : "report-select-option"}
+                  onClick={() => {
+                    onChange(option);
+                    setOpen(false);
+                  }}
+                >
+                  <span
+                    className={
+                      option === "Inactivo"
+                        ? "estado-badge is-inactivo"
+                        : "estado-badge is-activo"
+                    }
+                  >
+                    {option}
+                  </span>
+                  {active ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function ModernOrigenSelect({
+  id,
+  value,
+  options,
+  createOption,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  options: readonly string[];
+  createOption?: string | null;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const allOptions = createOption
+    ? [...options.filter((o) => o !== createOption), createOption]
+    : [...options];
+  const selected = allOptions.includes(value) ? value : allOptions[0] || value;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className={`report-select form-modern-select ${open ? "is-open" : ""}`} ref={rootRef}>
+      <button
+        id={id}
+        type="button"
+        className="report-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{selected || "Seleccionar inventario"}</span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <ul className="report-select-menu" role="listbox" aria-labelledby={id}>
+          {options.map((option) => {
+            const active = option === selected;
+            return (
+              <li key={option} role="option" aria-selected={active}>
+                <button
+                  type="button"
+                  className={active ? "report-select-option is-active" : "report-select-option"}
+                  onClick={() => {
+                    onChange(option);
+                    setOpen(false);
+                  }}
+                >
+                  <span>{option}</span>
+                  {active ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              </li>
+            );
+          })}
+          {createOption ? (
+            <li role="option" aria-selected={selected === createOption}>
+              <button
+                type="button"
+                className={
+                  selected === createOption
+                    ? "report-select-option is-active is-create"
+                    : "report-select-option is-create"
+                }
+                onClick={() => {
+                  onChange(createOption);
+                  setOpen(false);
+                }}
+              >
+                <span>Nuevo conteo · {createOption}</span>
+                {selected === createOption ? <Check size={14} aria-hidden="true" /> : <Plus size={14} aria-hidden="true" />}
+              </button>
+            </li>
+          ) : null}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
 
 interface AddProductModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onCreated: (item: InventarioRow) => void;
+  onCreated: (item: InventarioRow | InventarioRow[]) => void;
   existingAreas: string[];
   existingPeople: string[];
+  items: InventarioRow[];
 }
 
 type StepMode = "choose" | "qr" | "form";
-
-const ORIGEN_OPTIONS = ["Compra", "Donación", "Préstamo", "Traslado", "Otro"] as const;
 
 export default function AddProductModal({
   isOpen,
@@ -39,12 +235,29 @@ export default function AddProductModal({
   onCreated,
   existingAreas,
   existingPeople,
+  items,
 }: AddProductModalProps) {
+  const existingOrigens = useMemo(() => listExistingOrigens(items), [items]);
+  const createOrigenOption = useMemo(
+    () => nextInventarioName(existingOrigens),
+    [existingOrigens],
+  );
+  const defaultOrigen = useMemo(
+    () => latestInventarioName(existingOrigens),
+    [existingOrigens],
+  );
+
   const [mode, setMode] = useState<StepMode>("choose");
   const [fromQR, setFromQR] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const csvInputRef = useRef<HTMLInputElement>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [cascadeHint, setCascadeHint] = useState<string | null>(null);
+  const [fuenteOrigen, setFuenteOrigen] = useState<string | null>(null);
+  const [destinoInventario, setDestinoInventario] = useState(ORIGEN_SIN_ORIGEN);
+  const [bloqueadoDuplicado, setBloqueadoDuplicado] = useState(false);
 
   // Form State
   const [formData, setFormData] = useState<NewInventarioItem>({
@@ -57,7 +270,8 @@ export default function AddProductModal({
     persona: "",
     cantidad: 1,
     observaciones: "",
-    origen: "Compra",
+    estado: "Activo",
+    origen: ORIGEN_SIN_ORIGEN,
   });
 
   // QR Scanner State
@@ -68,31 +282,105 @@ export default function AddProductModal({
   const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
   const scanLoopRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const saveLockRef = useRef(false);
   const [qrDecodedRaw, setQrDecodedRaw] = useState<string | null>(null);
 
-  // Reiniciar estado al abrir/cerrar
+  const applyCascadeFromEtiqueta = useCallback(
+    (etiqueta: string, destino: string) => {
+      // Tras guardar ok, items/revalidate pueden llegar antes de cerrar el modal:
+      // no volver a marcar duplicado en rojo.
+      if (saveLockRef.current) return null;
+
+      const dest = destino.trim();
+      const tag = etiqueta.trim();
+      if (!tag) {
+        setFuenteOrigen(null);
+        setCascadeHint(null);
+        setBloqueadoDuplicado(false);
+        return null;
+      }
+
+      // Rojo solo si YA está en el inventario destino elegido
+      const duplicate = existsInOrigen(items, tag, dest);
+      if (duplicate) {
+        setFuenteOrigen(dest);
+        setBloqueadoDuplicado(true);
+        setCascadeHint(
+          `La etiqueta ya existe en ${dest}. Debe ser completamente nueva en ese inventario.`,
+        );
+        return { blocked: true as const, fields: rowToFormFields(duplicate) };
+      }
+
+      const hit = findByEtiquetaCascade(items, tag, dest);
+      if (!hit || hit.inDestino) {
+        setFuenteOrigen(null);
+        setCascadeHint(null);
+        setBloqueadoDuplicado(false);
+        return null;
+      }
+
+      // Azul: tomado de un inventario anterior → se puede guardar en el destino
+      setFuenteOrigen(hit.foundIn);
+      setBloqueadoDuplicado(false);
+      setCascadeHint(
+        `Datos tomados de ${hit.foundIn} (versión más reciente). Se colocarán en ${dest}.`,
+      );
+      return { blocked: false as const, fields: rowToFormFields(hit.row) };
+    },
+    [items],
+  );
+
+  // Mantener aviso azul/rojo sincronizado al cambiar destino o etiqueta
   useEffect(() => {
-    if (isOpen) {
-      setMode("choose");
-      setFromQR(false);
-      setErrorMessage(null);
-      setSuccessMessage(null);
-      setQrDecodedRaw(null);
-      setFormData({
-        etiqueta: "",
-        articulo: "",
-        marca: "",
-        modelo: "",
-        serie: "",
-        area: "",
-        persona: "",
-        cantidad: 1,
-        observaciones: "",
-        origen: "Compra",
-      });
-    } else {
+    if (!isOpen || mode !== "form") return;
+    // Tras guardar, items se actualiza y la etiqueta ya existe en destino:
+    // no revalidar o el hint azul pasa a rojo un instante antes de cerrar.
+    if (successMessage || isSubmitting) return;
+    const tag = formData.etiqueta?.trim();
+    if (!tag) return;
+    applyCascadeFromEtiqueta(tag, destinoInventario || defaultOrigen);
+  }, [
+    isOpen,
+    mode,
+    formData.etiqueta,
+    destinoInventario,
+    defaultOrigen,
+    items,
+    applyCascadeFromEtiqueta,
+    successMessage,
+    isSubmitting,
+  ]);
+
+  // Reiniciar estado solo al abrir (no al cambiar defaultOrigen mid-save)
+  useEffect(() => {
+    if (!isOpen) {
       stopCamera();
+      return;
     }
+    saveLockRef.current = false;
+    setMode("choose");
+    setFromQR(false);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setCascadeHint(null);
+    setFuenteOrigen(null);
+    setBloqueadoDuplicado(false);
+    setDestinoInventario(defaultOrigen);
+    setQrDecodedRaw(null);
+    setFormData({
+      etiqueta: "",
+      articulo: "",
+      marca: "",
+      modelo: "",
+      serie: "",
+      area: "",
+      persona: "",
+      cantidad: 1,
+      observaciones: "",
+      estado: "Activo",
+      origen: defaultOrigen,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- solo al abrir
   }, [isOpen]);
 
   // Manejo de ESC para cerrar
@@ -143,7 +431,6 @@ export default function AddProductModal({
               : typeof json.qty === "number"
               ? json.qty
               : 1,
-          origen: ORIGEN_OPTIONS.includes(json.origen) ? json.origen : "Compra",
           observaciones: json.observaciones || json.notes || json.desc || "",
         };
       } catch {
@@ -175,7 +462,6 @@ export default function AddProductModal({
           area: dict["area"] || dict["departamento"] || "",
           persona: dict["persona"] || dict["asignado"] || "",
           cantidad: dict["cantidad"] ? parseInt(dict["cantidad"], 10) || 1 : 1,
-          origen: ORIGEN_OPTIONS.find((o) => o.toLowerCase() === dict["origen"]?.toLowerCase()) || "Compra",
           observaciones: dict["observaciones"] || dict["notas"] || "",
         };
       }
@@ -190,12 +476,32 @@ export default function AddProductModal({
       }
     }
 
-    setFormData((prev) => ({
-      ...prev,
-      ...parsed,
-      cantidad: parsed.cantidad !== undefined ? parsed.cantidad : prev.cantidad || 1,
-      origen: parsed.origen || prev.origen || "Compra",
-    }));
+    const etiqueta = String(parsed.etiqueta || "").trim();
+    const destino = destinoInventario || defaultOrigen;
+    const cascade = etiqueta ? applyCascadeFromEtiqueta(etiqueta, destino) : null;
+
+    setFormData((prev) => {
+      const fromHistory = cascade?.fields ?? null;
+      return {
+        ...prev,
+        ...(fromHistory || {}),
+        ...Object.fromEntries(
+          Object.entries(parsed).filter(([, v]) => v !== undefined && v !== ""),
+        ),
+        cantidad:
+          parsed.cantidad !== undefined
+            ? parsed.cantidad
+            : fromHistory?.cantidad ?? prev.cantidad ?? 1,
+        origen: destino,
+        etiqueta: etiqueta || prev.etiqueta,
+      };
+    });
+
+    if (!etiqueta) {
+      setCascadeHint(null);
+      setFuenteOrigen(null);
+      setBloqueadoDuplicado(false);
+    }
 
     setQrDecodedRaw(rawText);
     setFromQR(true);
@@ -203,65 +509,99 @@ export default function AddProductModal({
     setMode("form");
   };
 
+  const beginQrScanLoop = useCallback(() => {
+    const scan = () => {
+      if (!videoRef.current || !canvasRef.current) return;
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+      if (video.readyState === video.HAVE_ENOUGH_DATA && ctx) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: "dontInvert",
+        });
+
+        if (code && code.data) {
+          parseQRContent(code.data);
+          return;
+        }
+      }
+      scanLoopRef.current = requestAnimationFrame(scan);
+    };
+
+    scanLoopRef.current = requestAnimationFrame(scan);
+  }, []);
+
   // Iniciar cámara y escaneo continuo
   const startCamera = useCallback(async (facing: "environment" | "user" = facingMode) => {
     stopCamera();
     setCameraError(null);
 
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setCameraError("Tu navegador no soporta el acceso a la cámara o requiere HTTPS.");
+      const host = typeof window !== "undefined" ? window.location.hostname : "";
+      const insecureLan =
+        typeof window !== "undefined" &&
+        !window.isSecureContext &&
+        host !== "localhost" &&
+        host !== "127.0.0.1";
+
+      if (insecureLan || !navigator.mediaDevices?.getUserMedia) {
+        setCameraError(
+          "La cámara en el celular necesita HTTPS. Opción fácil: en la PC corre npm run dev y en otra terminal npm run dev:phone; abre en el cel la URL https://…trycloudflare.com. Mientras, usa Subir imagen.",
+        );
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
-      });
+      const tryConstraints: MediaStreamConstraints[] = [
+        { video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } } },
+        { video: { facingMode: facing } },
+        { video: true },
+      ];
+
+      let stream: MediaStream | null = null;
+      let lastError: unknown = null;
+      for (const constraints of tryConstraints) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          break;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      if (!stream) {
+        throw lastError instanceof Error
+          ? lastError
+          : new Error("No se pudo acceder a la cámara.");
+      }
 
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", "true");
+        videoRef.current.muted = true;
         await videoRef.current.play();
         setCameraActive(true);
-
-        // Bucle de lectura de frames
-        const scan = () => {
-          if (!videoRef.current || !canvasRef.current) return;
-          const video = videoRef.current;
-          const canvas = canvasRef.current;
-          const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-          if (video.readyState === video.HAVE_ENOUGH_DATA && ctx) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-              inversionAttempts: "dontInvert",
-            });
-
-            if (code && code.data) {
-              parseQRContent(code.data);
-              return; // Detener bucle
-            }
-          }
-          scanLoopRef.current = requestAnimationFrame(scan);
-        };
-
-        scanLoopRef.current = requestAnimationFrame(scan);
+        beginQrScanLoop();
       }
     } catch (err: unknown) {
       console.error("Error al acceder a la cámara:", err);
+      const name = err instanceof Error ? err.name : "";
       const message =
-        err instanceof Error && err.name === "NotAllowedError"
+        name === "NotAllowedError"
           ? "Permiso denegado para usar la cámara. Permite el acceso o sube una imagen del QR."
-          : "No se pudo iniciar la cámara. Intenta subir una foto o ingresa manualmente.";
+          : name === "NotFoundError"
+            ? "No se encontró cámara en este dispositivo. Usa Subir imagen o registro manual."
+            : "No se pudo iniciar la cámara. Intenta subir una foto o ingresa manualmente.";
       setCameraError(message);
       setCameraActive(false);
     }
-  }, [facingMode, stopCamera]);
+  }, [facingMode, stopCamera, beginQrScanLoop]);
 
   // Cambiar entre cámara frontal y trasera
   const toggleFacingMode = () => {
@@ -306,7 +646,45 @@ export default function AddProductModal({
   const generateSuggestedTag = () => {
     const prefix = "OF-";
     const randomNum = Math.floor(1000 + Math.random() * 9000);
+    setCascadeHint(null);
+    setFuenteOrigen(null);
+    setBloqueadoDuplicado(false);
     setFormData((prev) => ({ ...prev, etiqueta: `${prefix}${randomNum}` }));
+  };
+
+  const handleEtiquetaLookup = (etiqueta: string) => {
+    const destino = destinoInventario || defaultOrigen;
+    const cascade = applyCascadeFromEtiqueta(etiqueta, destino);
+    if (!cascade) {
+      setFormData((prev) => ({
+        ...prev,
+        etiqueta: etiqueta.trim() || prev.etiqueta,
+        origen: destino,
+      }));
+      return;
+    }
+    // Aunque esté bloqueado por duplicado, mostrar los datos de la etiqueta
+    setFormData((prev) => ({
+      ...prev,
+      ...cascade.fields,
+      etiqueta: etiqueta.trim() || prev.etiqueta,
+      origen: destino,
+    }));
+  };
+
+  const handleDestinoChange = (destino: string) => {
+    setDestinoInventario(destino);
+    const cascade = applyCascadeFromEtiqueta(formData.etiqueta || "", destino);
+    if (!cascade) {
+      setFormData((prev) => ({ ...prev, origen: destino }));
+      return;
+    }
+    setFormData((prev) => ({
+      ...prev,
+      ...cascade.fields,
+      etiqueta: prev.etiqueta,
+      origen: destino,
+    }));
   };
 
   // Envío del formulario
@@ -315,7 +693,16 @@ export default function AddProductModal({
     setErrorMessage(null);
 
     if (!formData.etiqueta.trim()) {
-      setErrorMessage("Por favor ingresa una etiqueta única para el producto.");
+      setErrorMessage("Por favor ingresa una etiqueta para el artículo.");
+      return;
+    }
+
+    const destino = destinoInventario || defaultOrigen;
+    if (existsInOrigen(items, formData.etiqueta, destino)) {
+      setBloqueadoDuplicado(true);
+      setErrorMessage(
+        `La etiqueta "${formData.etiqueta.trim()}" ya está en ${destino}. Debe ser completamente nueva en ese inventario.`,
+      );
       return;
     }
     if (!formData.articulo.trim()) {
@@ -323,38 +710,93 @@ export default function AddProductModal({
       return;
     }
     if (!formData.area.trim()) {
-      setErrorMessage("Por favor indica el área a la que pertenece el producto.");
+      setErrorMessage("Por favor indica el área a la que pertenece el artículo.");
       return;
     }
 
     setIsSubmitting(true);
 
     try {
-      const result = await addInventarioAction(formData);
+      const result = await addInventarioAction({
+        ...formData,
+        origen: destino,
+      });
 
       if (!result.success || !result.data) {
-        setErrorMessage(result.error || "Ocurrió un error al registrar en Supabase.");
+        setErrorMessage(result.error || "No se pudo guardar el artículo. Inténtalo de nuevo.");
         setIsSubmitting(false);
         return;
       }
 
-      setSuccessMessage("¡Producto registrado con éxito en la base de datos!");
-      onCreated(result.data);
+      saveLockRef.current = true;
+      setCascadeHint(null);
+      setBloqueadoDuplicado(false);
+      setFuenteOrigen(null);
+      setErrorMessage(null);
+      setSuccessMessage("¡Artículo guardado correctamente!");
+      const created = result.data;
+      setIsSubmitting(false);
 
       setTimeout(() => {
+        onCreated(created);
         onClose();
       }, 1100);
+      return;
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Error al conectar con la base de datos.";
+      const msg = err instanceof Error ? err.message : "Error al guardar. Inténtalo de nuevo.";
       setErrorMessage(msg);
-    } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const handleCsvImport = async (file: File | null) => {
+    if (!file || isImporting) return;
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsImporting(true);
+
+    try {
+      const origen = destinoInventario || defaultOrigen;
+      const parsed = await parseInventarioImportFile(file, origen);
+      if (!parsed.items.length) {
+        setErrorMessage(
+          "No se encontraron filas válidas para importar. Verifica Etiqueta y Articulo."
+        );
+        setIsImporting(false);
+        return;
+      }
+
+      const result = await addInventarioBulkAction(parsed.items);
+      if (!result.success || !result.data?.length) {
+        setErrorMessage(result.error || "No se pudo importar el archivo.");
+        setIsImporting(false);
+        return;
+      }
+
+      const ok = result.data.length;
+      const notes: string[] = [];
+      if (parsed.skipped > 0) notes.push(`${parsed.skipped} vacías`);
+      if (parsed.skippedDupEtiqueta > 0) {
+        notes.push(`${parsed.skippedDupEtiqueta} etiqueta dup. en el mismo origen`);
+      }
+      const skippedNote = notes.length ? ` (omitidas: ${notes.join(", ")})` : "";
+      setSuccessMessage(`Se importaron ${ok} artículo${ok === 1 ? "" : "s"}${skippedNote}.`);
+      onCreated(result.data);
+      setIsImporting(false);
+      setTimeout(() => onClose(), 1400);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "No se pudo leer el archivo.";
+      setErrorMessage(msg);
+      setIsImporting(false);
+    } finally {
+      if (csvInputRef.current) csvInputRef.current.value = "";
     }
   };
 
   if (!isOpen) return null;
 
   return (
+    <ModalPortal>
     <div className="product-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <div className="product-modal-card">
         {/* Encabezado del Modal */}
@@ -377,32 +819,60 @@ export default function AddProductModal({
             <div>
               <h2 id="modal-title">
                 {mode === "choose"
-                  ? "Registrar nuevo producto"
+                  ? "Registrar nuevo artículo"
                   : mode === "qr"
                   ? "Escanear código QR"
                   : fromQR
-                  ? "Revisar datos del producto"
-                  : "Registro manual de producto"}
+                  ? "Revisar datos del artículo"
+                  : "Registro manual de artículo"}
               </h2>
               <p>
                 {mode === "choose"
-                  ? "Selecciona el método de registro para añadir a la base de datos"
+                  ? "Elige cómo quieres registrar el artículo"
                   : mode === "qr"
                   ? "Apunta con la cámara al QR o sube una imagen con el código"
                   : fromQR
-                  ? "Verifica y edita la información leída antes de guardar en Supabase"
-                  : "Completa los campos para dar de alta el artículo en Supabase"}
+                  ? "Verifica y edita la información antes de guardar"
+                  : "Completa los campos para dar de alta el artículo"}
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            className="product-modal-close"
-            onClick={onClose}
-            aria-label="Cerrar modal"
-          >
-            <X size={19} />
-          </button>
+          <div className="product-modal-header-actions">
+            {mode === "choose" ? (
+              <>
+                <input
+                  ref={csvInputRef}
+                  type="file"
+                  accept=".csv,.txt,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  hidden
+                  onChange={(e) => handleCsvImport(e.target.files?.[0] ?? null)}
+                />
+                <button
+                  type="button"
+                  className="product-modal-import"
+                  onClick={() => csvInputRef.current?.click()}
+                  disabled={isImporting}
+                  title="Importar CSV o Excel"
+                  aria-label="Importar CSV o Excel"
+                >
+                  {isImporting ? (
+                    <Loader2 size={16} className="spin" />
+                  ) : (
+                    <FileSpreadsheet size={16} />
+                  )}
+                  <span>{isImporting ? "Importando…" : "CSV / Excel"}</span>
+                </button>
+              </>
+            ) : null}
+            <button
+              type="button"
+              className="product-modal-close"
+              onClick={onClose}
+              aria-label="Cerrar modal"
+            >
+              <X size={19} />
+            </button>
+          </div>
         </header>
 
         {/* Notificaciones de éxito o error */}
@@ -442,7 +912,7 @@ export default function AddProductModal({
                 </div>
                 <h3>Escanear código QR</h3>
                 <p>
-                  Lee automáticamente la información del producto usando la cámara de tu dispositivo o
+                  Lee automáticamente la información del artículo usando la cámara de tu dispositivo o
                   subiendo una foto. Luego podrás revisarla y editarla.
                 </p>
                 <span className="choose-card-action">
@@ -481,25 +951,32 @@ export default function AddProductModal({
         {/* 2. ESCÁNER DE CÓDIGO QR */}
         {mode === "qr" ? (
           <div className="product-modal-body">
-            <div className="qr-scanner-container">
-              {/* Contenedor de Video */}
+            <div className="qr-scanner-container qr-scanner-modern">
               <div className="qr-viewport">
-                <video ref={videoRef} className="qr-video" muted />
+                <video ref={videoRef} className="qr-video" muted playsInline />
                 <canvas ref={canvasRef} style={{ display: "none" }} />
 
                 {cameraActive ? (
-                  <div className="qr-overlay-reticle">
-                    <div className="qr-scan-laser" />
-                    <div className="qr-corner top-left" />
-                    <div className="qr-corner top-right" />
-                    <div className="qr-corner bottom-left" />
-                    <div className="qr-corner bottom-right" />
-                  </div>
+                  <>
+                    <div className="qr-status-pill">
+                      <ScanLine size={14} />
+                      <span>Buscando código…</span>
+                    </div>
+                    <div className="qr-overlay-reticle">
+                      <div className="qr-scan-laser" />
+                      <div className="qr-corner top-left" />
+                      <div className="qr-corner top-right" />
+                      <div className="qr-corner bottom-left" />
+                      <div className="qr-corner bottom-right" />
+                    </div>
+                  </>
                 ) : (
                   <div className="qr-placeholder">
                     {cameraError ? (
                       <div className="qr-camera-prompt">
-                        <VideoOff size={40} />
+                        <span className="qr-prompt-icon is-warn">
+                          <VideoOff size={28} />
+                        </span>
                         <p>{cameraError}</p>
                         <button
                           type="button"
@@ -512,15 +989,16 @@ export default function AddProductModal({
                       </div>
                     ) : (
                       <div className="qr-camera-prompt">
-                        <Loader2 size={36} className="spin" />
-                        <p>Iniciando cámara...</p>
+                        <span className="qr-prompt-icon">
+                          <Loader2 size={28} className="spin" />
+                        </span>
+                        <p>Preparando cámara…</p>
                       </div>
                     )}
                   </div>
                 )}
               </div>
 
-              {/* Barra de herramientas del escáner */}
               <div className="qr-controls">
                 <div className="qr-controls-group">
                   {cameraActive ? (
@@ -536,7 +1014,7 @@ export default function AddProductModal({
                   ) : (
                     <button
                       type="button"
-                      className="qr-tool-btn"
+                      className="qr-tool-btn is-primary"
                       onClick={() => startCamera()}
                     >
                       <Camera size={16} />
@@ -544,7 +1022,6 @@ export default function AddProductModal({
                     </button>
                   )}
 
-                  {/* Subir archivo de imagen */}
                   <label className="qr-tool-btn file-upload-label" title="Subir foto con código QR">
                     <Upload size={16} />
                     <span>Subir imagen</span>
@@ -556,27 +1033,65 @@ export default function AddProductModal({
                     />
                   </label>
                 </div>
-
                 <p className="qr-help-hint">
-                  Coloca el código QR dentro del recuadro o carga un archivo con la imagen del código.
+                  Centra el código en el recuadro o sube una foto clara.
                 </p>
               </div>
 
-              {/* Fallback de entrada directa de texto/JSON del QR */}
-              <details className="qr-manual-fallback">
-                <summary>¿Tienes el código copiado o en texto?</summary>
-                <div className="qr-manual-input-box">
-                  <textarea
-                    rows={2}
-                    placeholder='Pega aquí el contenido del QR (ej. JSON: {"etiqueta": "E-10", "articulo": "Mouse"})'
-                    onChange={(e) => {
-                      if (e.target.value.trim()) {
-                        parseQRContent(e.target.value);
+              <div className="qr-paste-card">
+                <div className="qr-paste-head">
+                  <span className="qr-paste-icon" aria-hidden="true">
+                    <ClipboardPaste size={16} />
+                  </span>
+                  <div>
+                    <strong>Pegar código</strong>
+                    <p>Si ya copiaste la etiqueta o el texto del QR</p>
+                  </div>
+                </div>
+                <div className="qr-paste-row">
+                  <input
+                    type="text"
+                    className="qr-paste-input"
+                    placeholder="Ej. OF-0008 o el texto del código"
+                    aria-label="Pegar código o etiqueta"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const value = (e.target as HTMLInputElement).value.trim();
+                        if (value) parseQRContent(value);
                       }
                     }}
                   />
+                  <button
+                    type="button"
+                    className="qr-paste-btn"
+                    onClick={async () => {
+                      try {
+                        const text = await navigator.clipboard.readText();
+                        if (text.trim()) parseQRContent(text);
+                      } catch {
+                        setCameraError(
+                          "No se pudo leer el portapapeles. Pega el código en el campo y pulsa Continuar.",
+                        );
+                      }
+                    }}
+                  >
+                    Pegar
+                  </button>
+                  <button
+                    type="button"
+                    className="qr-paste-btn is-solid"
+                    onClick={(e) => {
+                      const input = (e.currentTarget.parentElement?.querySelector(
+                        ".qr-paste-input",
+                      ) as HTMLInputElement | null);
+                      const value = input?.value.trim() ?? "";
+                      if (value) parseQRContent(value);
+                    }}
+                  >
+                    Continuar
+                  </button>
                 </div>
-              </details>
+              </div>
             </div>
           </div>
         ) : null}
@@ -589,7 +1104,7 @@ export default function AddProductModal({
                 <CheckCircle2 size={18} />
                 <div>
                   <strong>Información detectada desde el código QR</strong>
-                  <p>Verifica y modifica cualquier campo necesario antes de registrar en Supabase.</p>
+                  <p>Verifica y modifica cualquier campo necesario antes de guardar.</p>
                 </div>
               </div>
             ) : null}
@@ -616,16 +1131,18 @@ export default function AddProductModal({
                   required
                   placeholder="Ej. ACT-0421, LAP-2026"
                   value={formData.etiqueta}
-                  onChange={(e) =>
-                    setFormData((prev) => ({ ...prev, etiqueta: e.target.value }))
-                  }
+                  onChange={(e) => {
+                    setCascadeHint(null);
+                    setFormData((prev) => ({ ...prev, etiqueta: e.target.value }));
+                  }}
+                  onBlur={(e) => handleEtiquetaLookup(e.target.value)}
                 />
               </div>
 
               {/* Artículo */}
               <div className="form-field">
                 <label htmlFor="field-articulo">
-                  Artículo / Producto <span className="req">*</span>
+                  Artículo <span className="req">*</span>
                 </label>
                 <input
                   id="field-articulo"
@@ -738,22 +1255,56 @@ export default function AddProductModal({
                 />
               </div>
 
-              {/* Origen */}
+              {/* Origen automático + inventario destino editable */}
+              <div className="form-field form-field-full origen-destino-row">
+                <div className="form-field">
+                  <label htmlFor="field-origen">Origen (de dónde se tomó)</label>
+                  <div
+                    id="field-origen"
+                    className={
+                      fuenteOrigen
+                        ? "origen-readonly has-source"
+                        : "origen-readonly is-new"
+                    }
+                    aria-live="polite"
+                  >
+                    <span>{fuenteOrigen || "Registro nuevo"}</span>
+                  </div>
+                </div>
+                <div className="form-field">
+                  <label htmlFor="field-destino">Inventario destino</label>
+                  <ModernOrigenSelect
+                    id="field-destino"
+                    value={destinoInventario || defaultOrigen}
+                    options={existingOrigens}
+                    createOption={createOrigenOption}
+                    onChange={handleDestinoChange}
+                  />
+                </div>
+              </div>
+
+              {cascadeHint && !successMessage ? (
+                <div className="form-field form-field-full">
+                  <p
+                    className={
+                      bloqueadoDuplicado ? "cascade-hint is-blocked" : "cascade-hint"
+                    }
+                    role="status"
+                  >
+                    {cascadeHint}
+                  </p>
+                </div>
+              ) : null}
+
               <div className="form-field">
-                <label htmlFor="field-origen">Origen</label>
-                <select
-                  id="field-origen"
-                  value={formData.origen || "Compra"}
-                  onChange={(e) =>
-                    setFormData((prev) => ({ ...prev, origen: e.target.value }))
+                <label htmlFor="field-estado">Estado del artículo</label>
+                <ModernEstadoSelect
+                  id="field-estado"
+                  value={formData.estado === "Inactivo" ? "Inactivo" : "Activo"}
+                  onChange={(estado) =>
+                    setFormData((prev) => ({ ...prev, estado }))
                   }
-                >
-                  {ORIGEN_OPTIONS.map((opt) => (
-                    <option key={opt} value={opt}>
-                      {opt}
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
 
               {/* Observaciones (ocupa 2 columnas) */}
@@ -784,17 +1335,17 @@ export default function AddProductModal({
               <button
                 type="submit"
                 className="btn-submit"
-                disabled={isSubmitting}
+                disabled={isSubmitting || bloqueadoDuplicado}
               >
                 {isSubmitting ? (
                   <>
                     <Loader2 size={16} className="spin" />
-                    <span>Guardando en Supabase...</span>
+                    <span>Guardando...</span>
                   </>
                 ) : (
                   <>
                     <Plus size={16} strokeWidth={2.4} />
-                    <span>Registrar en Base de Datos</span>
+                    <span>Guardar artículo</span>
                   </>
                 )}
               </button>
@@ -803,5 +1354,6 @@ export default function AddProductModal({
         ) : null}
       </div>
     </div>
+    </ModalPortal>
   );
 }

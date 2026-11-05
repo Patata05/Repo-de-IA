@@ -5,5 +5,8 @@ out
 .env
 .env.local
 .env*.local
+certificates
 
 *.tsbuildinfo
+
+supabase/.temp/

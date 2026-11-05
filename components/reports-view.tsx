@@ -1,18 +1,15 @@
 "use client";
 
-import { useMemo, useState, useEffect } from "react";
+import { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
-  BarChart3,
   Boxes,
-  Building2,
   Check,
   CheckSquare,
+  ChevronDown,
   Copy,
   Download,
-  FileSpreadsheet,
   FileText,
-  Filter,
   Layers,
   MapPin,
   MinusCircle,
@@ -29,14 +26,34 @@ import {
   X,
 } from "lucide-react";
 import type { InventarioRow } from "@/lib/supabase";
+import ModalPortal from "@/components/modal-portal";
+import {
+  buildSearchIndex,
+  indexMatchesPrepared,
+  prepareSearch,
+} from "@/lib/inventario-search";
 
 interface ReportsViewProps {
   items: InventarioRow[];
   onSelectProduct?: (item: InventarioRow) => void;
 }
 
-type ReportPreset = "general" | "persona" | "area" | "stock" | "personalizado";
 type ViewMode = "todos" | "incluidos";
+
+function buildReportTitle(filterArea: string, filterPerson: string, filterOrigen: string) {
+  const parts: string[] = [];
+  if (filterArea !== "ALL") parts.push(`Área: ${filterArea}`);
+  if (filterPerson === "__UNASSIGNED__") parts.push("Solo disponibles (sin asignar)");
+  else if (filterPerson === "__ASSIGNED__") parts.push("Solo asignados");
+  else if (filterPerson !== "ALL") parts.push(`Asignado a: ${filterPerson}`);
+  if (filterOrigen !== "ALL") parts.push(`Origen: ${filterOrigen}`);
+  return parts.length ? `Reporte de Inventario · ${parts.join(" · ")}` : "Reporte de Inventario";
+}
+
+type ReportSelectOption = {
+  value: string;
+  label: string;
+};
 
 function textOf(val: unknown) {
   return String(val ?? "").trim();
@@ -48,20 +65,144 @@ function formatNumber(num: number) {
 
 function getRowKey(r: InventarioRow, fallbackIndex?: number): string {
   if (r.id !== undefined && r.id !== null) return String(r.id);
-  if (r.etiqueta) return `etq-${r.etiqueta}`;
+  if (r.etiqueta) return `etq-${textOf(r.etiqueta)}::${textOf(r.origen)}`;
   return `idx-${fallbackIndex ?? 0}`;
 }
 
-export default function ReportsView({ items, onSelectProduct }: ReportsViewProps) {
-  // Preset seleccionado
-  const [preset, setPreset] = useState<ReportPreset>("general");
+function rowTimestamp(row: InventarioRow): number {
+  return (
+    Date.parse(String(row.updated_at ?? "")) ||
+    Date.parse(String(row.created_at ?? "")) ||
+    0
+  );
+}
 
+/**
+ * Conserva una fila por etiqueta+origen (como en BD / Excel).
+ * La misma etiqueta en otro origen cuenta aparte.
+ */
+function dedupeByEtiqueta(rows: InventarioRow[]): InventarioRow[] {
+  const byKey = new Map<string, InventarioRow>();
+  const withoutEtiqueta: InventarioRow[] = [];
+
+  for (const row of rows) {
+    const etq = textOf(row.etiqueta).toLowerCase();
+    if (!etq) {
+      withoutEtiqueta.push(row);
+      continue;
+    }
+    const key = `${etq}::${textOf(row.origen).toLowerCase()}`;
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, row);
+      continue;
+    }
+    const prevScore = rowTimestamp(prev) * 1_000_000 + (Number(prev.id) || 0);
+    const nextScore = rowTimestamp(row) * 1_000_000 + (Number(row.id) || 0);
+    if (nextScore >= prevScore) byKey.set(key, row);
+  }
+
+  const byId = new Map<number, InventarioRow>();
+  for (const row of withoutEtiqueta) {
+    if (row.id == null) continue;
+    const id = Number(row.id);
+    if (!byId.has(id)) byId.set(id, row);
+  }
+  const orphanNoId = withoutEtiqueta.filter((row) => row.id == null);
+
+  return [...byKey.values(), ...byId.values(), ...orphanNoId];
+}
+
+function ReportSelect({
+  id,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  options: ReportSelectOption[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className={`report-select ${open ? "is-open" : ""}`} ref={rootRef}>
+      <label htmlFor={id}>{label}</label>
+      <button
+        id={id}
+        type="button"
+        className="report-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{selected?.label ?? "Seleccionar"}</span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <ul className="report-select-menu" role="listbox" aria-labelledby={id}>
+          {options.map((option) => {
+            const active = option.value === value;
+            return (
+              <li key={option.value} role="option" aria-selected={active}>
+                <button
+                  type="button"
+                  className={active ? "report-select-option is-active" : "report-select-option"}
+                  onClick={() => {
+                    onChange(option.value);
+                    setOpen(false);
+                  }}
+                >
+                  <span>{option.label}</span>
+                  {active ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+export default function ReportsView({ items, onSelectProduct }: ReportsViewProps) {
   // Filtros dinámicos
   const [filterArea, setFilterArea] = useState<string>("ALL");
   const [filterPerson, setFilterPerson] = useState<string>("ALL");
   const [filterOrigen, setFilterOrigen] = useState<string>("ALL");
   const [searchQuery, setSearchQuery] = useState<string>("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      startTransition(() => setDebouncedSearch(searchQuery));
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [searchQuery]);
+
+  const searchIndex = useMemo(() => buildSearchIndex(items), [items]);
 
   // Modo de visualización de la tabla: "todos" los filtrados o solo los "incluidos"
   const [viewMode, setViewMode] = useState<ViewMode>("todos");
@@ -75,86 +216,106 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
   const [isAddPickerOpen, setIsAddPickerOpen] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
 
+  // Ancla visual para no perder la posición al seleccionar/deseleccionar
+  const listAnchorRef = useRef<HTMLElement | null>(null);
+  const pendingAnchorTopRef = useRef<number | null>(null);
+
+  const runKeepingListInView = (action: () => void) => {
+    const anchor = listAnchorRef.current;
+    pendingAnchorTopRef.current = anchor ? anchor.getBoundingClientRect().top : null;
+    action();
+  };
+
+  useLayoutEffect(() => {
+    if (pendingAnchorTopRef.current === null || !listAnchorRef.current) return;
+    const previousTop = pendingAnchorTopRef.current;
+    pendingAnchorTopRef.current = null;
+    const delta = listAnchorRef.current.getBoundingClientRect().top - previousTop;
+    if (Math.abs(delta) > 0.5) {
+      window.scrollBy(0, delta);
+    }
+  });
+
   // Catálogos únicos existentes para los filtros
   const areasList = useMemo(() => {
     return [...new Set(items.map((i) => textOf(i.area)).filter(Boolean))].sort();
   }, [items]);
 
   const peopleList = useMemo(() => {
-    return [...new Set(items.map((i) => textOf(i.persona)).filter(Boolean))].sort();
-  }, [items]);
+    return [
+      ...new Set(
+        items
+          .filter((row) => {
+            if (filterArea !== "ALL" && textOf(row.area) !== filterArea) return false;
+            if (filterOrigen !== "ALL" && textOf(row.origen) !== filterOrigen) return false;
+            return Boolean(textOf(row.persona));
+          })
+          .map((row) => textOf(row.persona)),
+      ),
+    ].sort();
+  }, [items, filterArea, filterOrigen]);
 
   const origenesList = useMemo(() => {
-    return [...new Set(items.map((i) => textOf(i.origen)).filter(Boolean))].sort();
-  }, [items]);
+    return [
+      ...new Set(
+        items
+          .filter((row) => {
+            if (filterArea !== "ALL" && textOf(row.area) !== filterArea) return false;
+            return Boolean(textOf(row.origen));
+          })
+          .map((row) => textOf(row.origen)),
+      ),
+    ].sort();
+  }, [items, filterArea]);
 
-  // Manejo de cambio de preset
-  const handleSelectPreset = (newPreset: ReportPreset) => {
-    setPreset(newPreset);
-    setSearchQuery("");
-
-    let matched: InventarioRow[] = [];
-    if (newPreset === "stock") {
-      setFilterPerson("__UNASSIGNED__");
-      setFilterArea("ALL");
-      setFilterOrigen("ALL");
-      matched = items.filter((r) => textOf(r.persona) === "");
-    } else {
+  useEffect(() => {
+    if (
+      filterPerson !== "ALL" &&
+      filterPerson !== "__ASSIGNED__" &&
+      filterPerson !== "__UNASSIGNED__" &&
+      !peopleList.includes(filterPerson)
+    ) {
       setFilterPerson("ALL");
-      setFilterArea("ALL");
-      setFilterOrigen("ALL");
-      matched = items;
     }
+  }, [peopleList, filterPerson]);
 
-    // Seleccionar automáticamente los que coinciden con el nuevo preset
-    setSelectedKeys(new Set(matched.map((r, i) => getRowKey(r, i))));
-    setViewMode("todos");
-  };
+  useEffect(() => {
+    if (filterOrigen !== "ALL" && !origenesList.includes(filterOrigen)) {
+      setFilterOrigen("ALL");
+    }
+  }, [origenesList, filterOrigen]);
+
+  const preparedSearch = useMemo(() => prepareSearch(debouncedSearch), [debouncedSearch]);
 
   // Filtrado de candidatos según filtros de la barra superior
   const candidateItems = useMemo(() => {
-    return items.filter((row) => {
-      // Filtro por Área
-      if (filterArea !== "ALL") {
-        if (textOf(row.area) !== filterArea) return false;
-      }
-
-      // Filtro por Persona
+    const filteredRows: InventarioRow[] = [];
+    for (const entry of searchIndex) {
+      const row = entry.row;
+      if (filterArea !== "ALL" && textOf(row.area) !== filterArea) continue;
       if (filterPerson === "__UNASSIGNED__") {
-        if (textOf(row.persona) !== "") return false;
+        if (textOf(row.persona) !== "") continue;
       } else if (filterPerson === "__ASSIGNED__") {
-        if (textOf(row.persona) === "") return false;
+        if (textOf(row.persona) === "") continue;
       } else if (filterPerson !== "ALL") {
-        if (textOf(row.persona) !== filterPerson) return false;
+        if (textOf(row.persona) !== filterPerson) continue;
       }
+      if (filterOrigen !== "ALL" && textOf(row.origen) !== filterOrigen) continue;
+      if (preparedSearch && !indexMatchesPrepared(entry, preparedSearch)) continue;
+      filteredRows.push(row);
+    }
+    return dedupeByEtiqueta(filteredRows);
+  }, [searchIndex, filterArea, filterPerson, filterOrigen, preparedSearch]);
 
-      // Filtro por Origen
-      if (filterOrigen !== "ALL") {
-        if (textOf(row.origen) !== filterOrigen) return false;
-      }
-
-      // Búsqueda textual libre
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase().trim();
-        const matches =
-          textOf(row.etiqueta).toLowerCase().includes(q) ||
-          textOf(row.articulo).toLowerCase().includes(q) ||
-          textOf(row.marca).toLowerCase().includes(q) ||
-          textOf(row.modelo).toLowerCase().includes(q) ||
-          textOf(row.serie).toLowerCase().includes(q) ||
-          textOf(row.area).toLowerCase().includes(q) ||
-          textOf(row.persona).toLowerCase().includes(q) ||
-          textOf(row.observaciones).toLowerCase().includes(q);
-        if (!matches) return false;
-      }
-
-      return true;
-    });
-  }, [items, filterArea, filterPerson, filterOrigen, searchQuery]);
+  // Al filtrar, el reporte incluye solo lo que coincide con el filtro.
+  // Los extras se agregan después con "Añadir productos...".
+  useEffect(() => {
+    setSelectedKeys(new Set(candidateItems.map((row, index) => getRowKey(row, index))));
+  }, [candidateItems]);
 
   // PRODUCTOS EFECTIVAMENTE INCLUIDOS EN EL REPORTE FINAL
   const reportIncludedItems = useMemo(() => {
-    return items.filter((r, i) => selectedKeys.has(getRowKey(r, i)));
+    return dedupeByEtiqueta(items.filter((r, i) => selectedKeys.has(getRowKey(r, i))));
   }, [items, selectedKeys]);
 
   // Items mostrados en la tabla según el modo (todos los candidatos o solo incluidos)
@@ -201,18 +362,22 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
 
   // Acciones masivas
   const selectAllCandidates = () => {
-    setSelectedKeys((prev) => {
-      const next = new Set(prev);
-      candidateItems.forEach((r, i) => next.add(getRowKey(r, i)));
-      return next;
+    runKeepingListInView(() => {
+      setSelectedKeys((prev) => {
+        const next = new Set(prev);
+        candidateItems.forEach((r, i) => next.add(getRowKey(r, i)));
+        return next;
+      });
     });
   };
 
   const deselectAllCandidates = () => {
-    setSelectedKeys((prev) => {
-      const next = new Set(prev);
-      candidateItems.forEach((r, i) => next.delete(getRowKey(r, i)));
-      return next;
+    runKeepingListInView(() => {
+      setSelectedKeys((prev) => {
+        const next = new Set(prev);
+        candidateItems.forEach((r, i) => next.delete(getRowKey(r, i)));
+        return next;
+      });
     });
   };
 
@@ -264,12 +429,13 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
     setFilterPerson("ALL");
     setFilterOrigen("ALL");
     setSearchQuery("");
+    setDebouncedSearch("");
   };
 
   // Exportar reporte a CSV (SOLO LOS SELECCIONADOS)
   const handleExportCSV = () => {
     if (!reportIncludedItems.length) {
-      alert("No hay ningún producto seleccionado para exportar.");
+      alert("No hay ningún artículo seleccionado para exportar.");
       return;
     }
 
@@ -322,7 +488,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
   // Imprimir reporte formal (SOLO LOS SELECCIONADOS)
   const handlePrintReport = () => {
     if (!reportIncludedItems.length) {
-      alert("No hay ningún producto seleccionado para imprimir.");
+      alert("No hay ningún artículo seleccionado para imprimir.");
       return;
     }
 
@@ -334,20 +500,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
       timeStyle: "short",
     }).format(new Date());
 
-    const titlePreset =
-      preset === "general"
-        ? "Reporte General de Inventario"
-        : preset === "persona"
-        ? filterPerson !== "ALL"
-          ? `Reporte de Asignación / Resguardo: ${filterPerson}`
-          : "Reporte de Artículos Asignados por Persona"
-        : preset === "area"
-        ? filterArea !== "ALL"
-          ? `Reporte de Inventario por Área: ${filterArea}`
-          : "Reporte Consolidado por Áreas"
-        : preset === "stock"
-        ? "Reporte de Artículos en Stock (Disponibles)"
-        : "Reporte Personalizado de Inventario";
+    const titlePreset = buildReportTitle(filterArea, filterPerson, filterOrigen);
 
     const rowsHtml = reportIncludedItems
       .map(
@@ -398,7 +551,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
             </div>
             <div style="text-align:right;">
               <p><strong>Fecha de emisión:</strong> ${dateFormatted}</p>
-              <p>Productos seleccionados: ${totalReportRecords} | Unidades: ${totalReportUnits}</p>
+              <p>Artículos seleccionados: ${totalReportRecords} | Unidades: ${totalReportUnits}</p>
             </div>
           </div>
 
@@ -446,12 +599,12 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
   const handleCopySummary = async () => {
     const summary = `REPORTE DE INVENTARIO (SELECCIÓN PERSONALIZADA)
 Fecha: ${new Date().toLocaleDateString("es-MX")}
-Artículos seleccionados: ${totalReportRecords}
+Registros seleccionados: ${totalReportRecords}
 Unidades físicas: ${totalReportUnits}
 Asignados: ${assignedCount} | Stock: ${unassignedCount}
 
 Desglose por área:
-${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data.count} artículos)`).join("\n")}
+${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data.count} ${data.count === 1 ? "registro" : "registros"})`).join("\n")}
 `;
     try {
       await navigator.clipboard.writeText(summary);
@@ -464,132 +617,199 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
 
   // Filtrado de productos para el modal "Añadir productos al reporte"
   const pickerCandidates = useMemo(() => {
-    if (!pickerSearch.trim()) return items;
-    const q = pickerSearch.toLowerCase().trim();
-    return items.filter(
-      (r) =>
-        textOf(r.articulo).toLowerCase().includes(q) ||
-        textOf(r.etiqueta).toLowerCase().includes(q) ||
-        textOf(r.marca).toLowerCase().includes(q) ||
-        textOf(r.area).toLowerCase().includes(q) ||
-        textOf(r.persona).toLowerCase().includes(q)
-    );
-  }, [items, pickerSearch]);
+    const filtered = !pickerSearch.trim()
+      ? items
+      : items.filter((r) => {
+          const q = pickerSearch.toLowerCase().trim();
+          return (
+            textOf(r.articulo).toLowerCase().includes(q) ||
+            textOf(r.etiqueta).toLowerCase().includes(q) ||
+            textOf(r.marca).toLowerCase().includes(q) ||
+            textOf(r.serie).toLowerCase().includes(q) ||
+            textOf(r.area).toLowerCase().includes(q) ||
+            textOf(r.persona).toLowerCase().includes(q)
+          );
+        });
+
+    // Primero los que aún no están en el reporte (para añadirlos con claridad)
+    return dedupeByEtiqueta(filtered).sort((a, b) => {
+      const aIncluded = selectedKeys.has(getRowKey(a));
+      const bIncluded = selectedKeys.has(getRowKey(b));
+      if (aIncluded === bIncluded) return 0;
+      return aIncluded ? 1 : -1;
+    });
+  }, [items, pickerSearch, selectedKeys]);
 
   return (
     <div className="reports-page-container">
-      {/* Selector de Presets de Reporte */}
-      <section className="reports-presets-bar" aria-label="Tipos de reporte">
-        <button
-          type="button"
-          className={`report-preset-btn ${preset === "general" ? "is-active" : ""}`}
-          onClick={() => handleSelectPreset("general")}
-        >
-          <Layers size={16} />
-          <span>Reporte General</span>
-        </button>
+      {/* Métricas Resumen del Reporte (Calculadas con los productos seleccionados) */}
+      <section className="reports-kpi-grid">
+        <article className="stat-card stat-blue">
+          <div className="stat-topline">
+            <span>Artículos en Reporte</span>
+            <span className="stat-icon"><Package size={18} /></span>
+          </div>
+          <strong>{formatNumber(totalReportRecords)}</strong>
+          <small>Artículos que se imprimirán/exportarán</small>
+        </article>
 
-        <button
-          type="button"
-          className={`report-preset-btn ${preset === "persona" ? "is-active" : ""}`}
-          onClick={() => handleSelectPreset("persona")}
-        >
-          <Users size={16} />
-          <span>Por Persona (Resguardos)</span>
-        </button>
+        <article className="stat-card stat-teal">
+          <div className="stat-topline">
+            <span>Unidades Físicas</span>
+            <span className="stat-icon"><Boxes size={18} /></span>
+          </div>
+          <strong>{formatNumber(totalReportUnits)}</strong>
+          <small>Suma de existencias calculadas</small>
+        </article>
 
-        <button
-          type="button"
-          className={`report-preset-btn ${preset === "area" ? "is-active" : ""}`}
-          onClick={() => handleSelectPreset("area")}
-        >
-          <Building2 size={16} />
-          <span>Por Área / Dpto.</span>
-        </button>
+        <article className="stat-card stat-purple">
+          <div className="stat-topline">
+            <span>Asignados</span>
+            <span className="stat-icon"><UserCheck size={18} /></span>
+          </div>
+          <strong>{formatNumber(assignedCount)}</strong>
+          <small>
+            {totalReportRecords > 0 ? Math.round((assignedCount / totalReportRecords) * 100) : 0}% en
+            resguardo
+          </small>
+        </article>
 
-        <button
-          type="button"
-          className={`report-preset-btn ${preset === "stock" ? "is-active" : ""}`}
-          onClick={() => handleSelectPreset("stock")}
-        >
-          <PackageCheck size={16} />
-          <span>Disponibles en Stock</span>
-        </button>
-
-        <button
-          type="button"
-          className={`report-preset-btn ${preset === "personalizado" ? "is-active" : ""}`}
-          onClick={() => handleSelectPreset("personalizado")}
-        >
-          <Filter size={16} />
-          <span>Filtro Personalizado</span>
-        </button>
+        <article className="stat-card stat-amber">
+          <div className="stat-topline">
+            <span>Disponibles (Stock)</span>
+            <span className="stat-icon"><PackageCheck size={18} /></span>
+          </div>
+          <strong>{formatNumber(unassignedCount)}</strong>
+          <small>Sin persona asignada</small>
+        </article>
       </section>
+
+      {/* Gráficos de distribución (Calculados con los productos seleccionados) */}
+      {totalReportRecords > 0 ? (
+        <section className="reports-distribution-grid">
+          {/* Distribución por Áreas */}
+          <div className="panel report-panel">
+            <div className="report-panel-header">
+              <h3><MapPin size={16} /> Distribución por Área (En reporte)</h3>
+              <span>{areaBreakdown.length} áreas</span>
+            </div>
+            <div className="report-breakdown-list">
+              {areaBreakdown.slice(0, 6).map(([area, data], index) => {
+                const totalUnits = Math.max(
+                  areaBreakdown.reduce((sum, [, item]) => sum + item.units, 0),
+                  1,
+                );
+                const pct = Math.round((data.units / totalUnits) * 100);
+                return (
+                  <article key={area} className="breakdown-card tone-blue">
+                    <div className="breakdown-card-top">
+                      <span className="breakdown-rank">{String(index + 1).padStart(2, "0")}</span>
+                      <div className="breakdown-card-copy">
+                        <strong>{area}</strong>
+                        <small>
+                          {formatNumber(data.count)} {data.count === 1 ? "artículo" : "artículos"}
+                        </small>
+                      </div>
+                      <span className="breakdown-pill">{pct}%</span>
+                    </div>
+                    <div className="breakdown-card-meta">
+                      <span>
+                        {formatNumber(data.units)} {data.units === 1 ? "unidad" : "unidades"}
+                      </span>
+                    </div>
+                    <div className="breakdown-bar">
+                      <div className="breakdown-bar-fill bar-blue" style={{ width: `${pct}%` }} />
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Distribución por Origen */}
+          <div className="panel report-panel">
+            <div className="report-panel-header">
+              <h3><Layers size={16} /> Distribución por Origen</h3>
+              <span>{origenBreakdown.length} categorías</span>
+            </div>
+            <div className="report-breakdown-list">
+              {origenBreakdown.map(([orig, units], index) => {
+                const totalUnits = Math.max(
+                  origenBreakdown.reduce((sum, [, value]) => sum + value, 0),
+                  1,
+                );
+                const pct = Math.round((units / totalUnits) * 100);
+                return (
+                  <article key={orig} className="breakdown-card tone-teal">
+                    <div className="breakdown-card-top">
+                      <span className="breakdown-rank">{String(index + 1).padStart(2, "0")}</span>
+                      <div className="breakdown-card-copy">
+                        <strong>{orig}</strong>
+                        <small>Origen del inventario</small>
+                      </div>
+                      <span className="breakdown-pill">{pct}%</span>
+                    </div>
+                    <div className="breakdown-card-meta">
+                      <span>
+                        {formatNumber(units)} {units === 1 ? "unidad" : "unidades"}
+                      </span>
+                    </div>
+                    <div className="breakdown-bar">
+                      <div className="breakdown-bar-fill bar-teal" style={{ width: `${pct}%` }} />
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {/* Barra de Filtros y Herramientas */}
       <section className="reports-filter-panel">
         <div className="reports-filter-grid">
-          {/* Filtro de Área */}
-          <div className="report-filter-item">
-            <label htmlFor="rep-area">Área / Ubicación</label>
-            <select
-              id="rep-area"
-              value={filterArea}
-              onChange={(e) => setFilterArea(e.target.value)}
-            >
-              <option value="ALL">Todas las áreas ({areasList.length})</option>
-              {areasList.map((area) => (
-                <option key={area} value={area}>
-                  {area}
-                </option>
-              ))}
-            </select>
-          </div>
+          <ReportSelect
+            id="rep-area"
+            label="Área / Ubicación"
+            value={filterArea}
+            onChange={setFilterArea}
+            options={[
+              { value: "ALL", label: `Todas las áreas (${areasList.length})` },
+              ...areasList.map((area) => ({ value: area, label: area })),
+            ]}
+          />
 
-          {/* Filtro de Persona */}
-          <div className="report-filter-item">
-            <label htmlFor="rep-person">Asignado a</label>
-            <select
-              id="rep-person"
-              value={filterPerson}
-              onChange={(e) => setFilterPerson(e.target.value)}
-            >
-              <option value="ALL">Todas las asignaciones</option>
-              <option value="__ASSIGNED__">Solo artículos con asignación</option>
-              <option value="__UNASSIGNED__">Solo disponibles (Sin asignar)</option>
-              {peopleList.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </select>
-          </div>
+          <ReportSelect
+            id="rep-person"
+            label="Asignado a"
+            value={filterPerson}
+            onChange={setFilterPerson}
+            options={[
+              { value: "ALL", label: "Todas las asignaciones" },
+              { value: "__ASSIGNED__", label: "Solo artículos con asignación" },
+              { value: "__UNASSIGNED__", label: "Solo disponibles (Sin asignar)" },
+              ...peopleList.map((person) => ({ value: person, label: person })),
+            ]}
+          />
 
-          {/* Filtro de Origen */}
-          <div className="report-filter-item">
-            <label htmlFor="rep-origen">Origen</label>
-            <select
-              id="rep-origen"
-              value={filterOrigen}
-              onChange={(e) => setFilterOrigen(e.target.value)}
-            >
-              <option value="ALL">Todos los orígenes</option>
-              {origenesList.map((o) => (
-                <option key={o} value={o}>
-                  {o}
-                </option>
-              ))}
-            </select>
-          </div>
+          <ReportSelect
+            id="rep-origen"
+            label="Origen"
+            value={filterOrigen}
+            onChange={setFilterOrigen}
+            options={[
+              { value: "ALL", label: "Todos los orígenes" },
+              ...origenesList.map((origen) => ({ value: origen, label: origen })),
+            ]}
+          />
 
-          {/* Búsqueda rápida */}
           <div className="report-filter-item report-filter-search">
             <label htmlFor="rep-search">Búsqueda rápida</label>
             <div className="report-search-wrap">
               <Search size={15} />
               <input
                 id="rep-search"
-                placeholder="Filtrar por artículo, marca, serie..."
+                placeholder="Ej. Biblioteca, Martinez, mesa, 471776…"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
@@ -597,7 +817,10 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
                 <button
                   type="button"
                   className="report-search-clear"
-                  onClick={() => setSearchQuery("")}
+                  onClick={() => {
+                    setSearchQuery("");
+                    setDebouncedSearch("");
+                  }}
                 >
                   ×
                 </button>
@@ -654,12 +877,16 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
       </section>
 
       {/* BARRA DE COMPOSICIÓN / CONTROL DE INCLUSIÓN DEL REPORTE */}
-      <section className="report-composition-bar" aria-label="Control de inclusión de productos">
+      <section
+        ref={listAnchorRef}
+        className="report-composition-bar"
+        aria-label="Control de inclusión de artículos"
+      >
         <div className="composition-summary">
           <span className="composition-badge">
             <CheckSquare size={16} />
             <strong>{formatNumber(totalReportRecords)}</strong>
-            <span>productos seleccionados para el reporte</span>
+            <span>Registros seleccionados para el reporte</span>
           </span>
           <span className="composition-units-hint">
             ({formatNumber(totalReportUnits)} unidades físicas calculadas)
@@ -672,14 +899,14 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
             <button
               type="button"
               className={viewMode === "todos" ? "is-active" : ""}
-              onClick={() => setViewMode("todos")}
+              onClick={() => runKeepingListInView(() => setViewMode("todos"))}
             >
               Todos ({candidateItems.length})
             </button>
             <button
               type="button"
               className={viewMode === "incluidos" ? "is-active" : ""}
-              onClick={() => setViewMode("incluidos")}
+              onClick={() => runKeepingListInView(() => setViewMode("incluidos"))}
             >
               Incluidos en reporte ({totalReportRecords})
             </button>
@@ -714,10 +941,10 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
               setPickerSearch("");
               setIsAddPickerOpen(true);
             }}
-            title="Buscar y agregar cualquier otro producto al reporte"
+            title="Buscar y agregar cualquier otro artículo al reporte"
           >
             <Plus size={14} strokeWidth={2.4} />
-            <span>Añadir productos...</span>
+            <span>Añadir artículos...</span>
           </button>
         </div>
       </section>
@@ -727,110 +954,10 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
         <div className="modal-alert modal-alert-error" style={{ margin: "0" }}>
           <AlertCircle size={16} />
           <span>
-            No has seleccionado ningún producto para el reporte. Marca las casillas de los artículos
+            No has seleccionado ningún artículo para el reporte. Marca las casillas de los artículos
             que deseas incluir para activar la exportación e impresión.
           </span>
         </div>
-      ) : null}
-
-      {/* Métricas Resumen del Reporte (Calculadas con los productos seleccionados) */}
-      <section className="reports-kpi-grid">
-        <article className="stat-card stat-blue">
-          <div className="stat-topline">
-            <span>Artículos en Reporte</span>
-            <span className="stat-icon"><Package size={18} /></span>
-          </div>
-          <strong>{formatNumber(totalReportRecords)}</strong>
-          <small>Productos que se imprimirán/exportarán</small>
-        </article>
-
-        <article className="stat-card stat-teal">
-          <div className="stat-topline">
-            <span>Unidades Físicas</span>
-            <span className="stat-icon"><Boxes size={18} /></span>
-          </div>
-          <strong>{formatNumber(totalReportUnits)}</strong>
-          <small>Suma de existencias calculadas</small>
-        </article>
-
-        <article className="stat-card stat-purple">
-          <div className="stat-topline">
-            <span>Asignados</span>
-            <span className="stat-icon"><UserCheck size={18} /></span>
-          </div>
-          <strong>{formatNumber(assignedCount)}</strong>
-          <small>
-            {totalReportRecords > 0 ? Math.round((assignedCount / totalReportRecords) * 100) : 0}% en
-            resguardo
-          </small>
-        </article>
-
-        <article className="stat-card stat-amber">
-          <div className="stat-topline">
-            <span>Disponibles (Stock)</span>
-            <span className="stat-icon"><PackageCheck size={18} /></span>
-          </div>
-          <strong>{formatNumber(unassignedCount)}</strong>
-          <small>Sin persona asignada</small>
-        </article>
-      </section>
-
-      {/* Gráficos de distribución (Calculados con los productos seleccionados) */}
-      {totalReportRecords > 0 ? (
-        <section className="reports-distribution-grid">
-          {/* Distribución por Áreas */}
-          <div className="panel report-panel">
-            <div className="report-panel-header">
-              <h3><MapPin size={16} /> Distribución por Área (En reporte)</h3>
-              <span>{areaBreakdown.length} áreas</span>
-            </div>
-            <div className="report-breakdown-list">
-              {areaBreakdown.slice(0, 6).map(([area, data]) => {
-                const maxUnits = Math.max(...areaBreakdown.map(([, d]) => d.units), 1);
-                const pct = Math.round((data.units / maxUnits) * 100);
-                return (
-                  <div key={area} className="breakdown-row">
-                    <div className="breakdown-info">
-                      <strong>{area}</strong>
-                      <span>
-                        {formatNumber(data.units)} {data.units === 1 ? "unidad" : "unidades"} (
-                        {data.count} art.)
-                      </span>
-                    </div>
-                    <div className="breakdown-bar">
-                      <div className="breakdown-bar-fill bar-blue" style={{ width: `${pct}%` }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Distribución por Origen */}
-          <div className="panel report-panel">
-            <div className="report-panel-header">
-              <h3><Layers size={16} /> Distribución por Origen</h3>
-              <span>{origenBreakdown.length} categorías</span>
-            </div>
-            <div className="report-breakdown-list">
-              {origenBreakdown.map(([orig, units]) => {
-                const maxO = Math.max(...origenBreakdown.map(([, u]) => u), 1);
-                const pct = Math.round((units / maxO) * 100);
-                return (
-                  <div key={orig} className="breakdown-row">
-                    <div className="breakdown-info">
-                      <strong>{orig}</strong>
-                      <span>{formatNumber(units)} unidades</span>
-                    </div>
-                    <div className="breakdown-bar">
-                      <div className="breakdown-bar-fill bar-teal" style={{ width: `${pct}%` }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </section>
       ) : null}
 
       {/* Tabla detallada del reporte con Selección Activa */}
@@ -839,12 +966,12 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
           <div>
             <h2>
               {viewMode === "incluidos"
-                ? `Productos incluidos en el reporte (${totalReportRecords})`
-                : `Productos disponibles (${candidateItems.length})`}
+                ? `Artículos incluidos en el reporte (${totalReportRecords})`
+                : `Artículos disponibles (${candidateItems.length})`}
             </h2>
             <p>
               {viewMode === "incluidos"
-                ? "Esta es la lista exacta de productos que se exportarán en CSV o se imprimirán. Puedes quitar artículos con el botón de la derecha."
+                ? "Esta es la lista exacta de artículos que se exportarán en CSV o se imprimirán. Puedes quitar artículos con el botón de la derecha."
                 : "Marca o desmarca los artículos para agregarlos o quitarlos del reporte según lo que necesites."}
             </p>
           </div>
@@ -858,11 +985,12 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
                   <span className="sr-only">Incluir</span>
                 </th>
                 <th scope="col">Etiqueta</th>
-                <th scope="col">Artículo</th>
-                <th scope="col">Marca / Modelo</th>
-                <th scope="col">Serie</th>
-                <th scope="col">Área</th>
-                <th scope="col">Persona Asignada</th>
+                <th scope="col" className="col-articulo">Artículo</th>
+                <th scope="col" className="col-marca">Marca</th>
+                <th scope="col" className="col-modelo">Modelo</th>
+                <th scope="col" className="col-serie">Serie</th>
+                <th scope="col" className="col-area">Área</th>
+                <th scope="col" className="col-persona">Persona Asignada</th>
                 <th scope="col" style={{ textAlign: "center" }}>Cantidad</th>
                 <th scope="col">Estado en reporte</th>
                 <th scope="col" style={{ textAlign: "right" }}>Acción</th>
@@ -908,26 +1036,35 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
                     </td>
 
                     <td
-                      className="table-cell-clickable"
+                      className="table-cell-clickable col-articulo"
                       onClick={() => onSelectProduct?.(row)}
-                      title="Ver ficha completa"
+                      title={textOf(row.articulo) || "Ver ficha completa"}
                     >
                       <strong>{textOf(row.articulo) || "—"}</strong>
                     </td>
 
-                    <td>
-                      {[textOf(row.marca), textOf(row.modelo)].filter(Boolean).join(" ") || "—"}
+                    <td className="col-marca" title={textOf(row.marca) || undefined}>
+                      {textOf(row.marca) || "—"}
                     </td>
 
-                    <td className="detail-code">{textOf(row.serie) || "—"}</td>
+                    <td className="col-modelo" title={textOf(row.modelo) || undefined}>
+                      {textOf(row.modelo) || "—"}
+                    </td>
 
-                    <td>
+                    <td
+                      className="col-serie detail-code"
+                      title={textOf(row.serie) || undefined}
+                    >
+                      {textOf(row.serie) || "—"}
+                    </td>
+
+                    <td className="col-area" title={textOf(row.area) || undefined}>
                       <span className="detail-pill pill-area" style={{ fontSize: "11px" }}>
                         {textOf(row.area) || "General"}
                       </span>
                     </td>
 
-                    <td>
+                    <td className="col-persona" title={textOf(row.persona) || undefined}>
                       {textOf(row.persona) ? (
                         <span className="person-cell">
                           <span>{textOf(row.persona)}</span>
@@ -983,10 +1120,10 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
 
               {!displayTableItems.length ? (
                 <tr>
-                  <td className="table-empty" colSpan={10}>
+                  <td className="table-empty" colSpan={11}>
                     {viewMode === "incluidos"
-                      ? "Aún no has incluido productos en el reporte. Puedes seleccionar productos de la pestaña 'Todos' o usar el botón 'Añadir productos'."
-                      : "No hay productos que coincidan con los filtros aplicados."}
+                      ? "Aún no has incluido artículos en el reporte. Puedes seleccionar artículos de la pestaña 'Todos' o usar el botón 'Añadir artículos'."
+                      : "No hay artículos que coincidan con los filtros aplicados."}
                   </td>
                 </tr>
               ) : null}
@@ -997,6 +1134,7 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
 
       {/* MODAL PARA AGREGAR PRODUCTOS ADICIONALES AL REPORTE */}
       {isAddPickerOpen ? (
+        <ModalPortal>
         <div
           className="product-modal-overlay"
           role="dialog"
@@ -1007,7 +1145,7 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
             <header className="product-modal-header">
               <div className="product-modal-title-group">
                 <div>
-                  <h2 id="picker-title">Añadir productos al reporte</h2>
+                  <h2 id="picker-title">Añadir artículos al reporte</h2>
                   <p>
                     Busca y selecciona cualquier artículo del inventario para incorporarlo al reporte
                   </p>
@@ -1091,14 +1229,14 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
                 })}
 
                 {!pickerCandidates.length ? (
-                  <p className="table-empty">No se encontraron productos con esa búsqueda.</p>
+                  <p className="table-empty">No se encontraron artículos con esa búsqueda.</p>
                 ) : null}
               </div>
             </div>
 
-            <div className="form-footer" style={{ padding: "16px 24px", margin: "0" }}>
+            <div className="form-footer">
               <span style={{ fontSize: "12px", color: "var(--muted)", marginRight: "auto" }}>
-                {totalReportRecords} productos seleccionados en total
+                {totalReportRecords} artículos seleccionados en total
               </span>
               <button
                 type="button"
@@ -1110,6 +1248,7 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
             </div>
           </div>
         </div>
+        </ModalPortal>
       ) : null}
     </div>
   );
