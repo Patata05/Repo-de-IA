@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef } from "react";
 import QRCode from "qrcode";
+import { formatInventarioQrText } from "@/lib/inventario-qr";
 import {
   Boxes,
   Calendar,
@@ -304,24 +305,15 @@ export default function ProductDetailModal({
       return;
     }
 
-    const payload = JSON.stringify({
-      etiqueta: product.etiqueta,
-      articulo: product.articulo,
-      marca: product.marca,
-      modelo: product.modelo,
-      serie: product.serie,
-      area: product.area,
-      persona: product.persona,
-      cantidad: product.cantidad,
-      origen: product.origen,
-    });
+    // Texto legible: Google Lens / escáner muestran campos claros; la app también lo parsea.
+    const payload = formatInventarioQrText(product);
 
     let cancelled = false;
     QRCode.toDataURL(payload, {
-      width: 240,
-      margin: 2,
-      errorCorrectionLevel: "M",
-      color: { dark: "#0b1220", light: "#ffffff" },
+      width: 168,
+      margin: 1,
+      errorCorrectionLevel: "L",
+      color: { dark: "#111827", light: "#ffffff" },
     })
       .then((url) => {
         if (!cancelled) setQrDataUrl(url);
@@ -382,20 +374,9 @@ export default function ProductDetailModal({
     }
   };
 
-  // Copiar Ficha Técnica al portapapeles
+  // Copiar Ficha Técnica al portapapeles (mismo formato que el QR)
   const handleCopyFicha = async () => {
-    const text = `FICHA DE INVENTARIO
-Etiqueta: ${product.etiqueta || "—"}
-Artículo: ${product.articulo || "—"}
-Marca: ${product.marca || "—"}
-Modelo: ${product.modelo || "—"}
-Serie: ${product.serie || "—"}
-Área: ${product.area || "—"}
-Asignado a: ${product.persona || "Sin asignar"}
-Cantidad: ${product.cantidad ?? 1}
-Origen: ${product.origen || "S/O"}
-Observaciones: ${product.observaciones || "Ninguna"}
-Registrado: ${formatDate(product.created_at)}`;
+    const text = `${formatInventarioQrText(product)}\nRegistrado: ${formatDate(product.created_at)}`;
 
     try {
       await navigator.clipboard.writeText(text);

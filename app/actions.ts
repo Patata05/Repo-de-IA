@@ -60,17 +60,33 @@ export async function addInventarioBulkAction(
     };
   }
 
-  const { data, error } = await createInventarioMany(normalized);
+  try {
+    const { data, error } = await createInventarioMany(normalized);
 
-  if (error || !data?.length) {
+    if (error || !data?.length) {
+      return {
+        success: false,
+        error: error || "No se pudieron importar los artículos.",
+      };
+    }
+
+    revalidatePath("/");
+    return { success: true, data };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    const lower = message.toLowerCase();
+    if (lower.includes("fetch failed") || lower.includes("network")) {
+      return {
+        success: false,
+        error:
+          "No se pudo conectar a Supabase al importar. Revisa internet, el proyecto en Supabase y Frontend-ia/.env.local; reinicia npm run dev.",
+      };
+    }
     return {
       success: false,
-      error: error || "No se pudieron importar los artículos.",
+      error: message || "Error inesperado al importar.",
     };
   }
-
-  revalidatePath("/");
-  return { success: true, data };
 }
 
 export async function updateInventarioAction(

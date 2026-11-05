@@ -144,9 +144,13 @@ export async function createInventario(
 
     return { data: data as InventarioRow, error: null };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Error inesperado al guardar.";
     console.error("Error en createInventario:", err);
-    return { data: null, error: message };
+    return {
+      data: null,
+      error:
+        mapNetworkError(err) ||
+        (err instanceof Error ? err.message : "Error inesperado al guardar."),
+    };
   }
 }
 
@@ -168,7 +172,35 @@ function toInventarioPayload(item: NewInventarioItem) {
   };
 }
 
+function mapNetworkError(err: unknown): string | null {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  const cause =
+    err instanceof Error && "cause" in err
+      ? String((err as { cause?: unknown }).cause ?? "")
+      : "";
+  const blob = `${message} ${cause}`.toLowerCase();
+  if (
+    blob.includes("fetch failed") ||
+    blob.includes("econnrefused") ||
+    blob.includes("enotfound") ||
+    blob.includes("econnreset") ||
+    blob.includes("etimedout") ||
+    blob.includes("network") ||
+    blob.includes("certificate") ||
+    blob.includes("getaddrinfo")
+  ) {
+    return (
+      "No se pudo conectar a Supabase (TypeError: fetch failed). " +
+      "Revisa internet, que el proyecto no esté pausado, y NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY en Frontend-ia/.env.local. " +
+      "Reinicia npm run dev e inténtalo de nuevo."
+    );
+  }
+  return null;
+}
+
 function mapImportError(msg: string): string {
+  const network = mapNetworkError(new Error(msg));
+  if (network) return network;
   if (isMissingEstadoColumn(msg)) return ESTADO_COLUMN_HINT;
   if (msg.toLowerCase().includes("value too long") || msg.toLowerCase().includes("character varying")) {
     return "Algún texto supera el límite de la base. Ejecuta Database/widen-inventario-text.sql en Supabase y vuelve a importar.";
@@ -180,6 +212,61 @@ function mapImportError(msg: string): string {
     return "La base aún no permite series duplicadas. Ejecuta Database/allow-serie-duplicates-so.sql en Supabase.";
   }
   return msg;
+}
+
+const IMPORT_BATCH_SIZE = 80;
+
+async function insertPayloadBatch(
+  payloads: ReturnType<typeof toInventarioPayload>[]
+): Promise<{ data: InventarioRow[]; error: string | null }> {
+  if (!supabase) {
+    return { data: [], error: "El cliente de Supabase no está configurado." };
+  }
+
+  const { data, error } = await supabase.from("inventario").insert(payloads).select();
+  if (!error) {
+    return { data: (data as InventarioRow[]) || [], error: null };
+  }
+
+  console.error("Error al importar inventario en Supabase:", error);
+  const msg = error.message || "";
+  const isUnique =
+    msg.includes("inventario_etiqueta_key") ||
+    msg.includes("inventario_etiqueta_origen_key") ||
+    msg.includes("inventario_serie_key") ||
+    msg.includes("inventario_serie_origen_key") ||
+    msg.toLowerCase().includes("duplicate");
+
+  if (!isUnique) {
+    return { data: [], error: mapImportError(msg) };
+  }
+
+  // Lote con choques de únicos: insertar uno a uno y conservar los válidos
+  const saved: InventarioRow[] = [];
+  const failed: string[] = [];
+  for (const payload of payloads) {
+    const one = await supabase.from("inventario").insert([payload]).select().single();
+    if (one.error || !one.data) {
+      const detail = payload.serie
+        ? `${payload.etiqueta} / serie ${payload.serie}`
+        : payload.etiqueta;
+      if (failed.length < 10) failed.push(detail);
+      continue;
+    }
+    saved.push(one.data as InventarioRow);
+  }
+
+  if (saved.length) {
+    return { data: saved, error: null };
+  }
+
+  return {
+    data: [],
+    error:
+      failed.length > 0
+        ? `No se pudo importar. Conflictos en: ${failed.join(", ")}`
+        : mapImportError(msg),
+  };
 }
 
 export async function createInventarioMany(
@@ -194,55 +281,30 @@ export async function createInventarioMany(
 
   try {
     const payloads = items.map(toInventarioPayload);
-    const { data, error } = await supabase.from("inventario").insert(payloads).select();
+    const saved: InventarioRow[] = [];
+    let lastError: string | null = null;
 
-    if (!error) {
-      return { data: (data as InventarioRow[]) || [], error: null };
+    for (let i = 0; i < payloads.length; i += IMPORT_BATCH_SIZE) {
+      const chunk = payloads.slice(i, i + IMPORT_BATCH_SIZE);
+      const result = await insertPayloadBatch(chunk);
+      if (result.data.length) saved.push(...result.data);
+      if (result.error) lastError = result.error;
     }
 
-    console.error("Error al importar inventario en Supabase:", error);
-    const msg = error.message || "";
-    const isUnique =
-      msg.includes("inventario_etiqueta_key") ||
-      msg.includes("inventario_etiqueta_origen_key") ||
-      msg.includes("inventario_serie_key") ||
-      msg.includes("inventario_serie_origen_key") ||
-      msg.toLowerCase().includes("duplicate");
-
-    // Si el lote choca por únicos, insertar uno a uno y quedarnos con los válidos
-    if (isUnique) {
-      const saved: InventarioRow[] = [];
-      const failed: string[] = [];
-      for (const payload of payloads) {
-        const one = await supabase.from("inventario").insert([payload]).select().single();
-        if (one.error || !one.data) {
-          const detail = payload.serie
-            ? `${payload.etiqueta} / serie ${payload.serie}`
-            : payload.etiqueta;
-          if (failed.length < 10) failed.push(detail);
-          continue;
-        }
-        saved.push(one.data as InventarioRow);
-      }
-
-      if (saved.length) {
-        return { data: saved, error: null };
-      }
-
-      return {
-        data: [],
-        error:
-          failed.length > 0
-            ? `No se pudo importar. Conflictos en: ${failed.join(", ")}`
-            : mapImportError(msg),
-      };
+    if (saved.length) {
+      return { data: saved, error: null };
     }
 
-    return { data: [], error: mapImportError(msg) };
+    return {
+      data: [],
+      error: lastError || "No se pudieron importar los artículos.",
+    };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Error inesperado al importar.";
     console.error("Error en createInventarioMany:", err);
-    return { data: [], error: message };
+    return {
+      data: [],
+      error: mapNetworkError(err) || (err instanceof Error ? err.message : "Error inesperado al importar."),
+    };
   }
 }
 

@@ -27,6 +27,7 @@ import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import { addInventarioAction, addInventarioBulkAction } from "@/app/actions";
 import ModalPortal from "@/components/modal-portal";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
+import { parseInventarioQrText } from "@/lib/inventario-qr";
 import {
   existsInOrigen,
   findByEtiquetaCascade,
@@ -408,74 +409,9 @@ export default function AddProductModal({
     setCameraActive(false);
   }, []);
 
-  // Parsear datos obtenidos del QR
+  // Parsear datos obtenidos del QR (texto legible o JSON legacy)
   const parseQRContent = (rawText: string) => {
-    const trimmed = rawText.trim();
-    let parsed: Partial<NewInventarioItem> = {};
-
-    // 1. Intentar parsear como JSON
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-      try {
-        const json = JSON.parse(trimmed);
-        parsed = {
-          etiqueta: json.etiqueta || json.tag || json.label || json.code || json.id || "",
-          articulo: json.articulo || json.name || json.item || json.producto || "",
-          marca: json.marca || json.brand || "",
-          modelo: json.modelo || json.model || "",
-          serie: json.serie || json.serial || json.sn || "",
-          area: json.area || json.departamento || json.ubicacion || "",
-          persona: json.persona || json.asignado || json.user || json.owner || "",
-          cantidad:
-            typeof json.cantidad === "number"
-              ? json.cantidad
-              : typeof json.qty === "number"
-              ? json.qty
-              : 1,
-          observaciones: json.observaciones || json.notes || json.desc || "",
-        };
-      } catch {
-        // No era JSON válido, continuar
-      }
-    }
-
-    // 2. Si no fue JSON, intentar buscar pares clave: valor
-    if (!parsed.etiqueta && !parsed.articulo) {
-      const lines = trimmed.split(/\r?\n/);
-      const dict: Record<string, string> = {};
-
-      for (const line of lines) {
-        const separatorIdx = line.indexOf(":");
-        if (separatorIdx !== -1) {
-          const key = line.slice(0, separatorIdx).trim().toLowerCase();
-          const val = line.slice(separatorIdx + 1).trim();
-          dict[key] = val;
-        }
-      }
-
-      if (Object.keys(dict).length > 0) {
-        parsed = {
-          etiqueta: dict["etiqueta"] || dict["tag"] || dict["codigo"] || dict["id"] || "",
-          articulo: dict["articulo"] || dict["producto"] || dict["nombre"] || dict["item"] || "",
-          marca: dict["marca"] || dict["brand"] || "",
-          modelo: dict["modelo"] || dict["model"] || "",
-          serie: dict["serie"] || dict["serial"] || dict["sn"] || "",
-          area: dict["area"] || dict["departamento"] || "",
-          persona: dict["persona"] || dict["asignado"] || "",
-          cantidad: dict["cantidad"] ? parseInt(dict["cantidad"], 10) || 1 : 1,
-          observaciones: dict["observaciones"] || dict["notas"] || "",
-        };
-      }
-    }
-
-    // 3. Fallback: usar el texto como etiqueta si es corto, o en observaciones si es largo
-    if (!parsed.etiqueta && !parsed.articulo) {
-      if (trimmed.length <= 50) {
-        parsed.etiqueta = trimmed;
-      } else {
-        parsed.observaciones = `QR: ${trimmed}`;
-      }
-    }
-
+    const parsed = parseInventarioQrText(rawText);
     const etiqueta = String(parsed.etiqueta || "").trim();
     const destino = destinoInventario || defaultOrigen;
     const cascade = etiqueta ? applyCascadeFromEtiqueta(etiqueta, destino) : null;
@@ -486,14 +422,15 @@ export default function AddProductModal({
         ...prev,
         ...(fromHistory || {}),
         ...Object.fromEntries(
-          Object.entries(parsed).filter(([, v]) => v !== undefined && v !== ""),
+          Object.entries(parsed).filter(([, v]) => v !== undefined && v !== "" && v !== null),
         ),
         cantidad:
-          parsed.cantidad !== undefined
+          parsed.cantidad !== undefined && parsed.cantidad !== null
             ? parsed.cantidad
             : fromHistory?.cantidad ?? prev.cantidad ?? 1,
-        origen: destino,
+        origen: String(parsed.origen || "").trim() || destino,
         etiqueta: etiqueta || prev.etiqueta,
+        estado: String(parsed.estado || prev.estado || "Activo"),
       };
     });
 
@@ -785,7 +722,12 @@ export default function AddProductModal({
       setIsImporting(false);
       setTimeout(() => onClose(), 1400);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "No se pudo leer el archivo.";
+      const raw = err instanceof Error ? err.message : "No se pudo leer el archivo.";
+      const lower = raw.toLowerCase();
+      const msg =
+        lower.includes("fetch failed") || lower.includes("network")
+          ? "No se pudo conectar a Supabase al importar el archivo. Revisa internet, que el proyecto no esté pausado, y Frontend-ia/.env.local (URL + anon key). Reinicia npm run dev e inténtalo de nuevo."
+          : raw;
       setErrorMessage(msg);
       setIsImporting(false);
     } finally {
@@ -1045,18 +987,19 @@ export default function AddProductModal({
                   </span>
                   <div>
                     <strong>Pegar código</strong>
-                    <p>Si ya copiaste la etiqueta o el texto del QR</p>
+                    <p>Pega el texto del QR (Google Lens / escáner) o solo la etiqueta</p>
                   </div>
                 </div>
                 <div className="qr-paste-row">
-                  <input
-                    type="text"
+                  <textarea
                     className="qr-paste-input"
-                    placeholder="Ej. OF-0008 o el texto del código"
-                    aria-label="Pegar código o etiqueta"
+                    rows={3}
+                    placeholder={"INVENTARIO\nEtiqueta: PC-001\nArtículo: Laptop\n…"}
+                    aria-label="Pegar código o texto del QR"
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        const value = (e.target as HTMLInputElement).value.trim();
+                      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault();
+                        const value = (e.target as HTMLTextAreaElement).value.trim();
                         if (value) parseQRContent(value);
                       }
                     }}
@@ -1083,7 +1026,7 @@ export default function AddProductModal({
                     onClick={(e) => {
                       const input = (e.currentTarget.parentElement?.querySelector(
                         ".qr-paste-input",
-                      ) as HTMLInputElement | null);
+                      ) as HTMLTextAreaElement | null);
                       const value = input?.value.trim() ?? "";
                       if (value) parseQRContent(value);
                     }}
