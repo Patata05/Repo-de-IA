@@ -1,0 +1,26 @@
+// Ejemplo para OpenClaw: gestiona este repo con Muse Code.
+// Copia lo relevante a tu openclaw.json / Control UI.
+// Workspace = carpeta IA (Frontend-ia + Backend-ia).
+{
+  agents: {
+    defaults: {
+      workspace: "C:/Users/Neverbaexx/Documents/IA",
+      model: "meta/muse-spark-1.3",
+      models: {
+        "meta/muse-spark-1.3": {
+          agentRuntime: { id: "muse" },
+        },
+        "meta/muse-wonder-1.0": {
+          agentRuntime: { id: "muse" },
+        },
+      },
+    },
+  },
+  plugins: {
+    entries: {
+      muse: {
+        enabled: true,
+      },
+    },
+  },
+}

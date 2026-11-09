@@ -55,6 +55,12 @@ def _load_env() -> dict[str, str]:
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_MODEL",
         "DEEPSEEK_BASE_URL",
+        "MODEL_API_KEY",
+        "META_API_KEY",
+        "MUSE_API_KEY",
+        "MUSE_MODEL",
+        "META_MODEL",
+        "META_BASE_URL",
     )
     values: dict[str, str] = {}
     for key in keys:

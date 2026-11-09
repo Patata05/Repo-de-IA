@@ -11,6 +11,7 @@ from inventario.supabase_client import get_env
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+META_BASE_URL = "https://api.meta.ai/v1"
 OLLAMA_DEFAULT_BASE = "http://127.0.0.1:11434/v1"
 
 
@@ -23,7 +24,7 @@ class LlmEndpoint:
 
 def _parse_providers(raw: str) -> list[str]:
     parts = [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
-    return parts or ["groq", "deepseek", "ollama", "gemini"]
+    return parts or ["muse", "deepseek", "groq", "ollama", "gemini"]
 
 
 def _preferred_only(*candidates: str) -> tuple[str, ...]:
@@ -54,6 +55,25 @@ def _deepseek_models(env: dict[str, str]) -> tuple[str, ...]:
     return _preferred_only(env.get("DEEPSEEK_MODEL"), "deepseek-chat")
 
 
+def _muse_models(env: dict[str, str]) -> tuple[str, ...]:
+    # Meta Model API (OpenAI-compatible). Prefer Spark for tool loops del chatbot.
+    return _preferred_only(
+        env.get("MUSE_MODEL"),
+        env.get("META_MODEL"),
+        env.get("LLM_MODEL"),
+        "muse-spark-1.3",
+    )
+
+
+def _muse_api_key(env: dict[str, str]) -> str:
+    return (
+        env.get("MODEL_API_KEY")
+        or env.get("META_API_KEY")
+        or env.get("MUSE_API_KEY")
+        or ""
+    )
+
+
 def _ollama_is_alive(openai_base: str) -> bool:
     """Comprueba tags en el host Ollama (sin /v1). Timeout corto."""
     root = openai_base.rstrip("/")
@@ -73,12 +93,32 @@ def build_llm_endpoints() -> tuple[list[LlmEndpoint], list[str]]:
     Devuelve (endpoints, avisos_de_config).
     """
     env = get_env()
-    order = _parse_providers(env.get("LLM_PROVIDERS", "groq,deepseek,ollama,gemini"))
+    order = _parse_providers(
+        env.get("LLM_PROVIDERS", "muse,deepseek,groq,ollama,gemini")
+    )
     endpoints: list[LlmEndpoint] = []
     warnings: list[str] = []
 
     for provider in order:
-        if provider == "groq":
+        if provider in ("muse", "meta"):
+            key = _muse_api_key(env)
+            if not key:
+                warnings.append("muse: falta MODEL_API_KEY (o META_API_KEY / MUSE_API_KEY)")
+                continue
+            base = (env.get("META_BASE_URL") or META_BASE_URL).rstrip("/")
+            endpoints.append(
+                LlmEndpoint(
+                    provider="muse",
+                    client=OpenAI(
+                        api_key=key,
+                        base_url=base,
+                        timeout=45.0,
+                        max_retries=0,
+                    ),
+                    models=_muse_models(env),
+                )
+            )
+        elif provider == "groq":
             key = env.get("GROQ_API_KEY") or ""
             if not key:
                 warnings.append("groq: falta GROQ_API_KEY")
