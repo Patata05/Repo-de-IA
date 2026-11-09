@@ -362,29 +362,63 @@ export default function ProductDetailModal({
     }
   };
 
-  const handleCopyEtiqueta = async () => {
-    const tag = String(product.etiqueta ?? "").trim();
-    if (!tag) return;
+  const copyToClipboard = async (value: string) => {
+    const text = String(value ?? "");
+    if (!text) return false;
     try {
-      await navigator.clipboard.writeText(tag);
-      setEtiquetaCopied(true);
-      setTimeout(() => setEtiquetaCopied(false), 2000);
-    } catch (err) {
-      console.error("Error al copiar etiqueta:", err);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      /* fallback abajo */
+    }
+    try {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(area);
+      return ok;
+    } catch {
+      return false;
     }
   };
 
-  // Copiar Ficha Técnica al portapapeles (mismo formato que el QR)
-  const handleCopyFicha = async () => {
-    const text = `${formatInventarioQrText(product)}\nRegistrado: ${formatDate(product.created_at)}`;
+  const handleCopyEtiqueta = async () => {
+    const tag = String(product.etiqueta ?? "").trim();
+    if (!tag) return;
+    const ok = await copyToClipboard(tag);
+    if (!ok) return;
+    setEtiquetaCopied(true);
+    setTimeout(() => setEtiquetaCopied(false), 2000);
+  };
 
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error("Error al copiar ficha:", err);
-    }
+  // Copiar ficha completa (legible); el QR sigue en formato compacto INV:…
+  const handleCopyFicha = async () => {
+    const text = `INVENTARIO
+Etiqueta: ${product.etiqueta || "—"}
+Artículo: ${product.articulo || "—"}
+Marca: ${product.marca || "—"}
+Modelo: ${product.modelo || "—"}
+Serie: ${product.serie || "—"}
+Área: ${product.area || "—"}
+Asignado a: ${product.persona || "Sin asignar"}
+Cantidad: ${product.cantidad ?? 1}
+Origen: ${product.origen || "S/O"}
+Estado: ${product.estado || "Activo"}
+Observaciones: ${product.observaciones || "Ninguna"}
+Registrado: ${formatDate(product.created_at)}
+QR: ${formatInventarioQrText(product)}`;
+
+    const ok = await copyToClipboard(text);
+    if (!ok) return;
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   // Imprimir Etiqueta Física

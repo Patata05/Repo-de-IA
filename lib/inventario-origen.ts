@@ -116,14 +116,16 @@ export function findByEtiquetaCascade(
     }
   }
 
-  // Fuente: inventarios estrictamente anteriores al destino (o todos si no hay destino)
+  // Fuente: inventarios anteriores al destino (S/O = base, siempre anterior a Inventario N)
   const sourceCandidates = matches.filter((row) => {
     const origen = origenOf(row);
     if (!destino) return true;
     if (origen === destino) return false;
     const n = inventarioNumber(origen);
+    // Destino sin número (p. ej. S/O): cualquier otro origen puede ser fuente
     if (targetNum === null) return origen !== destino;
-    if (n === null) return false;
+    // Destino Inventario N: sirven Inventario 1..N-1 y S/O (sin número)
+    if (n === null) return true;
     return n < targetNum;
   });
 
