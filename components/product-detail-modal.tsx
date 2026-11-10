@@ -1,8 +1,8 @@
 "use client";
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import QRCode from "qrcode";
 import { formatInventarioQrText } from "@/lib/inventario-qr";
+import { encodeProductQrDataUrl } from "@/lib/encode-inventario-qr";
 import {
   Boxes,
   Calendar,
@@ -252,6 +252,7 @@ export default function ProductDetailModal({
   const [etiquetaCopied, setEtiquetaCopied] = useState(false);
   const [showQrExpanded, setShowQrExpanded] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState("");
+  const [qrBusy, setQrBusy] = useState(false);
 
   // Form State para edición
   const [editForm, setEditForm] = useState<NewInventarioItem>({
@@ -295,37 +296,63 @@ export default function ProductDetailModal({
       setCopied(false);
       setEtiquetaCopied(false);
       setShowQrExpanded(false);
+      setQrDataUrl("");
+      setQrBusy(false);
     }
   }, [product, isOpen]);
 
-  // QR local (sin API externa) para que aparezca al instante
+  // QR con ficha completa en worker (no bloquea el hilo de la UI)
   useEffect(() => {
-    if (!isOpen || !product) {
-      setQrDataUrl("");
-      return;
-    }
-
-    // Texto legible: Google Lens / escáner muestran campos claros; la app también lo parsea.
-    const payload = formatInventarioQrText(product);
+    if (!isOpen || !product) return;
 
     let cancelled = false;
-    QRCode.toDataURL(payload, {
-      width: 168,
-      margin: 1,
-      errorCorrectionLevel: "L",
-      color: { dark: "#111827", light: "#ffffff" },
-    })
+    setQrBusy(true);
+    void encodeProductQrDataUrl(product)
       .then((url) => {
         if (!cancelled) setQrDataUrl(url);
       })
       .catch(() => {
         if (!cancelled) setQrDataUrl("");
+      })
+      .finally(() => {
+        if (!cancelled) setQrBusy(false);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isOpen, product]);
+  }, [
+    isOpen,
+    product?.id,
+    product?.etiqueta,
+    product?.origen,
+    product?.updated_at,
+    product?.articulo,
+    product?.marca,
+    product?.modelo,
+    product?.serie,
+    product?.area,
+    product?.persona,
+    product?.cantidad,
+    product?.estado,
+    product?.observaciones,
+  ]);
+
+  const ensureQrGenerated = async () => {
+    if (!product) return "";
+    if (qrDataUrl) return qrDataUrl;
+    setQrBusy(true);
+    try {
+      const url = await encodeProductQrDataUrl(product);
+      setQrDataUrl(url);
+      return url;
+    } catch {
+      setQrDataUrl("");
+      return "";
+    } finally {
+      setQrBusy(false);
+    }
+  };
 
   // Manejo de ESC
   useEffect(() => {
@@ -398,31 +425,18 @@ export default function ProductDetailModal({
     setTimeout(() => setEtiquetaCopied(false), 2000);
   };
 
-  // Copiar ficha completa (legible); el QR sigue en formato compacto INV:…
+  // Ficha completa en portapapeles (el QR visual es corto para no congelar)
   const handleCopyFicha = async () => {
-    const text = `INVENTARIO
-Etiqueta: ${product.etiqueta || "—"}
-Artículo: ${product.articulo || "—"}
-Marca: ${product.marca || "—"}
-Modelo: ${product.modelo || "—"}
-Serie: ${product.serie || "—"}
-Área: ${product.area || "—"}
-Asignado a: ${product.persona || "Sin asignar"}
-Cantidad: ${product.cantidad ?? 1}
-Origen: ${product.origen || "S/O"}
-Estado: ${product.estado || "Activo"}
-Observaciones: ${product.observaciones || "Ninguna"}
-Registrado: ${formatDate(product.created_at)}
-QR: ${formatInventarioQrText(product)}`;
-
+    const text = `${formatInventarioQrText(product)}\nRegistrado: ${formatDate(product.created_at)}`;
     const ok = await copyToClipboard(text);
     if (!ok) return;
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // Imprimir Etiqueta Física
-  const handlePrintLabel = () => {
+  // Imprimir Etiqueta Física (genera QR solo si hace falta)
+  const handlePrintLabel = async () => {
+    const qrUrl = (await ensureQrGenerated()) || qrDataUrl;
     const printWindow = window.open("", "_blank", "width=600,height=400");
     if (!printWindow) return;
 
@@ -481,7 +495,7 @@ QR: ${formatInventarioQrText(product)}`;
         <body>
           <div class="label-card">
             <div class="label-qr">
-              <img src="${qrImageUrl}" alt="QR" />
+              ${qrUrl ? `<img src="${qrUrl}" alt="QR" />` : ""}
             </div>
             <div class="label-info">
               <span class="label-tag">${product.etiqueta}</span>
@@ -964,23 +978,37 @@ QR: ${formatInventarioQrText(product)}`;
                         src={qrImageUrl}
                         alt={`QR ${product.etiqueta}`}
                         className="qr-img"
-                        decoding="sync"
+                        decoding="async"
                       />
                     ) : (
-                      <div className="qr-img qr-img-placeholder" aria-hidden="true" />
+                      <div
+                        className="qr-img qr-img-placeholder qr-img-load-btn"
+                        aria-busy={qrBusy}
+                        aria-label={qrBusy ? "Generando QR" : "QR pendiente"}
+                      >
+                        {qrBusy ? (
+                          <Loader2 size={22} className="spin" />
+                        ) : (
+                          <QrCode size={22} />
+                        )}
+                      </div>
                     )}
                   </div>
                   <span className="qr-tag-label">{product.etiqueta}</span>
                   <p className="qr-instruction">
-                    Apunta con la cámara o un escáner para consultar este artículo.
+                    {qrImageUrl
+                      ? "Al escanear verás la ficha completa del artículo."
+                      : qrBusy
+                        ? "Generando QR con la ficha completa…"
+                        : "Preparando código QR…"}
                   </p>
 
                   <div className="qr-action-buttons">
                     <button
                       type="button"
                       className="qr-btn"
-                      onClick={handlePrintLabel}
-                      disabled={!qrImageUrl}
+                      onClick={() => void handlePrintLabel()}
+                      disabled={qrBusy}
                       title="Imprimir etiqueta adhesiva para este artículo"
                     >
                       <Printer size={14} />
@@ -988,7 +1016,7 @@ QR: ${formatInventarioQrText(product)}`;
                     </button>
                     <button
                       type="button"
-                      className="qr-btn"
+                      className={etiquetaCopied ? "qr-btn is-copied" : "qr-btn"}
                       onClick={handleCopyEtiqueta}
                       disabled={!product.etiqueta}
                       title="Copiar etiqueta al portapapeles"
@@ -1006,18 +1034,18 @@ QR: ${formatInventarioQrText(product)}`;
               <div className="detail-actions-left">
                 <button
                   type="button"
-                  className="btn-action-tool"
+                  className={copied ? "btn-action-tool is-copied" : "btn-action-tool"}
                   onClick={handleCopyFicha}
                   title="Copiar todos los datos de este artículo al portapapeles"
                 >
-                  {copied ? <Check size={15} className="text-teal" /> : <Copy size={15} />}
+                  {copied ? <Check size={15} /> : <Copy size={15} />}
                   <span>{copied ? "¡Copiado!" : "Copiar ficha"}</span>
                 </button>
 
                 <button
                   type="button"
                   className="btn-action-tool"
-                  onClick={handlePrintLabel}
+                  onClick={() => void handlePrintLabel()}
                   title="Imprimir etiqueta con código QR para pegar en el equipo"
                 >
                   <Printer size={15} />

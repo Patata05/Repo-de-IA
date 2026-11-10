@@ -1,6 +1,6 @@
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 
-/** Opciones QR: pocos módulos (payload corto + corrección L). */
+/** Opciones QR: corrección L = diseño menos denso/robusto. */
 export const INVENTARIO_QR_RENDER = {
   width: 168,
   margin: 1,
@@ -8,15 +8,55 @@ export const INVENTARIO_QR_RENDER = {
   color: { dark: "#0b1220", light: "#ffffff" },
 };
 
+function field(label: string, value: unknown): string | null {
+  const v = String(value ?? "").trim();
+  if (!v || v === "—" || v.toLowerCase() === "null") return null;
+  return `${label}: ${v}`;
+}
+
 /**
- * Payload compacto del QR.
- * Al escanear (Lens / celular) queda en portapapeles algo corto y legible.
- * La app reconoce la etiqueta para abrir/alta.
- *
- * Formato: INV:<etiqueta>|<origen>
- * Ejemplo: INV:295942|S/O
+ * Ficha legible para el QR (al escanear queda completa en portapapeles).
+ * Solo incluye campos con valor → menos densidad. Diseño visual: EC nivel L.
+ * La app sigue parseando este formato clave: valor.
  */
 export function formatInventarioQrText(
+  item: Partial<InventarioRow | NewInventarioItem>,
+): string {
+  const etiqueta = String(item.etiqueta ?? "").trim();
+  if (!etiqueta) return "";
+
+  const lines = [
+    "INVENTARIO",
+    field("Etiqueta", etiqueta),
+    field("Artículo", item.articulo),
+    field("Marca", item.marca),
+    field("Modelo", item.modelo),
+    field("Serie", item.serie),
+    field("Área", item.area),
+    field("Persona", item.persona),
+    field(
+      "Cantidad",
+      item.cantidad != null && item.cantidad !== ""
+        ? String(item.cantidad)
+        : null,
+    ),
+    field("Origen", item.origen || "S/O"),
+    field("Estado", item.estado),
+    field(
+      "Observaciones",
+      (() => {
+        const obs = String(item.observaciones ?? "").trim();
+        if (!obs) return null;
+        return obs.length > 80 ? `${obs.slice(0, 77)}…` : obs;
+      })(),
+    ),
+  ].filter(Boolean);
+
+  return lines.join("\n");
+}
+
+/** Referencia corta (solo etiqueta|origen) si se necesita un payload mínimo. */
+export function formatInventarioQrCompact(
   item: Partial<InventarioRow | NewInventarioItem>,
 ): string {
   const etiqueta = String(item.etiqueta ?? "")
