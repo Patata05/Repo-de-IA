@@ -1,0 +1,4 @@
+Django>=5.1,<6
+django-cors-headers>=4.6
+openai>=1.40
+python-dotenv>=1.0
