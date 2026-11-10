@@ -46,6 +46,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent,
   type MutableRefObject,
   lazy,
   Suspense,
@@ -733,6 +734,18 @@ function normalizePlain(raw: string) {
     .trim();
 }
 
+function isRowActivo(row: { estado?: string | null }) {
+  const v = String(row.estado ?? "")
+    .trim()
+    .toLowerCase();
+  return !(
+    v === "inactivo" ||
+    v === "baja" ||
+    v === "no" ||
+    v === "inactive"
+  );
+}
+
 type AreaSearchIndex = {
   tokens: string[];
   byToken: Map<string, string[]>;
@@ -851,6 +864,7 @@ function findPersonInText(
     .split(/\s+/)
     .filter((t) => t.length > 2 && !PERSON_STOP_WORDS.has(t));
   if (!tokens.length) return undefined;
+  const phrase = tokens.join(" ");
   const idx = getPersonSearchIndex(inventory);
   let best: { raw: string; score: number } | null = null;
   for (const person of idx.people) {
@@ -877,7 +891,7 @@ function findPersonInText(
         }
       }
     }
-    if (person.norm.includes(tokens.join(" ")) && tokens.join(" ").length >= 4) {
+    if (person.norm.includes(phrase) && phrase.length >= 4) {
       score = Math.max(score, 650);
     }
     if (score < 80) continue;
@@ -989,17 +1003,7 @@ function buildPersonTotalReply(person: string, inventory: InventarioRow[]) {
       rows.map((row) => String(row.area ?? "").trim()).filter(Boolean),
     ),
   ];
-  const activos = rows.filter((row) => {
-    const v = String(row.estado ?? "")
-      .trim()
-      .toLowerCase();
-    return !(
-      v === "inactivo" ||
-      v === "baja" ||
-      v === "no" ||
-      v === "inactive"
-    );
-  }).length;
+  const activos = rows.filter(isRowActivo).length;
   const areaLine =
     areas.length === 0
       ? "sin área registrada"
@@ -1623,17 +1627,7 @@ function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
   const personas = new Set(
     rows.map((row) => String(row.persona ?? "").trim()).filter(Boolean),
   );
-  const activos = rows.filter((row) => {
-    const v = String(row.estado ?? "")
-      .trim()
-      .toLowerCase();
-    return !(
-      v === "inactivo" ||
-      v === "baja" ||
-      v === "no" ||
-      v === "inactive"
-    );
-  }).length;
+  const activos = rows.filter(isRowActivo).length;
   const n = rows.length;
   return (
     `En **${area}** hay **${n}** registro${n === 1 ? "" : "s"}: ` +
@@ -1988,6 +1982,102 @@ async function copyChatText(text: string) {
   } catch {
     return false;
   }
+}
+
+type ChoiceCard = {
+  title: string;
+  body: string;
+  action: string;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
+  disabled?: boolean;
+};
+
+function ChatChoiceModal({
+  titleId,
+  title,
+  subtitle,
+  onDismiss,
+  keep,
+  drop,
+}: {
+  titleId: string;
+  title: string;
+  subtitle: string;
+  onDismiss: () => void;
+  keep: ChoiceCard;
+  drop: ChoiceCard;
+}) {
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      className="product-modal-overlay"
+      role="presentation"
+      onClick={onDismiss}
+    >
+      <div
+        className="product-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="product-modal-header">
+          <div className="product-modal-title-group">
+            <div>
+              <h2 id={titleId}>{title}</h2>
+              <p>{subtitle}</p>
+            </div>
+          </div>
+          <div className="product-modal-header-actions">
+            <button
+              type="button"
+              className="product-modal-close"
+              onClick={onDismiss}
+              aria-label="Cerrar"
+            >
+              <X size={19} />
+            </button>
+          </div>
+        </header>
+        <div className="product-modal-body">
+          <div className="choose-options-grid">
+            {(
+              [
+                ["keep", keep],
+                ["delete", drop],
+              ] as const
+            ).map(([kind, card]) => (
+              <button
+                key={kind}
+                type="button"
+                className={`choose-card choose-card-${kind === "keep" ? "keep" : "delete"}`}
+                disabled={card.disabled}
+                onClick={card.onClick}
+              >
+                <div className="choose-card-badge">
+                  {kind === "keep" ? "Conservar" : "Permanente"}
+                </div>
+                <div className="choose-card-icon" aria-hidden="true">
+                  {kind === "keep" ? (
+                    <Undo2 size={36} strokeWidth={1.8} />
+                  ) : (
+                    <Trash2 size={36} strokeWidth={1.8} />
+                  )}
+                </div>
+                <h3>{card.title}</h3>
+                <p>{card.body}</p>
+                <span className="choose-card-action">
+                  <span>{card.action}</span>
+                  <span className="arrow-pill">→</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 function ChatUserEditBox({
@@ -3041,91 +3131,32 @@ const SideRail = memo(function SideRail({
         </div>
       ) : null}
 
-      {deleteConfirmId && typeof document !== "undefined"
-        ? createPortal(
-            <div
-              className="product-modal-overlay"
-              role="presentation"
-              onClick={() => setDeleteConfirmId(null)}
-            >
-              <div
-                className="product-modal-card"
-                role="dialog"
-                aria-modal="true"
-                aria-labelledby="sidebar-delete-title"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <header className="product-modal-header">
-                  <div className="product-modal-title-group">
-                    <div>
-                      <h2 id="sidebar-delete-title">Eliminar búsqueda</h2>
-                      <p>Elige cómo quieres continuar con esta conversación</p>
-                    </div>
-                  </div>
-                  <div className="product-modal-header-actions">
-                    <button
-                      type="button"
-                      className="product-modal-close"
-                      onClick={() => setDeleteConfirmId(null)}
-                      aria-label="Cerrar"
-                    >
-                      <X size={19} />
-                    </button>
-                  </div>
-                </header>
-                <div className="product-modal-body">
-                  <div className="choose-options-grid">
-                    <button
-                      type="button"
-                      className="choose-card choose-card-keep"
-                      onClick={() => setDeleteConfirmId(null)}
-                    >
-                      <div className="choose-card-badge">Conservar</div>
-                      <div className="choose-card-icon" aria-hidden="true">
-                        <Undo2 size={36} strokeWidth={1.8} />
-                      </div>
-                      <h3>Cancelar</h3>
-                      <p>
-                        Mantén esta búsqueda en Reciente. No se borra nada y
-                        puedes seguir consultando.
-                      </p>
-                      <span className="choose-card-action">
-                        <span>Volver al chat</span>
-                        <span className="arrow-pill">→</span>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="choose-card choose-card-delete"
-                      onClick={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        const id = deleteConfirmId;
-                        setDeleteConfirmId(null);
-                        onDeleteChat(id);
-                      }}
-                    >
-                      <div className="choose-card-badge">Permanente</div>
-                      <div className="choose-card-icon" aria-hidden="true">
-                        <Trash2 size={36} strokeWidth={1.8} />
-                      </div>
-                      <h3>Borrar</h3>
-                      <p>
-                        No podrás regresar a esta respuesta ni a su historial
-                        en Reciente.
-                      </p>
-                      <span className="choose-card-action">
-                        <span>Eliminar conversación</span>
-                        <span className="arrow-pill">→</span>
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>,
-            document.body,
-          )
-        : null}
+      {deleteConfirmId ? (
+        <ChatChoiceModal
+          titleId="sidebar-delete-title"
+          title="Eliminar búsqueda"
+          subtitle="Elige cómo quieres continuar con esta conversación"
+          onDismiss={() => setDeleteConfirmId(null)}
+          keep={{
+            title: "Cancelar",
+            body: "Mantén esta búsqueda en Reciente. No se borra nada y puedes seguir consultando.",
+            action: "Volver al chat",
+            onClick: () => setDeleteConfirmId(null),
+          }}
+          drop={{
+            title: "Borrar",
+            body: "No podrás regresar a esta respuesta ni a su historial en Reciente.",
+            action: "Eliminar conversación",
+            onClick: (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              const id = deleteConfirmId;
+              setDeleteConfirmId(null);
+              onDeleteChat(id);
+            },
+          }}
+        />
+      ) : null}
     </aside>
   );
 });
@@ -6862,98 +6893,36 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         existingOrigens={inventarioOptions}
       />
 
-      {pendingChatDeleteRow && typeof document !== "undefined"
-        ? createPortal(
-            <div
-              className="product-modal-overlay"
-              role="presentation"
-              onClick={() => {
-                if (!chatDeleteBusy) setPendingChatDeleteRow(null);
-              }}
-            >
-              <div
-                className="product-modal-card"
-                role="dialog"
-                aria-modal="true"
-                aria-labelledby="chat-delete-record-title"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <header className="product-modal-header">
-                  <div className="product-modal-title-group">
-                    <div>
-                      <h2 id="chat-delete-record-title">Eliminar registro</h2>
-                      <p>
-                        {String(pendingChatDeleteRow.etiqueta ?? "").trim() ||
-                          `ID ${pendingChatDeleteRow.id}`}
-                        {pendingChatDeleteRow.articulo
-                          ? ` — ${pendingChatDeleteRow.articulo}`
-                          : ""}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="product-modal-header-actions">
-                    <button
-                      type="button"
-                      className="product-modal-close"
-                      onClick={() => {
-                        if (!chatDeleteBusy) setPendingChatDeleteRow(null);
-                      }}
-                      aria-label="Cerrar"
-                    >
-                      <X size={19} />
-                    </button>
-                  </div>
-                </header>
-                <div className="product-modal-body">
-                  <div className="choose-options-grid">
-                    <button
-                      type="button"
-                      className="choose-card choose-card-keep"
-                      disabled={chatDeleteBusy}
-                      onClick={() => setPendingChatDeleteRow(null)}
-                    >
-                      <div className="choose-card-badge">Conservar</div>
-                      <div className="choose-card-icon" aria-hidden="true">
-                        <Undo2 size={36} strokeWidth={1.8} />
-                      </div>
-                      <h3>Cancelar</h3>
-                      <p>
-                        El registro se queda en el inventario. No se borra nada.
-                      </p>
-                      <span className="choose-card-action">
-                        <span>Volver al chat</span>
-                        <span className="arrow-pill">→</span>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="choose-card choose-card-delete"
-                      disabled={chatDeleteBusy}
-                      onClick={() => {
-                        void confirmChatDeleteRecord();
-                      }}
-                    >
-                      <div className="choose-card-badge">Permanente</div>
-                      <div className="choose-card-icon" aria-hidden="true">
-                        <Trash2 size={36} strokeWidth={1.8} />
-                      </div>
-                      <h3>{chatDeleteBusy ? "Eliminando…" : "Borrar"}</h3>
-                      <p>
-                        No podrás deshacerlo desde el chat. El artículo sale del
-                        inventario.
-                      </p>
-                      <span className="choose-card-action">
-                        <span>Eliminar registro</span>
-                        <span className="arrow-pill">→</span>
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>,
-            document.body,
-          )
-        : null}
+      {pendingChatDeleteRow ? (
+        <ChatChoiceModal
+          titleId="chat-delete-record-title"
+          title="Eliminar registro"
+          subtitle={`${String(pendingChatDeleteRow.etiqueta ?? "").trim() || `ID ${pendingChatDeleteRow.id}`}${
+            pendingChatDeleteRow.articulo
+              ? ` — ${pendingChatDeleteRow.articulo}`
+              : ""
+          }`}
+          onDismiss={() => {
+            if (!chatDeleteBusy) setPendingChatDeleteRow(null);
+          }}
+          keep={{
+            title: "Cancelar",
+            body: "El registro se queda en el inventario. No se borra nada.",
+            action: "Volver al chat",
+            disabled: chatDeleteBusy,
+            onClick: () => setPendingChatDeleteRow(null),
+          }}
+          drop={{
+            title: chatDeleteBusy ? "Eliminando…" : "Borrar",
+            body: "No podrás deshacerlo desde el chat. El artículo sale del inventario.",
+            action: "Eliminar registro",
+            disabled: chatDeleteBusy,
+            onClick: () => {
+              void confirmChatDeleteRecord();
+            },
+          }}
+        />
+      ) : null}
     </div>
   );
 }

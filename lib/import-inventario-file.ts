@@ -1,4 +1,4 @@
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import type { NewInventarioItem } from "@/lib/supabase";
 import { normalizeEstado } from "@/lib/supabase";
 
@@ -228,14 +228,35 @@ function parseCsvText(text: string): unknown[][] {
   return rows;
 }
 
-function sheetToMatrix(sheet: XLSX.WorkSheet): unknown[][] {
-  // raw:false = texto formateado de Excel (conserva ceros y códigos largos)
-  return XLSX.utils.sheet_to_json<unknown[]>(sheet, {
-    header: 1,
-    raw: false,
-    defval: "",
-    blankrows: false,
+function cellDisplay(cell: ExcelJS.Cell): string {
+  const text = String(cell.text ?? "").trim();
+  if (text) return text;
+  const value = cell.value;
+  if (value == null || typeof value === "object") return "";
+  return String(value).trim();
+}
+
+async function workbookToMatrix(buffer: ArrayBuffer): Promise<{
+  matrix: unknown[][];
+  sheetName: string;
+}> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const preferred =
+    workbook.worksheets.find((sheet) =>
+      normalizeHeader(sheet.name).includes("lectura"),
+    ) || workbook.worksheets[0];
+  if (!preferred) throw new Error("El archivo de Excel no tiene hojas.");
+
+  const matrix: unknown[][] = [];
+  preferred.eachRow({ includeEmpty: false }, (row) => {
+    const cells: string[] = [];
+    for (let c = 1; c <= row.cellCount; c += 1) {
+      cells.push(cellDisplay(row.getCell(c)));
+    }
+    if (cells.some((cell) => cell.length > 0)) matrix.push(cells);
   });
+  return { matrix, sheetName: preferred.name };
 }
 
 function findHeader(matrix: unknown[][]): {
@@ -347,17 +368,17 @@ export async function parseInventarioImportFile(
     return rowsFromMatrix(matrix, origen);
   }
 
-  if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
-    const workbook = XLSX.read(buffer, { type: "array" });
-    const preferred =
-      workbook.SheetNames.find((n) => normalizeHeader(n).includes("lectura")) ||
-      workbook.SheetNames[0];
-    if (!preferred) throw new Error("El archivo de Excel no tiene hojas.");
-    const sheet = workbook.Sheets[preferred];
-    const matrix = sheetToMatrix(sheet);
-    const parsed = rowsFromMatrix(matrix, origen);
-    return { ...parsed, sheetName: preferred };
+  if (name.endsWith(".xls") && !name.endsWith(".xlsx")) {
+    throw new Error(
+      "El formato .xls antiguo no está soportado. Ábrelo en Excel y guárdalo como .xlsx.",
+    );
   }
 
-  throw new Error("Formato no soportado. Usa CSV o Excel (.xlsx / .xls).");
+  if (name.endsWith(".xlsx")) {
+    const { matrix, sheetName } = await workbookToMatrix(buffer);
+    const parsed = rowsFromMatrix(matrix, origen);
+    return { ...parsed, sheetName };
+  }
+
+  throw new Error("Formato no soportado. Usa CSV o Excel (.xlsx).");
 }

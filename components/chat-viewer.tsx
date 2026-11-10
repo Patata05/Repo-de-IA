@@ -1,6 +1,6 @@
 "use client";
 
-import { useLayoutEffect, useState } from "react";
+import { memo, useLayoutEffect, useMemo, useState } from "react";
 import { ChevronRight, Layers, QrCode } from "lucide-react";
 import type { ChatApiItem, ChatQrPayload } from "@/lib/chat-api";
 import type { InventarioRow } from "@/lib/supabase";
@@ -42,6 +42,29 @@ function textOf(value: unknown) {
   return String(value ?? "").trim();
 }
 
+function foldText(value: unknown) {
+  return textOf(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isInactiveEstado(value: unknown) {
+  const v = textOf(value).toLowerCase();
+  return v === "inactivo" || v === "baja" || v === "no" || v === "inactive";
+}
+
+function matchesFocus(value: string, focusNorm: string) {
+  if (!value || !focusNorm) return false;
+  if (value === focusNorm || value.includes(focusNorm)) return true;
+  const focusToks = focusNorm.split(" ").filter(Boolean);
+  const toks = value.split(" ").filter(Boolean);
+  return focusToks.length > 0 && focusToks.every((tok) => toks.includes(tok));
+}
+
 function formatNumber(value: number) {
   return new Intl.NumberFormat("es-MX").format(value);
 }
@@ -55,7 +78,7 @@ function inventoryLabel(items: Array<{ origen?: string | null }>) {
   return "Inventario";
 }
 
-export default function ChatViewer({
+function ChatViewer({
   inventory,
   resultItems = [],
   qrCards = [],
@@ -83,152 +106,189 @@ export default function ChatViewer({
     notifyViewerLayout();
   }, [overviewExpanded, qrExpanded]);
 
-  const areaCounts = new Map<string, number>();
-  for (const row of inventory) {
-    const area = textOf(row.area) || "Sin área";
-    areaCounts.set(area, (areaCounts.get(area) ?? 0) + 1);
-  }
-  const areasSorted = [...areaCounts.entries()].sort((a, b) => b[1] - a[1]);
   const areaPreviewLimit = 5;
-  const maxArea = areasSorted[0]?.[1] || 1;
-
-  const personaCounts = new Map<string, number>();
-  for (const row of inventory) {
-    const persona = textOf(row.persona);
-    if (!persona) continue;
-    personaCounts.set(persona, (personaCounts.get(persona) ?? 0) + 1);
-  }
-  const personasSorted = [...personaCounts.entries()].sort(
-    (a, b) => b[1] - a[1],
-  );
-  const maxPersona = personasSorted[0]?.[1] || 1;
   const personaPreviewLimit = 6;
-
-  const marcaCounts = new Map<string, number>();
-  for (const row of inventory) {
-    const marca = textOf(row.marca) || "Sin marca";
-    marcaCounts.set(marca, (marcaCounts.get(marca) ?? 0) + 1);
-  }
-  const marcasSorted = [...marcaCounts.entries()].sort((a, b) => b[1] - a[1]);
   const marcaPreviewLimit = 8;
-
-  const estadoCounts = { activo: 0, inactivo: 0, otro: 0 };
-  for (const row of inventory) {
-    const v = textOf(row.estado).toLowerCase();
-    if (!v || v === "activo" || v === "active" || v === "si" || v === "sí") {
-      estadoCounts.activo += 1;
-    } else if (
-      v === "inactivo" ||
-      v === "baja" ||
-      v === "no" ||
-      v === "inactive"
-    ) {
-      estadoCounts.inactivo += 1;
-    } else {
-      estadoCounts.otro += 1;
-    }
-  }
-  const estadoTotal =
-    estadoCounts.activo + estadoCounts.inactivo + estadoCounts.otro || 1;
-
-  const personas = new Set(
-    inventory.map((row) => textOf(row.persona)).filter(Boolean),
-  );
-  const activos = estadoCounts.activo;
-
-  const focusNorm = textOf(focusArea)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  const areaRows =
-    showAreaTotal && focusNorm
-      ? inventory.filter((row) => {
-          const areaNorm = textOf(row.area)
-            .toLowerCase()
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "")
-            .replace(/[^a-z0-9\s]/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-          if (!areaNorm) return false;
-          if (areaNorm === focusNorm || areaNorm.includes(focusNorm)) return true;
-          const focusToks = focusNorm.split(" ").filter(Boolean);
-          const areaToks = areaNorm.split(" ").filter(Boolean);
-          return focusToks.length > 0 && focusToks.every((tok) => areaToks.includes(tok));
-        })
-      : [];
-  const areaPersonas = new Set(
-    areaRows.map((row) => textOf(row.persona)).filter(Boolean),
-  );
-  const areaActivos = areaRows.filter((row) => {
-    const v = textOf(row.estado).toLowerCase();
-    return !(
-      v === "inactivo" ||
-      v === "baja" ||
-      v === "no" ||
-      v === "inactive"
-    );
-  }).length;
-
-  const personRows =
-    showPersonTotal && focusNorm
-      ? inventory.filter((row) => {
-          const personNorm = textOf(row.persona)
-            .toLowerCase()
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "")
-            .replace(/[^a-z0-9\s]/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-          if (!personNorm) return false;
-          if (personNorm === focusNorm || personNorm.includes(focusNorm)) {
-            return true;
-          }
-          const focusToks = focusNorm.split(" ").filter(Boolean);
-          const personToks = personNorm.split(" ").filter(Boolean);
-          return (
-            focusToks.length > 0 &&
-            focusToks.every((tok) => personToks.includes(tok))
-          );
-        })
-      : [];
-  const personAreaCounts = new Map<string, number>();
-  for (const row of personRows) {
-    const area = textOf(row.area) || "Sin área";
-    personAreaCounts.set(area, (personAreaCounts.get(area) ?? 0) + 1);
-  }
-  const personAreasSorted = [...personAreaCounts.entries()].sort(
-    (a, b) => b[1] - a[1],
-  );
-  const maxPersonArea = personAreasSorted[0]?.[1] || 1;
-  const personActivos = personRows.filter((row) => {
-    const v = textOf(row.estado).toLowerCase();
-    return !(
-      v === "inactivo" ||
-      v === "baja" ||
-      v === "no" ||
-      v === "inactive"
-    );
-  }).length;
-  const personAreaLabel =
-    personAreasSorted.length === 1
-      ? personAreasSorted[0][0]
-      : personAreasSorted.length
-        ? String(personAreasSorted.length)
-        : "—";
-
   const recentPreviewLimit = 5;
   const recentLimit = 10;
-  const recentAll = [...inventory]
-    .sort((a, b) => {
-      const ta = Date.parse(String(a.updated_at || a.created_at || "")) || 0;
-      const tb = Date.parse(String(b.updated_at || b.created_at || "")) || 0;
-      return tb - ta;
-    })
-    .slice(0, recentLimit);
+
+  const overviewData = useMemo(() => {
+    const emptyPairs: Array<[string, number]> = [];
+    const base = {
+      areasSorted: emptyPairs,
+      maxArea: 1,
+      personasSorted: emptyPairs,
+      maxPersona: 1,
+      marcasSorted: emptyPairs,
+      personaCount: 0,
+      activos: 0,
+      estadoCounts: { activo: 0, inactivo: 0, otro: 0 },
+      estadoTotal: 1,
+      areaRows: [] as InventarioRow[],
+      areaPersonas: 0,
+      areaActivos: 0,
+      personRows: [] as InventarioRow[],
+      personAreasSorted: emptyPairs,
+      maxPersonArea: 1,
+      personActivos: 0,
+      personAreaLabel: "—",
+      recentAll: [] as InventarioRow[],
+    };
+    if (!overview) return base;
+
+    const focusNorm = foldText(focusArea);
+
+    if (overview === "areaTotal") {
+      const areaRows = focusNorm
+        ? inventory.filter((row) => matchesFocus(foldText(row.area), focusNorm))
+        : [];
+      const people = new Set(
+        areaRows.map((row) => textOf(row.persona)).filter(Boolean),
+      );
+      return {
+        ...base,
+        areaRows,
+        areaPersonas: people.size,
+        areaActivos: areaRows.filter((row) => !isInactiveEstado(row.estado)).length,
+      };
+    }
+
+    if (overview === "personTotal") {
+      const personRows = focusNorm
+        ? inventory.filter((row) =>
+            matchesFocus(foldText(row.persona), focusNorm),
+          )
+        : [];
+      const personAreaCounts = new Map<string, number>();
+      let personActivos = 0;
+      for (const row of personRows) {
+        const area = textOf(row.area) || "Sin área";
+        personAreaCounts.set(area, (personAreaCounts.get(area) ?? 0) + 1);
+        if (!isInactiveEstado(row.estado)) personActivos += 1;
+      }
+      const personAreasSorted = [...personAreaCounts.entries()].sort(
+        (a, b) => b[1] - a[1],
+      );
+      return {
+        ...base,
+        personRows,
+        personAreasSorted,
+        maxPersonArea: personAreasSorted[0]?.[1] || 1,
+        personActivos,
+        personAreaLabel:
+          personAreasSorted.length === 1
+            ? personAreasSorted[0][0]
+            : personAreasSorted.length
+              ? String(personAreasSorted.length)
+              : "—",
+      };
+    }
+
+    if (overview === "recent") {
+      return {
+        ...base,
+        recentAll: [...inventory]
+          .sort((a, b) => {
+            const ta =
+              Date.parse(String(a.updated_at || a.created_at || "")) || 0;
+            const tb =
+              Date.parse(String(b.updated_at || b.created_at || "")) || 0;
+            return tb - ta;
+          })
+          .slice(0, recentLimit),
+      };
+    }
+
+    const needAreas = overview === "full" || overview === "areas";
+    const needPersonas = overview === "personas";
+    const needMarcas = overview === "marcas";
+    const needEstado = overview === "full" || overview === "stats" || overview === "estado";
+    const needRecent = overview === "full";
+    const areaCounts = new Map<string, number>();
+    const personaCounts = new Map<string, number>();
+    const marcaCounts = new Map<string, number>();
+    const estadoCounts = { activo: 0, inactivo: 0, otro: 0 };
+
+    for (const row of inventory) {
+      if (needAreas) {
+        const area = textOf(row.area) || "Sin área";
+        areaCounts.set(area, (areaCounts.get(area) ?? 0) + 1);
+      }
+      if (needPersonas || overview === "full" || overview === "stats") {
+        const persona = textOf(row.persona);
+        if (persona) personaCounts.set(persona, (personaCounts.get(persona) ?? 0) + 1);
+      }
+      if (needMarcas) {
+        const marca = textOf(row.marca) || "Sin marca";
+        marcaCounts.set(marca, (marcaCounts.get(marca) ?? 0) + 1);
+      }
+      if (needEstado) {
+        const v = textOf(row.estado).toLowerCase();
+        if (!v || v === "activo" || v === "active" || v === "si" || v === "sí") {
+          estadoCounts.activo += 1;
+        } else if (isInactiveEstado(v)) {
+          estadoCounts.inactivo += 1;
+        } else {
+          estadoCounts.otro += 1;
+        }
+      }
+    }
+
+    const areasSorted = needAreas
+      ? [...areaCounts.entries()].sort((a, b) => b[1] - a[1])
+      : emptyPairs;
+    const personasSorted = needPersonas
+      ? [...personaCounts.entries()].sort((a, b) => b[1] - a[1])
+      : emptyPairs;
+
+    return {
+      ...base,
+      areasSorted,
+      maxArea: areasSorted[0]?.[1] || 1,
+      personasSorted,
+      maxPersona: personasSorted[0]?.[1] || 1,
+      marcasSorted: needMarcas
+        ? [...marcaCounts.entries()].sort((a, b) => b[1] - a[1])
+        : emptyPairs,
+      personaCount: personaCounts.size,
+      activos: estadoCounts.activo,
+      estadoCounts,
+      estadoTotal:
+        estadoCounts.activo + estadoCounts.inactivo + estadoCounts.otro || 1,
+      recentAll: needRecent
+        ? [...inventory]
+            .sort((a, b) => {
+              const ta =
+                Date.parse(String(a.updated_at || a.created_at || "")) || 0;
+              const tb =
+                Date.parse(String(b.updated_at || b.created_at || "")) || 0;
+              return tb - ta;
+            })
+            .slice(0, recentLimit)
+        : [],
+    };
+  }, [inventory, overview, focusArea]);
+
+  const {
+    areasSorted,
+    maxArea,
+    personasSorted,
+    maxPersona,
+    marcasSorted,
+    personaCount,
+    activos,
+    estadoCounts,
+    estadoTotal,
+    areaRows,
+    areaPersonas,
+    areaActivos,
+    personRows,
+    personAreasSorted,
+    maxPersonArea,
+    personActivos,
+    personAreaLabel,
+    recentAll,
+  } = overviewData;
 
   const listItems: ChatApiItem[] = hasQr
     ? qrCards.map((card) => {
@@ -422,7 +482,7 @@ export default function ChatViewer({
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Personas</span>
-                        <strong>{formatNumber(areaPersonas.size)}</strong>
+                        <strong>{formatNumber(areaPersonas)}</strong>
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Activos</span>
@@ -512,7 +572,7 @@ export default function ChatViewer({
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Personas</span>
-                        <strong>{formatNumber(personas.size)}</strong>
+                        <strong>{formatNumber(personaCount)}</strong>
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Activos</span>
@@ -852,3 +912,5 @@ export default function ChatViewer({
     </div>
   );
 }
+
+export default memo(ChatViewer);
