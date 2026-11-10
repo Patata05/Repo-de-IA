@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Layers } from "lucide-react";
+import { useLayoutEffect, useState } from "react";
+import { ChevronRight, Layers, QrCode } from "lucide-react";
 import type { ChatApiItem, ChatQrPayload } from "@/lib/chat-api";
 import type { InventarioRow } from "@/lib/supabase";
 
@@ -11,6 +11,12 @@ const QR_PREVIEW_LIMIT = 3;
 const RESULT_PREVIEW_LIMIT = 3;
 
 export type ChatViewerOverview = "full" | "stats" | "areas" | "recent";
+
+/** Avisa al sync del chat que el panel cambió de tamaño (Mostrar más/menos). */
+function notifyViewerLayout() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("chat-viewer-layout"));
+}
 
 type ChatViewerProps = {
   inventory: InventarioRow[];
@@ -54,6 +60,11 @@ export default function ChatViewer({
   const [qrExpanded, setQrExpanded] = useState(false);
   const [overviewExpanded, setOverviewExpanded] = useState(false);
 
+  // Antes del paint: evita el parpadeo al expandir en el tope final.
+  useLayoutEffect(() => {
+    notifyViewerLayout();
+  }, [overviewExpanded, qrExpanded]);
+
   const areaCounts = new Map<string, number>();
   for (const row of inventory) {
     const area = textOf(row.area) || "Sin área";
@@ -89,7 +100,16 @@ export default function ChatViewer({
           resultItems.find(
             (item) =>
               textOf(item.etiqueta).toLowerCase() ===
-              textOf(card.etiqueta).toLowerCase(),
+                textOf(card.etiqueta).toLowerCase() &&
+              (!textOf(card.origen) ||
+                textOf(item.origen) === textOf(card.origen)),
+          ) ||
+          inventory.find(
+            (row) =>
+              textOf(row.etiqueta).toLowerCase() ===
+                textOf(card.etiqueta).toLowerCase() &&
+              (!textOf(card.origen) ||
+                textOf(row.origen) === textOf(card.origen)),
           );
         return {
           id: card.id ?? match?.id ?? null,
@@ -100,7 +120,10 @@ export default function ChatViewer({
           origen: card.origen ?? match?.origen ?? null,
           marca: match?.marca ?? null,
           modelo: match?.modelo ?? null,
+          serie: match?.serie ?? null,
+          cantidad: match?.cantidad ?? null,
           estado: match?.estado ?? null,
+          observaciones: match?.observaciones ?? null,
         };
       })
     : resultItems.length > 0
@@ -114,12 +137,14 @@ export default function ChatViewer({
     personasInResults.length === 1 ? personasInResults[0] : "";
 
   const contextLabel = hasResults
-    ? personLabel ||
-      inventoryLabel(
-        resultItems.length
-          ? resultItems
-          : qrCards.map((card) => ({ origen: null, ...card })),
-      )
+    ? hasQr
+      ? personLabel ||
+        inventoryLabel(
+          resultItems.length
+            ? resultItems
+            : qrCards.map((card) => ({ origen: null, ...card })),
+        )
+      : personLabel || "Etiquetas"
     : overview === "areas"
       ? "Áreas"
       : overview === "recent"
@@ -131,9 +156,7 @@ export default function ChatViewer({
   const contextSub = hasResults
     ? hasQr
       ? `${qrCards.length} código${qrCards.length === 1 ? "" : "s"} QR`
-      : personLabel
-        ? `${listItems.length} registro${listItems.length === 1 ? "" : "s"}`
-        : `${listItems.length} resultado${listItems.length === 1 ? "" : "s"}`
+      : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
     : overview === "areas"
       ? "Distribución por área"
     : overview === "recent"
@@ -141,13 +164,6 @@ export default function ChatViewer({
       : overview === "stats"
           ? "Totales"
           : "Resumen en vivo";
-
-  const qrByKey = new Map<string, ChatViewerQr>();
-  for (const card of qrCards) {
-    if (card.id != null) qrByKey.set(`id:${card.id}`, card);
-    const tag = textOf(card.etiqueta).toLowerCase();
-    if (tag) qrByKey.set(`etq:${tag}`, card);
-  }
 
   return (
     <div className="chat-viewer-sync-body">
@@ -160,40 +176,45 @@ export default function ChatViewer({
         (() => {
           const areasOnly = overview === "areas";
           const recentOnly = overview === "recent";
+          // Cerrado: stats + preview (llena el cuadro). Abierto: más detalle.
+          const collapsedAreaLimit = 3;
+          const collapsedRecentLimit = 3;
           const canCollapseFull =
             overview === "full" &&
-            ((showAreas && areasSorted.length > 0) ||
-              (showRecent && recentAll.length > 0));
+            ((showAreas && areasSorted.length > collapsedAreaLimit) ||
+              (showRecent && recentAll.length > collapsedRecentLimit));
           const canCollapseAreas =
             areasOnly && areasSorted.length > areaPreviewLimit;
           const canCollapseRecent =
             recentOnly && recentAll.length > recentPreviewLimit;
           const canCollapseOverview =
             canCollapseFull || canCollapseAreas || canCollapseRecent;
-          const showExtra = !canCollapseFull || overviewExpanded;
-          const visibleAreas = areasOnly
-            ? overviewExpanded
-              ? areasSorted
-              : areasSorted.slice(0, areaPreviewLimit)
-            : showExtra
-              ? areasSorted.slice(0, areaPreviewLimit)
-              : [];
+          const visibleAreas = !showAreas
+            ? []
+            : areasOnly
+              ? overviewExpanded
+                ? areasSorted
+                : areasSorted.slice(0, areaPreviewLimit)
+              : overviewExpanded
+                ? areasSorted.slice(0, areaPreviewLimit)
+                : areasSorted.slice(0, collapsedAreaLimit);
           const visibleRecent = !showRecent
             ? []
             : recentOnly
               ? overviewExpanded
                 ? recentAll
                 : recentAll.slice(0, recentPreviewLimit)
-              : showExtra
-                ? overviewExpanded
-                  ? recentAll
-                  : recentAll.slice(0, recentPreviewLimit)
-                : [];
-          const moreCount = canCollapseRecent
-            ? recentAll.length - recentPreviewLimit
-            : canCollapseAreas
-              ? areasSorted.length - areaPreviewLimit
-              : 0;
+              : overviewExpanded
+                ? recentAll
+                : recentAll.slice(0, collapsedRecentLimit);
+          const moreCount = canCollapseFull
+            ? Math.max(0, recentAll.length - collapsedRecentLimit) +
+              Math.max(0, areasSorted.length - collapsedAreaLimit)
+            : canCollapseRecent
+              ? recentAll.length - recentPreviewLimit
+              : canCollapseAreas
+                ? areasSorted.length - areaPreviewLimit
+                : 0;
           return (
             <>
               <div className="chat-viewer-scroll">
@@ -313,78 +334,27 @@ export default function ChatViewer({
                   className="chat-viewer-card"
                   aria-label="Resultados de la consulta"
                 >
-                  {!hasQr ? (
-                    <h3 className="chat-viewer-section-title">Coincidencias</h3>
-                  ) : null}
+                  {hasQr ? null : (
+                    <h3 className="chat-viewer-section-title">Etiquetas</h3>
+                  )}
                   <div
                     className={`chat-viewer-expandable${
                       qrExpanded ? " is-expanded" : ""
                     }`}
                   >
-                    <ul className={`chat-viewer-list${hasQr ? " is-qr" : ""}`}>
+                    <ul className={`chat-viewer-list${hasQr ? " is-qr-links" : ""}`}>
                       {visibleItems.map((item, index) => {
                         const etiqueta =
                           textOf(item.etiqueta) || `Item ${index + 1}`;
                         const articulo = textOf(item.articulo) || "Artículo";
-                        const persona = textOf(item.persona);
+                        const persona = textOf(item.persona) || "Sin asignar";
                         const area = textOf(item.area);
                         const origen = textOf(item.origen) || contextLabel;
-                        const qr =
-                          (item.id != null
-                            ? qrByKey.get(`id:${item.id}`)
-                            : undefined) ||
-                          qrByKey.get(`etq:${etiqueta.toLowerCase()}`) ||
-                          (listItems.length === 1 ? qrCards[0] : undefined);
-                        const showQrTitle =
-                          hasQr && (index === 0 || listItems.length > 1);
 
                         return (
                           <li key={`${item.id ?? etiqueta}-${index}`}>
-                            <button
-                              type="button"
-                              className={`chat-viewer-list-item${
-                                hasQr && qr?.dataUrl ? " has-qr" : ""
-                              }`}
-                              onClick={() => onSelectItem?.(item)}
-                            >
-                              {hasQr && qr?.dataUrl ? (
-                                <>
-                                  {showQrTitle ? (
-                                    <span className="chat-viewer-qr-head">
-                                      {index === 0 ? (
-                                        <span className="chat-viewer-section-title">
-                                          Códigos QR
-                                        </span>
-                                      ) : null}
-                                      <span className="chat-viewer-badge">
-                                        {etiqueta}
-                                      </span>
-                                    </span>
-                                  ) : null}
-                                  <span className="chat-viewer-qr-body">
-                                    <span
-                                      className="chat-viewer-qr-frame"
-                                      aria-hidden="true"
-                                    >
-                                      <img src={qr.dataUrl} alt="" />
-                                    </span>
-                                    <span className="chat-viewer-list-copy">
-                                      <strong>{articulo}</strong>
-                                      <span>
-                                        {[persona, area]
-                                          .filter(Boolean)
-                                          .join(" · ") || origen}
-                                      </span>
-                                      {origen ? (
-                                        <span className="chat-viewer-origen">
-                                          <Layers size={12} aria-hidden="true" />
-                                          {origen}
-                                        </span>
-                                      ) : null}
-                                    </span>
-                                  </span>
-                                </>
-                              ) : (
+                            {hasQr ? (
+                              <div className="chat-viewer-list-item has-qr-link">
                                 <span className="chat-viewer-item-main">
                                   <span className="chat-viewer-badge">
                                     {etiqueta}
@@ -404,8 +374,32 @@ export default function ChatViewer({
                                     ) : null}
                                   </span>
                                 </span>
-                              )}
-                            </button>
+                                <button
+                                  type="button"
+                                  className="chat-viewer-qr-open"
+                                  onClick={() => onSelectItem?.(item)}
+                                  title={`Abrir ficha ${etiqueta}`}
+                                >
+                                  <QrCode size={14} />
+                                  <span>QR</span>
+                                  <ChevronRight size={16} />
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                className="chat-viewer-list-item"
+                                onClick={() => onSelectItem?.(item)}
+                              >
+                                <span className="chat-viewer-badge">
+                                  {etiqueta}
+                                </span>
+                                <span className="chat-viewer-list-copy">
+                                  <strong>{articulo}</strong>
+                                  <span>{persona}</span>
+                                </span>
+                              </button>
+                            )}
                           </li>
                         );
                       })}

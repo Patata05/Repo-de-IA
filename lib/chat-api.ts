@@ -50,6 +50,7 @@ export function getChatApiBaseUrl() {
 export async function askInventoryChat(
   message: string,
   history: ChatApiHistoryItem[] = [],
+  options?: { signal?: AbortSignal },
 ): Promise<ChatApiResponse> {
   const base = getChatApiBaseUrl();
   // Next proxy: /api/chat | Django directo: .../api/chat/
@@ -60,8 +61,21 @@ export async function askInventoryChat(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, history }),
+      signal: options?.signal,
     });
   } catch (error) {
+    if (
+      (error instanceof DOMException && error.name === "AbortError") ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      return {
+        reply: "",
+        error: "aborted",
+        items: [],
+        mutated: false,
+        qr: [],
+      };
+    }
     const detail = error instanceof Error ? error.message : "red";
     return {
       reply:
