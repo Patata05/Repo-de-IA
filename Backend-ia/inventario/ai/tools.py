@@ -68,8 +68,9 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
                 "Cuenta artículos donde un campo contiene un texto y devuelve "
                 "una muestra de items para el visor. "
                 "Ej: campo=persona valor=GARCIA AVILA MARTIN; "
-                "campo=area valor=Biblioteca. "
-                "Usa UNA sola llamada para 'cuántos tiene [persona]'."
+                "campo=area valor=EDIF B (también 'edificio B' o 'EDIF. B'). "
+                "Usa UNA sola llamada para 'cuántos tiene [persona]' "
+                "o 'dame toda la información de [área]'."
             ),
             "parameters": {
                 "type": "object",

@@ -21,7 +21,9 @@ Consultas:
 - "cuántos registros tiene [persona]" / "qué tiene [persona]" → UNA sola
   contar_por_campo campo=persona valor="[nombre]" (devuelve total + items
   para el visor). NO llames resumen_inventario ni varias búsquedas.
-- Área (ej. Biblioteca) → contar_por_campo campo=area.
+- Área (ej. Biblioteca, "EDIF B", "edificio B", "dame toda su información")
+  → UNA sola contar_por_campo campo=area valor="EDIF B" (o el nombre).
+  No encadenes más tools. El visor muestra la lista; el chat, totales.
 - Persona (listar) → buscar_inventario o contar_por_campo campo=persona.
 - Listar equipos → buscar_inventario.
 - Etiqueta concreta → obtener_por_etiqueta.
@@ -126,7 +128,7 @@ Memoria entre chats:
 - No digas que no tienes retención si memory trae el cambio o previousTotal.
 """
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 4
 MAX_SIDE_ITEMS = 50
 MAX_HISTORY_TURNS = 10
 MAX_HISTORY_CHARS = 700
@@ -319,7 +321,7 @@ def _collect_qr(bucket: list[dict], result: dict) -> None:
 
 
 def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
-    """Resuelve 'total/cuántos de [área]' sin LLM cuando se puede emparejar el área."""
+    """Resuelve total/info de un área (EDIF B, Biblioteca…) sin rondas de LLM."""
     import re
     import unicodedata
 
@@ -336,7 +338,7 @@ def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
         return re.sub(r"\s+", " ", s).strip()
 
     msg = norm(raw)
-    wants_total = any(
+    wants_info = any(
         k in msg
         for k in (
             "cuantos",
@@ -347,9 +349,20 @@ def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
             "totales",
             "conteo",
             "hay",
+            "informacion",
+            "infomacion",
+            "info",
+            "datos",
+            "detalle",
+            "dame",
+            "muestra",
+            "mostrar",
+            "ver",
+            "lista",
+            "listar",
         )
     )
-    if not wants_total:
+    if not wants_info:
         return None
     if ("todas" in msg or "todos" in msg) and ("area" in msg or "areas" in msg):
         return None
@@ -358,66 +371,99 @@ def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
     if error or not rows:
         return None
 
-    areas = sorted(
-        {
+    def area_fold(area: str) -> str:
+        return norm(area)
+
+    def matches_area(area: str, needle: str) -> bool:
+        an = area_fold(area)
+        nn = norm(needle)
+        if not an or not nn:
+            return False
+        if an == nn or nn in an or an in nn:
+            return True
+        a_toks = an.split()
+        n_toks = nn.split()
+        return bool(n_toks) and all(t in a_toks for t in n_toks)
+
+    building = re.search(r"\b(?:edif|edifs|edificio|edificios)\s*([a-z0-9])\b", msg)
+    best: str | None = None
+    if building:
+        letter = building.group(1)
+        needle = f"edif {letter}"
+        for area in {
             str(r.get("area") or "").strip()
             for r in rows
             if str(r.get("area") or "").strip()
-        },
-        key=len,
-        reverse=True,
-    )
-    best: str | None = None
-    best_score = 0
-    for area in areas:
-        an = norm(area)
-        if not an:
-            continue
-        if an in msg and len(an) >= best_score:
-            best = area
-            best_score = len(an)
-            continue
-        tokens = [t for t in an.split() if len(t) > 2]
-        if tokens and all(t in msg for t in tokens) and len("".join(tokens)) > best_score:
-            best = area
-            best_score = len("".join(tokens))
+        }:
+            if matches_area(area, needle):
+                best = area
+                break
+        if not best:
+            best = needle
+    else:
+        areas = sorted(
+            {
+                str(r.get("area") or "").strip()
+                for r in rows
+                if str(r.get("area") or "").strip()
+            },
+            key=len,
+            reverse=True,
+        )
+        best_score = 0
+        for area in areas:
+            an = area_fold(area)
+            if not an:
+                continue
+            if an in msg and len(an) >= best_score:
+                best = area
+                best_score = len(an)
+                continue
+            tokens = [t for t in an.split() if len(t) > 2]
+            if tokens and all(t in msg for t in tokens) and len("".join(tokens)) > best_score:
+                best = area
+                best_score = len("".join(tokens))
 
-    if not best:
-        return None
-    if not any(k in msg for k in ("area", "areas", " en ", " del ", " de ")):
-        # Exige pista de área / preposición para no confundir totales globales.
-        if "area" not in msg and "areas" not in msg:
-            # "total de recursos humanos" usa "de "
+        if not best:
+            return None
+        if not any(k in msg for k in ("area", "areas", "edif", "edificio", " en ", " del ", " de ")):
             if " de " not in f" {msg} " and " en " not in f" {msg} ":
                 return None
 
-    sample, _ = list_por_campo("area", best, limit=12)
-    total = sum(
-        1
+    needle = best or ""
+    matched_rows = [
+        r
         for r in rows
-        if str(r.get("area") or "").strip().lower() == best.strip().lower()
-    )
+        if matches_area(str(r.get("area") or ""), needle)
+    ]
+    if not matched_rows:
+        sample, _ = list_por_campo("area", needle, limit=50)
+        matched_rows = sample or []
+    if not matched_rows:
+        return None
+
+    total = len(matched_rows)
     personas = {
         str(r.get("persona") or "").strip()
-        for r in rows
-        if str(r.get("area") or "").strip().lower() == best.strip().lower()
-        and str(r.get("persona") or "").strip()
+        for r in matched_rows
+        if str(r.get("persona") or "").strip()
     }
     activos = sum(
         1
-        for r in rows
-        if str(r.get("area") or "").strip().lower() == best.strip().lower()
-        and str(r.get("estado") or "").strip().lower()
+        for r in matched_rows
+        if str(r.get("estado") or "").strip().lower()
         not in {"inactivo", "baja", "no", "inactive"}
     )
+    label = str(matched_rows[0].get("area") or needle).strip() or needle
+    sample = matched_rows[:50]
     text = (
-        f"En **{best}** hay **{total}** registro{'s' if total != 1 else ''}: "
+        f"En **{label}** hay **{total}** registro{'s' if total != 1 else ''}: "
         f"**{len(personas)}** persona{'s' if len(personas) != 1 else ''} y "
         f"**{activos}** activo{'s' if activos != 1 else ''}.\n\n"
         "El detalle está en el visor derecho.\n\n"
-        "¿Quieres ver los artículos del área, filtrar por persona o generar QR de un lote?"
+        "¿Quieres filtrar por persona, generar QR de un lote o ver otra área?"
     )
-    return text, sample or []
+    return text, sample
 
 
 def run_chat_agent(
@@ -597,11 +643,25 @@ def run_chat_agent(
                     }
                 )
 
+        side = _side_items_for_reply(collected, qr_payloads)
+        if side:
+            n = len(side)
+            return (
+                f"Encontré **{n}** registro{'s' if n != 1 else ''} relacionados. "
+                "El detalle está en el visor derecho. "
+                "Si quieres, afina por persona, etiqueta o área.",
+                None,
+                used_label,
+                side,
+                mutated,
+                qr_payloads,
+            )
+        local_text, local_items = local_chat_answer(message)
         return (
-            "La consulta requirió demasiados pasos. Reformula la pregunta de forma más concreta.",
-            "max_tool_rounds",
-            used_label,
-            _side_items_for_reply(collected, qr_payloads),
+            local_text,
+            None,
+            used_label or "local:fallback",
+            local_items[:MAX_SIDE_ITEMS],
             mutated,
             qr_payloads,
         )

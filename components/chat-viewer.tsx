@@ -15,6 +15,7 @@ export type ChatViewerOverview =
   | "stats"
   | "areas"
   | "areaTotal"
+  | "personTotal"
   | "recent"
   | "personas"
   | "estado"
@@ -67,6 +68,7 @@ export default function ChatViewer({
   const hasResults = !showOverview && (resultItems.length > 0 || hasQr);
   const showStats = overview === "full" || overview === "stats";
   const showAreaTotal = overview === "areaTotal";
+  const showPersonTotal = overview === "personTotal";
   const showAreas = overview === "full" || overview === "areas";
   const showRecent = overview === "full" || overview === "recent";
   const showPersonas = overview === "personas";
@@ -134,12 +136,30 @@ export default function ChatViewer({
   );
   const activos = estadoCounts.activo;
 
-  const areaRows = showAreaTotal && focusArea
-    ? inventory.filter(
-        (row) =>
-          textOf(row.area).toLowerCase() === focusArea.toLowerCase(),
-      )
-    : [];
+  const focusNorm = textOf(focusArea)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const areaRows =
+    showAreaTotal && focusNorm
+      ? inventory.filter((row) => {
+          const areaNorm = textOf(row.area)
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^a-z0-9\s]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (!areaNorm) return false;
+          if (areaNorm === focusNorm || areaNorm.includes(focusNorm)) return true;
+          const focusToks = focusNorm.split(" ").filter(Boolean);
+          const areaToks = areaNorm.split(" ").filter(Boolean);
+          return focusToks.length > 0 && focusToks.every((tok) => areaToks.includes(tok));
+        })
+      : [];
   const areaPersonas = new Set(
     areaRows.map((row) => textOf(row.persona)).filter(Boolean),
   );
@@ -152,6 +172,53 @@ export default function ChatViewer({
       v === "inactive"
     );
   }).length;
+
+  const personRows =
+    showPersonTotal && focusNorm
+      ? inventory.filter((row) => {
+          const personNorm = textOf(row.persona)
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^a-z0-9\s]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (!personNorm) return false;
+          if (personNorm === focusNorm || personNorm.includes(focusNorm)) {
+            return true;
+          }
+          const focusToks = focusNorm.split(" ").filter(Boolean);
+          const personToks = personNorm.split(" ").filter(Boolean);
+          return (
+            focusToks.length > 0 &&
+            focusToks.every((tok) => personToks.includes(tok))
+          );
+        })
+      : [];
+  const personAreaCounts = new Map<string, number>();
+  for (const row of personRows) {
+    const area = textOf(row.area) || "Sin área";
+    personAreaCounts.set(area, (personAreaCounts.get(area) ?? 0) + 1);
+  }
+  const personAreasSorted = [...personAreaCounts.entries()].sort(
+    (a, b) => b[1] - a[1],
+  );
+  const maxPersonArea = personAreasSorted[0]?.[1] || 1;
+  const personActivos = personRows.filter((row) => {
+    const v = textOf(row.estado).toLowerCase();
+    return !(
+      v === "inactivo" ||
+      v === "baja" ||
+      v === "no" ||
+      v === "inactive"
+    );
+  }).length;
+  const personAreaLabel =
+    personAreasSorted.length === 1
+      ? personAreasSorted[0][0]
+      : personAreasSorted.length
+        ? String(personAreasSorted.length)
+        : "—";
 
   const recentPreviewLimit = 5;
   const recentLimit = 10;
@@ -221,7 +288,9 @@ export default function ChatViewer({
       ? "Áreas"
       : overview === "areaTotal"
         ? focusArea || "Área"
-        : overview === "recent"
+        : overview === "personTotal"
+          ? focusArea || "Persona"
+          : overview === "recent"
           ? "Recientes"
           : overview === "stats"
             ? "Totales"
@@ -241,7 +310,9 @@ export default function ChatViewer({
       ? `${areasSorted.length} áreas · distribución`
       : overview === "areaTotal"
         ? "Total del área"
-        : overview === "recent"
+        : overview === "personTotal"
+          ? "Inventario de la persona"
+          : overview === "recent"
           ? `${recentAll.length} últimos registros`
           : overview === "stats"
             ? "Conteo en vivo"
@@ -358,6 +429,70 @@ export default function ChatViewer({
                         <strong>{formatNumber(areaActivos)}</strong>
                       </div>
                     </section>
+                  ) : null}
+
+                  {showPersonTotal && focusArea ? (
+                    <>
+                      <section
+                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total is-person-total"
+                        aria-label={`Inventario de ${focusArea}`}
+                      >
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Registros
+                          </span>
+                          <strong>{formatNumber(personRows.length)}</strong>
+                        </div>
+                        <div className="chat-viewer-stat is-text-value">
+                          <span className="chat-viewer-stat-label">Persona</span>
+                          <strong title={focusArea}>{focusArea}</strong>
+                        </div>
+                        <div
+                          className={`chat-viewer-stat${
+                            personAreasSorted.length === 1 ? " is-text-value" : ""
+                          }`}
+                        >
+                          <span className="chat-viewer-stat-label">Áreas</span>
+                          <strong title={personAreasSorted.map(([a]) => a).join(", ")}>
+                            {personAreaLabel}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">Activos</span>
+                          <strong>{formatNumber(personActivos)}</strong>
+                        </div>
+                      </section>
+                      {personAreasSorted.length ? (
+                        <section
+                          className="chat-viewer-card"
+                          aria-label="Áreas de la persona"
+                        >
+                          <h3 className="chat-viewer-section-title">
+                            Dónde están sus cosas
+                          </h3>
+                          <ul className="chat-viewer-bars">
+                            {personAreasSorted.map(([area, count]) => (
+                              <li key={area} className="chat-viewer-bar-row">
+                                <div className="chat-viewer-bar-meta">
+                                  <span className="chat-viewer-rank-line">
+                                    <span>{area}</span>
+                                  </span>
+                                  <span>{formatNumber(count)}</span>
+                                </div>
+                                <div className="chat-viewer-bar-track">
+                                  <span
+                                    className="chat-viewer-bar-fill"
+                                    style={{
+                                      width: `${Math.max(8, (count / maxPersonArea) * 100)}%`,
+                                    }}
+                                  />
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      ) : null}
+                    </>
                   ) : null}
 
                   {showStats ? (

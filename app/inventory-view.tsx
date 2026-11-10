@@ -7,12 +7,12 @@ import {
   Boxes,
   Check,
   ChevronDown,
-  CircleAlert,
   Clock3,
   Layers,
   LayoutDashboard,
   CircleDot,
   Lightbulb,
+  Loader2,
   Copy,
   FileSpreadsheet,
   ImagePlus,
@@ -68,6 +68,10 @@ import {
   type ChatQrPayload,
 } from "@/lib/chat-api";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
+import {
+  matchOrigenFromPrompt,
+  ORIGEN_SIN_ORIGEN,
+} from "@/lib/inventario-origen";
 import { formatInventarioQrCompact } from "@/lib/inventario-qr";
 import {
   answerFromMemoryAboutBefore,
@@ -103,6 +107,7 @@ type ViewerOverview =
   | "stats"
   | "areas"
   | "areaTotal"
+  | "personTotal"
   | "recent"
   | "personas"
   | "estado"
@@ -119,6 +124,12 @@ type ChatMessage = {
   viewerOverview?: ViewerOverview;
   /** Foco de la incidencia (ej. nombre de área en areaTotal). */
   viewerFocus?: string;
+  /** Progreso visual al importar Excel/CSV. */
+  importProgress?: {
+    label: string;
+    done: number;
+    total: number;
+  };
 };
 type ChatQrCard = ChatQrPayload & { dataUrl: string };
 type ChatSession = {
@@ -383,20 +394,83 @@ const AREA_STOP_WORDS = new Set([
   "registros",
   "etiqueta",
   "etiquetas",
+  "informacion",
+  "infomacion",
+  "info",
+  "datos",
+  "detalle",
+  "resumen",
+  "todo",
+  "toda",
+  "todos",
+  "todas",
+  "su",
+  "sus",
   "articulo",
   "articulos",
   "equipo",
   "equipos",
   "por",
   "con",
+  "inventario",
+  "inventarios",
+  "solo",
+  "solamente",
+  "persona",
+  "personas",
 ]);
 
 function looksLikeAreaQuery(plain: string) {
   return (
-    /\b(area|areas|biblioteca|registro|registros|etiqueta|etiquetas|articulo|articulos|equipo|equipos|dame|muestra|mostrar|ver|lista|listar|busca|buscar)\b/.test(
+    /\b(area|areas|edif|edificio|edificios|biblioteca|registro|registros|etiqueta|etiquetas|articulo|articulos|equipo|equipos|dame|muestra|mostrar|ver|lista|listar|busca|buscar|informacion|infomacion|info|datos|detalle)\b/.test(
       plain,
-    ) || /\b(de|del|en)\s+[a-z0-9]{3,}/.test(plain)
+    ) || /\b(de|del|en)\s+[a-z0-9]{1,}/.test(plain)
   );
+}
+
+/** "EDIF B" / "edificio B" → área canónica (ignora puntos: EDIF. B). */
+function matchBuildingFromPrompt(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const plain = normalizePlain(userText);
+  const matched = plain.match(/\b(?:edif|edifs|edificio|edificios)\s*([a-z0-9])\b/);
+  if (!matched) return undefined;
+  const letter = matched[1];
+  const hits: string[] = [];
+  const seen = new Set<string>();
+  for (const row of inventory) {
+    const area = String(row.area ?? "").trim();
+    if (!area || seen.has(area)) continue;
+    const n = normalizePlain(area);
+    if (!/\bedif(?:icio)?s?\b/.test(n)) continue;
+    if (n.split(" ").includes(letter)) {
+      seen.add(area);
+      hits.push(area);
+    }
+  }
+  if (!hits.length) return "edif " + letter;
+  hits.sort((a, b) => a.length - b.length);
+  return hits[0];
+}
+
+function areaMatchesNeedle(area: string, needle: string) {
+  const a = normalizePlain(area);
+  const n = normalizePlain(needle);
+  if (!a || !n) return false;
+  if (a === n || a.includes(n) || n.includes(a)) return true;
+  const aToks = a.split(" ").filter(Boolean);
+  const nToks = n.split(" ").filter(Boolean);
+  if (nToks.length && nToks.every((tok) => aToks.includes(tok))) return true;
+  return aToks.some((tok) => {
+    if (tok === n || tok.includes(n) || n.includes(tok)) return true;
+    const budget = typoBudget(tok);
+    return (
+      budget > 0 &&
+      Math.abs(tok.length - n.length) <= budget &&
+      levenshtein(tok, n) <= budget
+    );
+  });
 }
 
 /** Aguja de área desde el texto (ej. "biblioteca" aunque digan bbliteca). */
@@ -415,7 +489,12 @@ function extractAreaNeedle(
     );
   const raw = (afterArea?.[1] || user)
     .split(/\s+/)
-    .filter((t) => t.length > 2 && !AREA_STOP_WORDS.has(t));
+    .filter((t, i, toks) => {
+      if (t.length <= 2 || AREA_STOP_WORDS.has(t)) return false;
+      // "inventario general" no es el área llamada "general".
+      if (t === "general" && toks[i - 1] === "inventario") return false;
+      return true;
+    });
   if (!raw.length) return undefined;
 
   const { tokens: areaTokens } = getAreaSearchIndex(inventory);
@@ -452,6 +531,8 @@ function matchAreaFromPrompt(
   userText: string,
   inventory: InventarioRow[],
 ): string | undefined {
+  const building = matchBuildingFromPrompt(userText, inventory);
+  if (building) return building;
   if (!looksLikeAreaQuery(normalizePlain(userText))) return undefined;
   return extractAreaNeedle(userText, inventory);
 }
@@ -467,27 +548,7 @@ function rowsForAreaNeedle(
   for (const row of inventory) {
     if (out.length >= limit) break;
     if (!String(row.etiqueta ?? "").trim()) continue;
-    const a = normalizePlain(String(row.area ?? ""));
-    if (!a) continue;
-    if (a === n || a.includes(n) || n.includes(a)) {
-      out.push(row);
-      continue;
-    }
-    // Solo fuzzy si no hubo includes (y con pocos tokens).
-    const toks = a.split(" ");
-    if (
-      toks.some((tok) => {
-        if (tok === n || tok.includes(n) || n.includes(tok)) return true;
-        const budget = typoBudget(tok);
-        return (
-          budget > 0 &&
-          Math.abs(tok.length - n.length) <= budget &&
-          levenshtein(tok, n) <= budget
-        );
-      })
-    ) {
-      out.push(row);
-    }
+    if (areaMatchesNeedle(String(row.area ?? ""), n)) out.push(row);
   }
   return out;
 }
@@ -514,6 +575,12 @@ function detectAreaListAsk(
     "listar",
     "busca",
     "buscar",
+    "informacion",
+    "infomacion",
+    "info",
+    "datos",
+    "detalle",
+    "resumen",
   );
   const hasTarget = intentHas(
     n,
@@ -525,15 +592,36 @@ function detectAreaListAsk(
     "articulos",
     "equipo",
     "equipos",
+    "informacion",
+    "infomacion",
+    "info",
+    "datos",
+    "detalle",
+    "todo",
+    "toda",
+    "todos",
+    "todas",
   );
   const areaCue =
-    intentHas(n, "area", "areas") || /\b(de|del|en)\b/.test(n);
+    intentHas(n, "area", "areas", "edif", "edificio", "edificios") ||
+    /\b(de|del|en)\b/.test(n) ||
+    /\bedif\s*[a-z0-9]\b/.test(n);
   if (!wantsList || (!hasTarget && !areaCue)) return undefined;
   // Ranking de áreas (todas) ≠ registros de un área.
   if (
     intentHas(n, "areas") &&
     intentHas(n, "todas", "todos", "ranking", "por") &&
     !hasTarget
+  ) {
+    return undefined;
+  }
+  // Inventario de una persona ("su inventario general") ≠ área "general".
+  if (
+    !intentHas(n, "area", "areas", "edif", "edificio", "edificios") &&
+    (intentHas(n, "inventario", "inventarios") ||
+      /\b(su|sus)\b/.test(n) ||
+      /\bde el\b/.test(n) ||
+      /\bde ella\b/.test(n))
   ) {
     return undefined;
   }
@@ -551,9 +639,22 @@ function buildAreaListReply(area: string, rows: InventarioRow[]) {
   if (!n) {
     return `No encontré registros en **${area}**. ¿Quieres revisar el nombre del área o ver el ranking de áreas?`;
   }
-  const label = area.length <= 24 ? area : area.slice(0, 1).toUpperCase() + area.slice(1);
+  const label = area.length <= 40 ? area : `${area.slice(0, 37)}…`;
+  const personas = new Set(
+    rows.map((row) => String(row.persona ?? "").trim()).filter(Boolean),
+  );
+  const sample = rows
+    .slice(0, 4)
+    .map((row) => {
+      const tag = String(row.etiqueta ?? "").trim();
+      const art = String(row.articulo ?? "").trim();
+      return tag && art ? `${tag}: ${art}` : tag || art;
+    })
+    .filter(Boolean);
   return (
-    `Listo: en el panel derecho tienes **${n}** registro${n === 1 ? "" : "s"} de **${label}**.\n\n` +
+    `En **${label}** hay **${n}** registro${n === 1 ? "" : "s"} y **${personas.size}** persona${personas.size === 1 ? "" : "s"}.\n\n` +
+    (sample.length ? `Ejemplos: ${sample.join(" · ")}\n\n` : "") +
+    `El detalle completo está en el panel derecho.\n\n` +
     `¿Quieres filtrar por persona, generar QR de un lote o ver otra área?`
   );
 }
@@ -670,6 +771,248 @@ function getAreaSearchIndex(inventory: InventarioRow[]): AreaSearchIndex {
   };
   areaIndexSize = inventory.length;
   return areaIndexCache;
+}
+
+const PERSON_STOP_WORDS = new Set([
+  ...AREA_STOP_WORDS,
+  "general",
+  "completo",
+  "completa",
+  "total",
+  "totales",
+  "conteo",
+  "cuantos",
+  "cuantas",
+  "cuanto",
+  "cuanta",
+  "tiene",
+  "tienen",
+  "hay",
+  "cosas",
+  "cosa",
+  "nombre",
+  "nombres",
+  "lo",
+  "le",
+  "me",
+  "te",
+  "ese",
+  "esa",
+  "eso",
+  "este",
+  "esta",
+  "aqui",
+  "alli",
+  "mismo",
+  "misma",
+  "nada",
+  "mas",
+]);
+
+type PersonSearchIndex = {
+  people: Array<{ raw: string; norm: string; tokens: string[] }>;
+  size: number;
+};
+
+let personIndexCache: PersonSearchIndex | null = null;
+let personIndexSize = -1;
+
+function getPersonSearchIndex(inventory: InventarioRow[]): PersonSearchIndex {
+  if (personIndexCache && personIndexSize === inventory.length) {
+    return personIndexCache;
+  }
+  const seen = new Set<string>();
+  const people: PersonSearchIndex["people"] = [];
+  for (const row of inventory) {
+    const raw = String(row.persona ?? "").trim();
+    if (!raw) continue;
+    const key = raw.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const norm = normalizePlain(raw);
+    people.push({
+      raw,
+      norm,
+      tokens: norm.split(" ").filter((t) => t.length > 2),
+    });
+  }
+  personIndexCache = { people, size: inventory.length };
+  personIndexSize = inventory.length;
+  return personIndexCache;
+}
+
+function findPersonInText(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const user = normalizeChatIntent(userText);
+  if (!user) return undefined;
+  const tokens = user
+    .split(/\s+/)
+    .filter((t) => t.length > 2 && !PERSON_STOP_WORDS.has(t));
+  if (!tokens.length) return undefined;
+  const idx = getPersonSearchIndex(inventory);
+  let best: { raw: string; score: number } | null = null;
+  for (const person of idx.people) {
+    if (!person.tokens.length) continue;
+    let score = 0;
+    if (person.norm === user) score = 1200;
+    else if (tokens.length && tokens.every((t) => person.tokens.includes(t))) {
+      score = 700 + tokens.length * 40;
+    } else {
+      for (const tok of tokens) {
+        if (person.tokens.includes(tok)) {
+          score += tok.length >= 4 ? 90 : 55;
+          continue;
+        }
+        const budget = typoBudget(tok);
+        if (budget <= 0) continue;
+        for (const pTok of person.tokens) {
+          if (Math.abs(pTok.length - tok.length) > budget) continue;
+          const dist = levenshtein(tok, pTok);
+          if (dist <= budget) {
+            score += 40 - dist;
+            break;
+          }
+        }
+      }
+    }
+    if (person.norm.includes(tokens.join(" ")) && tokens.join(" ").length >= 4) {
+      score = Math.max(score, 650);
+    }
+    if (score < 80) continue;
+    if (!best || score > best.score) best = { raw: person.raw, score };
+  }
+  return best?.raw;
+}
+
+function looksLikePersonAnaphora(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  return (
+    /\b(su|sus)\b/.test(n) ||
+    /\bde el\b/.test(n) ||
+    /\bde ella\b/.test(n) ||
+    /\besa persona\b/.test(n) ||
+    /\bde esa persona\b/.test(n)
+  );
+}
+
+function resolvePersonFocus(
+  userText: string,
+  inventory: InventarioRow[],
+  recentMessages?: Array<{ from: string; text: string; resultItems?: ChatApiItem[] }>,
+): string | undefined {
+  const named = findPersonInText(userText, inventory);
+  if (named) return named;
+  if (!looksLikePersonAnaphora(userText) || !recentMessages?.length) {
+    return undefined;
+  }
+  const current = normalizeChatIntent(userText);
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const message = recentMessages[i];
+    if (normalizeChatIntent(message.text || "") === current) continue;
+    const fromText = findPersonInText(message.text || "", inventory);
+    if (fromText) return fromText;
+    const people = [
+      ...new Set(
+        (message.resultItems || [])
+          .map((item) => String(item.persona ?? "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (people.length === 1) return people[0];
+  }
+  return undefined;
+}
+
+/** Inventario / totales de una persona concreta (p. ej. Martín). */
+function detectPersonTotalAsk(
+  userText: string,
+  inventory: InventarioRow[],
+  recentMessages?: Array<{ from: string; text: string; resultItems?: ChatApiItem[] }>,
+): string | undefined {
+  const user = normalizeChatIntent(userText);
+  if (!user) return undefined;
+  if (parseEtiquetaListAsk(userText) != null) return undefined;
+  if (userAskedQr(userText)) return undefined;
+  const wantsPersonView =
+    intentHas(
+      user,
+      "inventario",
+      "inventarios",
+      "resumen",
+      "total",
+      "totales",
+      "general",
+      "registros",
+      "registro",
+      "articulos",
+      "articulo",
+      "equipos",
+      "equipo",
+      "cosas",
+      "persona",
+      "personas",
+    ) ||
+    /\b(tiene|tienen|asignad)\b/.test(user) ||
+    intentHas(user, "dame", "muestra", "mostrar", "ver", "ensename");
+  if (!wantsPersonView && !looksLikePersonAnaphora(userText)) {
+    const onlyName = findPersonInText(userText, inventory);
+    if (onlyName && user.split(/\s+/).length <= 4) return onlyName;
+    return undefined;
+  }
+  return resolvePersonFocus(userText, inventory, recentMessages);
+}
+
+function rowsForPersonName(inventory: InventarioRow[], person: string) {
+  const n = normalizePlain(person);
+  if (!n) return [] as InventarioRow[];
+  return inventory.filter((row) => {
+    const p = normalizePlain(String(row.persona ?? ""));
+    if (!p) return false;
+    if (p === n || p.includes(n) || n.includes(p)) return true;
+    const pToks = p.split(" ").filter(Boolean);
+    const nToks = n.split(" ").filter(Boolean);
+    return nToks.length > 0 && nToks.every((tok) => pToks.includes(tok));
+  });
+}
+
+function buildPersonTotalReply(person: string, inventory: InventarioRow[]) {
+  const rows = rowsForPersonName(inventory, person);
+  const n = rows.length;
+  if (!n) {
+    return `No encontré registros asignados a **${person}**. ¿Quieres buscar con otro nombre?`;
+  }
+  const areas = [
+    ...new Set(
+      rows.map((row) => String(row.area ?? "").trim()).filter(Boolean),
+    ),
+  ];
+  const activos = rows.filter((row) => {
+    const v = String(row.estado ?? "")
+      .trim()
+      .toLowerCase();
+    return !(
+      v === "inactivo" ||
+      v === "baja" ||
+      v === "no" ||
+      v === "inactive"
+    );
+  }).length;
+  const areaLine =
+    areas.length === 0
+      ? "sin área registrada"
+      : areas.length <= 3
+        ? areas.join(", ")
+        : `${areas.slice(0, 3).join(", ")} y ${areas.length - 3} más`;
+  return (
+    `**${person}** tiene **${n}** registro${n === 1 ? "" : "s"} ` +
+    `(**${activos}** activo${activos === 1 ? "" : "s"}) en **${areas.length || 0}** ` +
+    `área${areas.length === 1 ? "" : "s"}: ${areaLine}.\n\n` +
+    `El detalle está en el visor derecho.\n\n` +
+    `¿Quieres ver las etiquetas, generar QR o filtrar por un área?`
+  );
 }
 
 const INTENT_BY_PREFIX = new Map<string, string[]>();
@@ -887,6 +1230,14 @@ function detectAreaTotalAsk(
   ) {
     return undefined;
   }
+  if (
+    !intentHas(user, "area", "areas", "edif", "edificio", "edificios") &&
+    (looksLikePersonAnaphora(userText) ||
+      (intentHas(user, "inventario", "inventarios") &&
+        intentHas(user, "general")))
+  ) {
+    return undefined;
+  }
   const wantsTotal =
     intentHas(
       user,
@@ -901,8 +1252,9 @@ function detectAreaTotalAsk(
   if (!wantsTotal) return undefined;
 
   const hasAreaCue =
-    intentHas(user, "area", "areas") ||
-    /\b(en|del|de)\b/.test(user);
+    intentHas(user, "area", "areas", "edif", "edificio", "edificios") ||
+    /\b(en|del|de)\b/.test(user) ||
+    /\bedif\s*[a-z0-9]\b/.test(user);
   if (!hasAreaCue) return undefined;
 
   const needle = extractAreaNeedle(userText, inventory);
@@ -1141,7 +1493,9 @@ function looksLikeRecordLookup(userText: string) {
 function hasConcreteInventoryAsk(
   userText: string,
   inventory: InventarioRow[],
+  recentMessages?: Array<{ from: string; text: string; resultItems?: ChatApiItem[] }>,
 ) {
+  if (detectPersonTotalAsk(userText, inventory, recentMessages)) return true;
   if (detectAreaTotalAsk(userText, inventory)) return true;
   if (detectViewerOverview(userText)) return true;
   if (parseEtiquetaListAsk(userText) != null) return true;
@@ -1263,9 +1617,8 @@ function assistantTypingDelayMs(reply: string) {
 }
 
 function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
-  const needle = area.trim().toLowerCase();
-  const rows = inventory.filter(
-    (row) => String(row.area ?? "").trim().toLowerCase() === needle,
+  const rows = inventory.filter((row) =>
+    areaMatchesNeedle(String(row.area ?? ""), area),
   );
   const personas = new Set(
     rows.map((row) => String(row.persona ?? "").trim()).filter(Boolean),
@@ -1423,10 +1776,11 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
   }
 
   if (
-    intentHas(user, "resumen", "panorama", "dashboard") ||
-    (intentHas(user, "inventario", "inventarios") &&
-      intentHas(user, "general", "completo", "total", "totales", "todo", "todos")) ||
-    (/^(dame|muestra|ver|quiero)\s+(el\s+)?inventarios?\s*$/.test(user))
+    !looksLikePersonAnaphora(userText) &&
+    (intentHas(user, "resumen", "panorama", "dashboard") ||
+      (intentHas(user, "inventario", "inventarios") &&
+        intentHas(user, "general", "completo", "total", "totales", "todo", "todos")) ||
+      /^(dame|muestra|ver|quiero)\s+(el\s+)?inventarios?\s*$/.test(user))
   ) {
     return "full";
   }
@@ -2289,7 +2643,7 @@ const SideRail = memo(function SideRail({
   onExpandedChange,
   chatSessions,
   activeChatId,
-  onOpenHistory,
+  onOpenHistory: _onOpenHistory,
   onBackToWorkspace,
   onStartNewChat,
   onOpenChat,
@@ -2386,12 +2740,6 @@ const SideRail = memo(function SideRail({
   const collapseSidebar = () => {
     setCollapsed(true);
     window.localStorage.setItem("inventario-sidebar", "collapsed");
-  };
-
-  const openHistory = () => {
-    setCollapsed(false);
-    window.localStorage.setItem("inventario-sidebar", "expanded");
-    onOpenHistory();
   };
 
   const toggleCollapsed = () => {
@@ -2503,7 +2851,10 @@ const SideRail = memo(function SideRail({
             className="sidebar-new-chat"
             aria-label="Nueva consulta"
             title="Nueva consulta"
-            onClick={openHistory}
+            onClick={() => {
+              onStartNewChat();
+              if (compactNav) collapseSidebar();
+            }}
           >
             <svg
               className="sidebar-new-chat-icon"
@@ -2601,7 +2952,9 @@ const SideRail = memo(function SideRail({
                       <button
                         type="button"
                         role="menuitem"
-                        onClick={() => {
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
                           setDeleteConfirmId(menuChatId);
                           setMenuChatId(null);
                           setMenuPos(null);
@@ -2610,51 +2963,6 @@ const SideRail = memo(function SideRail({
                         <Trash2 size={18} strokeWidth={1.6} aria-hidden="true" />
                         <span>Borrar</span>
                       </button>
-                    </div>,
-                    document.body,
-                  )
-                : null}
-              {deleteConfirmId && typeof document !== "undefined"
-                ? createPortal(
-                    <div
-                      className="sidebar-delete-overlay"
-                      role="presentation"
-                      onClick={() => setDeleteConfirmId(null)}
-                    >
-                      <div
-                        className="sidebar-delete-dialog"
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="sidebar-delete-title"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <span className="sidebar-delete-icon" aria-hidden="true">
-                          <CircleAlert size={22} strokeWidth={1.7} />
-                        </span>
-                        <h3 id="sidebar-delete-title">
-                          ¿Quieres eliminar esta búsqueda?
-                        </h3>
-                        <p>No podrás regresar a esta respuesta</p>
-                        <div className="sidebar-delete-actions">
-                          <button
-                            type="button"
-                            className="sidebar-delete-cancel"
-                            onClick={() => setDeleteConfirmId(null)}
-                          >
-                            Cancelar
-                          </button>
-                          <button
-                            type="button"
-                            className="sidebar-delete-confirm"
-                            onClick={() => {
-                              onDeleteChat(deleteConfirmId);
-                              setDeleteConfirmId(null);
-                            }}
-                          >
-                            Borrar
-                          </button>
-                        </div>
-                      </div>
                     </div>,
                     document.body,
                   )
@@ -2685,7 +2993,11 @@ const SideRail = memo(function SideRail({
                   title={label}
                   aria-current={selected ? "page" : undefined}
                   onClick={() => {
-                    onChange(id);
+                    if (id === "archivos") {
+                      onStartNewChat();
+                    } else {
+                      onChange(id);
+                    }
                     if (compactNav) collapseSidebar();
                   }}
                 >
@@ -2728,6 +3040,92 @@ const SideRail = memo(function SideRail({
           </button>
         </div>
       ) : null}
+
+      {deleteConfirmId && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="product-modal-overlay"
+              role="presentation"
+              onClick={() => setDeleteConfirmId(null)}
+            >
+              <div
+                className="product-modal-card"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="sidebar-delete-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <header className="product-modal-header">
+                  <div className="product-modal-title-group">
+                    <div>
+                      <h2 id="sidebar-delete-title">Eliminar búsqueda</h2>
+                      <p>Elige cómo quieres continuar con esta conversación</p>
+                    </div>
+                  </div>
+                  <div className="product-modal-header-actions">
+                    <button
+                      type="button"
+                      className="product-modal-close"
+                      onClick={() => setDeleteConfirmId(null)}
+                      aria-label="Cerrar"
+                    >
+                      <X size={19} />
+                    </button>
+                  </div>
+                </header>
+                <div className="product-modal-body">
+                  <div className="choose-options-grid">
+                    <button
+                      type="button"
+                      className="choose-card choose-card-keep"
+                      onClick={() => setDeleteConfirmId(null)}
+                    >
+                      <div className="choose-card-badge">Conservar</div>
+                      <div className="choose-card-icon" aria-hidden="true">
+                        <Undo2 size={36} strokeWidth={1.8} />
+                      </div>
+                      <h3>Cancelar</h3>
+                      <p>
+                        Mantén esta búsqueda en Reciente. No se borra nada y
+                        puedes seguir consultando.
+                      </p>
+                      <span className="choose-card-action">
+                        <span>Volver al chat</span>
+                        <span className="arrow-pill">→</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="choose-card choose-card-delete"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const id = deleteConfirmId;
+                        setDeleteConfirmId(null);
+                        onDeleteChat(id);
+                      }}
+                    >
+                      <div className="choose-card-badge">Permanente</div>
+                      <div className="choose-card-icon" aria-hidden="true">
+                        <Trash2 size={36} strokeWidth={1.8} />
+                      </div>
+                      <h3>Borrar</h3>
+                      <p>
+                        No podrás regresar a esta respuesta ni a su historial
+                        en Reciente.
+                      </p>
+                      <span className="choose-card-action">
+                        <span>Eliminar conversación</span>
+                        <span className="arrow-pill">→</span>
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </aside>
   );
 });
@@ -3734,7 +4132,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       );
       // Acuses / exploración: no forzar incidencia (salvo tip ya guardado).
       if (
-        !hasConcreteInventoryAsk(userText, items) &&
+        !hasConcreteInventoryAsk(userText, items, messages) &&
         isExploratoryChatAsk(userText)
       ) {
         // No recuperar QR/items basura; deja overview solo si ya venía de tip.
@@ -3766,26 +4164,37 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         !message.viewerOverview &&
         !(Array.isArray(message.qr) && message.qr.length) &&
         etiquetaLimit == null &&
-        hasConcreteInventoryAsk(userText, items)
+        hasConcreteInventoryAsk(userText, items, messages)
       ) {
-        const focusArea = detectAreaTotalAsk(userText, items);
-        const overview = focusArea
-          ? ("areaTotal" as ViewerOverview)
-          : detectViewerOverview(userText);
+        const history = messages.slice(0, index).map((item) => ({
+          from: item.from,
+          text: item.text || "",
+          resultItems: item.resultItems,
+        }));
+        const focusPerson = detectPersonTotalAsk(userText, items, history);
+        const focusArea = focusPerson
+          ? undefined
+          : detectAreaTotalAsk(userText, items);
+        const overview = focusPerson
+          ? ("personTotal" as ViewerOverview)
+          : focusArea
+            ? ("areaTotal" as ViewerOverview)
+            : detectViewerOverview(userText);
+        const viewerFocus = focusPerson || focusArea;
         if (overview) {
           changed = true;
           lastSide = {
             resultItems: [],
             qr: [],
             viewerOverview: overview,
-            viewerFocus: focusArea,
+            viewerFocus,
           };
           return {
             ...message,
             resultItems: [],
             qr: undefined,
             viewerOverview: overview,
-            viewerFocus: focusArea,
+            viewerFocus,
           };
         }
       }
@@ -3846,11 +4255,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
   const isAffirmativeChat = (value: string) =>
     /^(sí|si|yes|confirma|confirmo|adelante|ok|okay|okey|vale|dale|claro|listo|de acuerdo|importar|hazlo|procede|proceder)\b/i.test(
-      value.trim(),
-    );
-
-  const wantsImmediateImport = (value: string) =>
-    /\b(importa|importar|sube|subir|carga|cargar|confirma|confirmar|adelante|hazlo)\b/i.test(
       value.trim(),
     );
 
@@ -3962,6 +4366,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             ...m,
             text: reply,
             at: Date.now(),
+            importProgress: undefined,
             ...(side
               ? {
                   resultItems: side.resultItems || [],
@@ -4142,12 +4547,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         }
         const chunk = rows.slice(i, i + CHAT_IMPORT_CHUNK);
         const done = Math.min(i + chunk.length, total);
-        const progressText =
-          total > CHAT_IMPORT_CHUNK
-            ? `Importando “${sourceLabel}”… ${done}/${total}`
-            : `Importando “${sourceLabel}”…`;
         const progressing = messagesRef.current.map((m) =>
-          m.id === botId ? { ...m, text: progressText, at: Date.now() } : m,
+          m.id === botId
+            ? {
+                ...m,
+                text: `Importando “${sourceLabel}”… ${done}/${total}`,
+                at: Date.now(),
+                importProgress: { label: sourceLabel, done, total },
+              }
+            : m,
         );
         messagesRef.current = progressing;
         setMessages(progressing);
@@ -4190,9 +4598,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         skipped > 0
           ? `\n${skipped} fila${skipped === 1 ? "" : "s"} no se importaron (duplicados u error).`
           : "";
+      const dest = String(rows[0]?.origen ?? "").trim();
+      const destNote = dest ? ` en **${dest}**` : "";
       const finalReply =
-        `Listo: importé **${saved.length}** artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”.\n` +
-        `Inventario: **${totalBefore}** → **${totalAfter}** registros.${skipNote}\n\n` +
+        `Listo: importé **${formatNumber(saved.length)}** artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”${destNote}.\n` +
+        `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}\n\n` +
         `Te dejé el inventario general en el panel derecho (totales, áreas y recientes).`;
 
       // Efecto “escribiendo…” al cerrar (el import largo ya gastó la pausa inicial).
@@ -4393,10 +4803,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     // Adjuntar Excel/CSV → parsear; importar ya o pedir confirmación
     if (attach?.file && isSpreadsheetName(attach.name)) {
       try {
+        const existingOrigens = [
+          ...new Set(
+            items.map((row) => String(row.origen ?? "").trim()).filter(Boolean),
+          ),
+        ];
+        const askedOrigen = matchOrigenFromPrompt(text || userText, existingOrigens);
         const origen =
-          selectedInventarios[0] && selectedInventarios[0] !== "ALL"
+          askedOrigen ||
+          (selectedInventarios[0] && selectedInventarios[0] !== "ALL"
             ? selectedInventarios[0]
-            : "S/O";
+            : ORIGEN_SIN_ORIGEN);
         const parsed = await parseInventarioImportFile(attach.file, origen);
         if (!parsed.items.length) {
           setPendingChatImportSafe(null);
@@ -4407,23 +4824,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           );
           return;
         }
-        if (wantsImmediateImport(text)) {
-          await runBulkChatImport(parsed.items, attach.name);
-          return;
-        }
         setPendingChatImportSafe(parsed.items);
+        const n = parsed.items.length;
         const sample = parsed.items
           .slice(0, 5)
           .map((item) => `• ${item.etiqueta} — ${item.articulo}`)
           .join("\n");
         const more =
-          parsed.items.length > 5
-            ? `\n… y ${parsed.items.length - 5} más.`
-            : "";
+          n > 5 ? `\n…y ${formatNumber(n - 5)} más.` : "";
+        const destNote = askedOrigen
+          ? `Claro: **sí haré eso**. Voy a agregar este archivo a **${origen}**, no a ${ORIGEN_SIN_ORIGEN}.`
+          : `Claro: leí el archivo y lo dejaré listo para importar en **${origen}**.`;
         finishBotReply(
           sessionId,
           botId,
-          `Leí ${parsed.items.length} fila${parsed.items.length === 1 ? "" : "s"} de “${attach.name}” (origen ${origen}).\n${sample}${more}\n\n¿Confirmas importarlas todas? Responde sí (o escribe importar).`,
+          `${destNote}\n\n` +
+            `“${attach.name}” tiene **${formatNumber(n)}** registro${n === 1 ? "" : "s"} con etiqueta y artículo.\n` +
+            `${sample}${more}\n\n` +
+            `¿Quieres que empiece a importarlos ahora a **${origen}**? Responde **sí** (o escribe importar).`,
         );
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -4466,6 +4884,34 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
+    const chatHistory = messagesRef.current.map((message) => ({
+      from: message.from,
+      text: message.text || "",
+      resultItems: message.resultItems,
+    }));
+
+    // Inventario de una persona: mismos totales que el general, acotados a ella.
+    const earlyPerson = detectPersonTotalAsk(
+      userText || text,
+      items,
+      chatHistory,
+    );
+    if (earlyPerson) {
+      try {
+        const localReply = buildPersonTotalReply(earlyPerson, items);
+        await ensureTypingPause(localReply);
+        finishBotReply(sessionId, botId, localReply, {
+          resultItems: [],
+          qr: [],
+          viewerOverview: "personTotal",
+          viewerFocus: earlyPerson,
+        });
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+      return;
+    }
+
     // Total de un área: respuesta + incidencia locales (exacto, con pausa de tipeo).
     const earlyArea = detectAreaTotalAsk(userText || text, items);
     if (earlyArea) {
@@ -4498,6 +4944,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         finishBotReply(sessionId, botId, localReply, {
           resultItems: rows.map((row) => rowToChatApiItem(row)),
           qr: [],
+          viewerOverview: "areaTotal",
+          viewerFocus: earlyAreaList.area,
         });
       } catch {
         /* abort / nuevo mensaje */
@@ -4524,7 +4972,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     // Solo incidencia si el pedido es concreto o hubo escritura; saludos → texto (± tip).
     const forceSidePanel = wantsSidePanelShow(userText || text);
     const concreteAsk =
-      hasConcreteInventoryAsk(userText || text, items) || forceSidePanel;
+      hasConcreteInventoryAsk(userText || text, items, chatHistory) ||
+      forceSidePanel;
     const exploratoryAsk =
       !concreteAsk && !mutated && isExploratoryChatAsk(userText || text);
     if (!concreteAsk && !mutated) {
@@ -4565,10 +5014,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       !userAskedQr(userText || text)
     ) {
       forcedOverview =
-        detectViewerOverview(userText || text) ||
-        (intentHas(normalizeChatIntent(userText || text), "inventario", "resumen", "totales", "general")
-          ? "full"
-          : undefined);
+        detectPersonTotalAsk(userText || text, items, chatHistory)
+          ? "personTotal"
+          : detectViewerOverview(userText || text) ||
+            (intentHas(
+              normalizeChatIntent(userText || text),
+              "inventario",
+              "resumen",
+              "totales",
+              "general",
+            ) && !looksLikePersonAnaphora(userText || text)
+              ? "full"
+              : undefined);
     }
 
     // Etiquetas ≠ QR: listar exactamente lo pedido (o todas las del filtro si hay menos).
@@ -4714,15 +5171,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         areaListAsk.limit,
       ).map((row) => rowToChatApiItem(row));
     }
-    const focusArea = concreteAsk
+    const focusPerson = concreteAsk
+      ? detectPersonTotalAsk(userText || text, items, chatHistory)
+      : undefined;
+    const focusArea = concreteAsk && !focusPerson
       ? detectAreaTotalAsk(userText || text, items)
       : undefined;
     let askedOverview: ViewerOverview | undefined = mutated || areaListAsk
       ? undefined
       : concreteAsk
-        ? focusArea
-          ? "areaTotal"
-          : detectViewerOverview(userText || text) || forcedOverview
+        ? focusPerson
+          ? "personTotal"
+          : focusArea
+            ? "areaTotal"
+            : detectViewerOverview(userText || text) || forcedOverview
         : exploratoryAsk
           ? pickDiscoveryTip(userText || text)
           : forcedOverview;
@@ -4737,7 +5199,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         ? undefined
         : askedOverview || forcedOverview;
     const viewerFocus =
-      overview === "areaTotal" && focusArea ? focusArea : undefined;
+      overview === "personTotal" && focusPerson
+        ? focusPerson
+        : overview === "areaTotal" && focusArea
+          ? focusArea
+          : undefined;
     if (overview) {
       sideItems = [];
       qrPayloads = [];
@@ -4948,13 +5414,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   }, [changeRail]);
 
   const startNewChat = useCallback(() => {
+    chatAbortRef.current?.abort();
+    chatRequestGenRef.current += 1;
     const id =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
         : `chat-${Date.now()}`;
     activeChatIdRef.current = id;
     messagesRef.current = [];
-    saveActiveChatId(id);
+    saveActiveChatId(null);
     setActiveChatId(id);
     setMessages([]);
     setDraft("");
@@ -4962,6 +5430,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setAttachMenuOpen(false);
     setChatQrByMsg({});
     setPendingChatImport(null);
+    setPendingChatImportSafe(null);
     changeRail("archivos");
   }, [changeRail]);
 
@@ -5004,19 +5473,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   );
 
   const deleteChatSession = useCallback((sessionId: string) => {
-    setChatSessions((prev) => {
-      const next = mergeChatSessions(prev).filter((session) => session.id !== sessionId);
-      saveChatSessions(next);
-      return next;
-    });
+    chatAbortRef.current?.abort();
+    chatRequestGenRef.current += 1;
+    const stored = loadChatSessions().filter((session) => session.id !== sessionId);
+    saveChatSessions(stored);
+    setChatSessions(stored);
     if (activeChatIdRef.current === sessionId) {
-      activeChatIdRef.current = null;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `chat-${Date.now()}`;
+      activeChatIdRef.current = id;
       messagesRef.current = [];
       saveActiveChatId(null);
-      setActiveChatId(null);
+      setActiveChatId(id);
       setMessages([]);
       setDraft("");
       setChatQrByMsg({});
+      setPendingAttach(null);
     }
   }, []);
 
@@ -5780,6 +6254,45 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                               </div>
                             );
                           }
+                          if (message.importProgress) {
+                            const { label, done, total } = message.importProgress;
+                            const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+                            return (
+                              <div className="chat-response-block">
+                                <div
+                                  className="chat-import-card"
+                                  role="status"
+                                  aria-live="polite"
+                                  aria-label={`Importando ${label}, ${done} de ${total}`}
+                                >
+                                  <div className="chat-import-card-head">
+                                    <span className="chat-import-card-icon" aria-hidden="true">
+                                      <FileSpreadsheet size={18} strokeWidth={1.8} />
+                                    </span>
+                                    <div className="chat-import-card-copy">
+                                      <strong>Importando tabla</strong>
+                                      <span>{label}</span>
+                                    </div>
+                                    <Loader2
+                                      className="chat-import-card-spin"
+                                      size={16}
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                  </div>
+                                  <div className="chat-import-card-bar" aria-hidden="true">
+                                    <span style={{ width: `${pct}%` }} />
+                                  </div>
+                                  <div className="chat-import-card-meta">
+                                    <span>
+                                      {done.toLocaleString("es-MX")} / {total.toLocaleString("es-MX")} registros
+                                    </span>
+                                    <span>{pct}%</span>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          }
                           return (
                           <div className="chat-response-block">
                             <div className="chat-response">
@@ -6352,55 +6865,89 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       {pendingChatDeleteRow && typeof document !== "undefined"
         ? createPortal(
             <div
-              className="sidebar-delete-overlay"
+              className="product-modal-overlay"
               role="presentation"
               onClick={() => {
                 if (!chatDeleteBusy) setPendingChatDeleteRow(null);
               }}
             >
               <div
-                className="sidebar-delete-dialog"
+                className="product-modal-card"
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby="chat-delete-record-title"
                 onClick={(event) => event.stopPropagation()}
               >
-                <span className="sidebar-delete-icon" aria-hidden="true">
-                  <CircleAlert size={22} strokeWidth={1.7} />
-                </span>
-                <h3 id="chat-delete-record-title">
-                  ¿Quieres eliminar este registro?
-                </h3>
-                <p>
-                  Se borrará{" "}
-                  <strong>
-                    {String(pendingChatDeleteRow.etiqueta ?? "").trim() ||
-                      `ID ${pendingChatDeleteRow.id}`}
-                  </strong>
-                  {pendingChatDeleteRow.articulo
-                    ? ` — ${pendingChatDeleteRow.articulo}`
-                    : ""}
-                  . No podrás deshacerlo desde el chat.
-                </p>
-                <div className="sidebar-delete-actions">
-                  <button
-                    type="button"
-                    className="sidebar-delete-cancel"
-                    disabled={chatDeleteBusy}
-                    onClick={() => setPendingChatDeleteRow(null)}
-                  >
-                    Cancelar
-                  </button>
-                  <button
-                    type="button"
-                    className="sidebar-delete-confirm"
-                    disabled={chatDeleteBusy}
-                    onClick={() => {
-                      void confirmChatDeleteRecord();
-                    }}
-                  >
-                    {chatDeleteBusy ? "Eliminando…" : "Borrar"}
-                  </button>
+                <header className="product-modal-header">
+                  <div className="product-modal-title-group">
+                    <div>
+                      <h2 id="chat-delete-record-title">Eliminar registro</h2>
+                      <p>
+                        {String(pendingChatDeleteRow.etiqueta ?? "").trim() ||
+                          `ID ${pendingChatDeleteRow.id}`}
+                        {pendingChatDeleteRow.articulo
+                          ? ` — ${pendingChatDeleteRow.articulo}`
+                          : ""}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="product-modal-header-actions">
+                    <button
+                      type="button"
+                      className="product-modal-close"
+                      onClick={() => {
+                        if (!chatDeleteBusy) setPendingChatDeleteRow(null);
+                      }}
+                      aria-label="Cerrar"
+                    >
+                      <X size={19} />
+                    </button>
+                  </div>
+                </header>
+                <div className="product-modal-body">
+                  <div className="choose-options-grid">
+                    <button
+                      type="button"
+                      className="choose-card choose-card-keep"
+                      disabled={chatDeleteBusy}
+                      onClick={() => setPendingChatDeleteRow(null)}
+                    >
+                      <div className="choose-card-badge">Conservar</div>
+                      <div className="choose-card-icon" aria-hidden="true">
+                        <Undo2 size={36} strokeWidth={1.8} />
+                      </div>
+                      <h3>Cancelar</h3>
+                      <p>
+                        El registro se queda en el inventario. No se borra nada.
+                      </p>
+                      <span className="choose-card-action">
+                        <span>Volver al chat</span>
+                        <span className="arrow-pill">→</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="choose-card choose-card-delete"
+                      disabled={chatDeleteBusy}
+                      onClick={() => {
+                        void confirmChatDeleteRecord();
+                      }}
+                    >
+                      <div className="choose-card-badge">Permanente</div>
+                      <div className="choose-card-icon" aria-hidden="true">
+                        <Trash2 size={36} strokeWidth={1.8} />
+                      </div>
+                      <h3>{chatDeleteBusy ? "Eliminando…" : "Borrar"}</h3>
+                      <p>
+                        No podrás deshacerlo desde el chat. El artículo sale del
+                        inventario.
+                      </p>
+                      <span className="choose-card-action">
+                        <span>Eliminar registro</span>
+                        <span className="arrow-pill">→</span>
+                      </span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>,

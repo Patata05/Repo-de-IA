@@ -45,6 +45,54 @@ export function latestInventarioName(existing: string[]): string {
   return sorted[0] || ORIGEN_SIN_ORIGEN;
 }
 
+function foldOrigenText(raw: string) {
+  return String(raw || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Destino de importación desde el chat: “Inventario 1”, “en vez de S/O”, etc.
+ * Si pide un número que aún no existe, devuelve “Inventario N”.
+ */
+export function matchOrigenFromPrompt(
+  text: string,
+  existing: string[] = [],
+): string | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+
+  const numbered = n.match(/\binventarios?\s*(\d+)\b/);
+  if (numbered) {
+    const num = Number(numbered[1]);
+    if (Number.isFinite(num) && num > 0) {
+      const hit = existing.find((origen) => inventarioNumber(origen) === num);
+      return hit || `Inventario ${num}`;
+    }
+  }
+
+  const rejectsDefault =
+    /\b(en vez|enves|en lugar|envez|pero|no uses|no pongas|en vez de)\b/.test(n) &&
+    /\b(s o|so|sin origen)\b/.test(n);
+
+  let best: string | undefined;
+  let bestLen = 0;
+  for (const origen of existing) {
+    const on = foldOrigenText(origen);
+    if (on.length < 2) continue;
+    if (rejectsDefault && (on === "s o" || on === "so")) continue;
+    if (n.includes(on) && on.length > bestLen) {
+      best = origen;
+      bestLen = on.length;
+    }
+  }
+  return best;
+}
+
 function rowTimestamp(row: InventarioRow): number {
   return (
     Date.parse(String(row.updated_at ?? "")) ||

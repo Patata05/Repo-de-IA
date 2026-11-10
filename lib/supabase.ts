@@ -37,6 +37,31 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env
 export const supabase =
   supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
+const TABLE_CANDIDATES = ["inventario", "Inventario"] as const;
+let resolvedInventarioTable: string | null =
+  process.env.NEXT_PUBLIC_INVENTARIO_TABLE?.trim() || null;
+
+async function resolveInventarioTable(): Promise<string> {
+  if (resolvedInventarioTable) return resolvedInventarioTable;
+  if (!supabase) return "inventario";
+
+  for (const name of TABLE_CANDIDATES) {
+    const { error } = await supabase.from(name).select("etiqueta").limit(1);
+    if (!error) {
+      resolvedInventarioTable = name;
+      return name;
+    }
+  }
+
+  resolvedInventarioTable = "inventario";
+  return resolvedInventarioTable;
+}
+
+async function inventarioTable() {
+  const name = await resolveInventarioTable();
+  return supabase!.from(name);
+}
+
 export function normalizeEstado(value?: string | null): "Activo" | "Inactivo" {
   const v = String(value ?? "")
     .trim()
@@ -65,8 +90,8 @@ export async function readInventario(): Promise<{ rows: InventarioRow[] }> {
     const rows: InventarioRow[] = [];
     for (let from = 0; ; from += PAGE) {
       const to = from + PAGE - 1;
-      const { data, error } = await supabase
-        .from("inventario")
+      const table = await inventarioTable();
+      const { data, error } = await table
         .select("*")
         .order("created_at", { ascending: false })
         .order("id", { ascending: false })
@@ -111,11 +136,14 @@ export async function createInventario(
       origen: item.origen || "S/O",
     };
 
-    const { data, error } = await supabase
-      .from("inventario")
-      .insert([payload])
-      .select()
-      .single();
+    const table = await inventarioTable();
+    let { data, error } = await table.insert([payload]).select().single();
+    if (error && isMissingEstadoColumn(error.message || "")) {
+      const { estado: _estado, ...withoutEstado } = payload;
+      const retry = await (await inventarioTable()).insert([withoutEstado]).select().single();
+      data = retry.data;
+      error = retry.error;
+    }
 
     if (error) {
       console.error("Error al insertar producto en Supabase:", error);
@@ -202,6 +230,19 @@ function mapImportError(msg: string): string {
   const network = mapNetworkError(new Error(msg));
   if (network) return network;
   if (isMissingEstadoColumn(msg)) return ESTADO_COLUMN_HINT;
+  const lower = msg.toLowerCase();
+  if (lower.includes("schema cache") && lower.includes("table")) {
+    return (
+      "Supabase no encuentra la tabla public.inventario (puede existir 'Inventario' con otro nombre). " +
+      "En el SQL Editor ejecuta supabase/fix-inventario-import.sql y vuelve a importar."
+    );
+  }
+  if (lower.includes("row-level security") || lower.includes("rls")) {
+    return (
+      "Supabase bloqueó el INSERT por RLS. Ejecuta supabase/fix-inventario-import.sql " +
+      "para permitir escritura con la clave anon."
+    );
+  }
   if (msg.toLowerCase().includes("value too long") || msg.toLowerCase().includes("character varying")) {
     return "Algún texto supera el límite de la base. Ejecuta Database/widen-inventario-text.sql en Supabase y vuelve a importar.";
   }
@@ -223,7 +264,14 @@ async function insertPayloadBatch(
     return { data: [], error: "El cliente de Supabase no está configurado." };
   }
 
-  const { data, error } = await supabase.from("inventario").insert(payloads).select();
+  const table = await inventarioTable();
+  let { data, error } = await table.insert(payloads).select();
+  if (error && isMissingEstadoColumn(error.message || "")) {
+    const stripped = payloads.map(({ estado: _estado, ...rest }) => rest);
+    const retry = await (await inventarioTable()).insert(stripped).select();
+    data = retry.data;
+    error = retry.error;
+  }
   if (!error) {
     return { data: (data as InventarioRow[]) || [], error: null };
   }
@@ -245,7 +293,7 @@ async function insertPayloadBatch(
   const saved: InventarioRow[] = [];
   const failed: string[] = [];
   for (const payload of payloads) {
-    const one = await supabase.from("inventario").insert([payload]).select().single();
+    const one = await (await inventarioTable()).insert([payload]).select().single();
     if (one.error || !one.data) {
       const detail = payload.serie
         ? `${payload.etiqueta} / serie ${payload.serie}`
@@ -332,8 +380,7 @@ export async function updateInventario(
     if (item.estado !== undefined) payload.estado = normalizeEstado(item.estado);
     if (item.origen !== undefined) payload.origen = item.origen || "S/O";
 
-    const { data, error } = await supabase
-      .from("inventario")
+    const { data, error } = await (await inventarioTable())
       .update(payload)
       .eq("id", id)
       .select()
@@ -376,8 +423,7 @@ export async function deleteInventario(
   }
 
   try {
-    const { data, error } = await supabase
-      .from("inventario")
+    const { data, error } = await (await inventarioTable())
       .delete()
       .eq("id", numericId)
       .select("id");
@@ -396,8 +442,7 @@ export async function deleteInventario(
     }
 
     // Confirmación extra: el registro ya no debe existir
-    const { data: stillThere } = await supabase
-      .from("inventario")
+    const { data: stillThere } = await (await inventarioTable())
       .select("id")
       .eq("id", numericId)
       .maybeSingle();
@@ -430,8 +475,7 @@ export async function deleteInventarioMany(
   }
 
   try {
-    const { data, error } = await supabase
-      .from("inventario")
+    const { data, error } = await (await inventarioTable())
       .delete()
       .in("id", uniqueIds)
       .select("id");
@@ -492,11 +536,11 @@ export async function restoreInventarioMany(
 
   try {
     const withIds = rows.map((row) => toPayload(row, true));
-    const { data, error } = await supabase.from("inventario").insert(withIds).select();
+    const { data, error } = await (await inventarioTable()).insert(withIds).select();
 
     if (error) {
       const withoutIds = rows.map((row) => toPayload(row, false));
-      const retry = await supabase.from("inventario").insert(withoutIds).select();
+      const retry = await (await inventarioTable()).insert(withoutIds).select();
       if (retry.error || !retry.data?.length) {
         console.error("Error al restaurar productos en Supabase:", error, retry.error);
         return {

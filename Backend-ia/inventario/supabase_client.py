@@ -1,5 +1,7 @@
 import json
+import re
 import time
+import unicodedata
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,6 +16,13 @@ BACKEND_ENV_PATH = BASE_DIR / ".env"
 _CACHE: dict[str, object] = {"rows": None, "at": 0.0, "used": None, "error": None}
 _CACHE_TTL_SEC = 60.0
 _PAGE_SIZE = 1000
+
+def _fold_text(value: object) -> str:
+    text = unicodedata.normalize("NFD", str(value or "").lower())
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 WRITABLE_FIELDS = frozenset(
     {
@@ -151,7 +160,39 @@ def _with_key(base: str, path_qs: str, key_name: str, key: str, send_bearer: boo
     return url, headers, key_name
 
 
+_TABLE_NAME: str | None = None
+
+
+def inventario_table() -> str:
+    """PostgREST es case-sensitive: public.inventario ≠ public.Inventario."""
+    global _TABLE_NAME
+    if _TABLE_NAME:
+        return _TABLE_NAME
+    env = get_env()
+    forced = (
+        env.get("INVENTARIO_TABLE") or env.get("NEXT_PUBLIC_INVENTARIO_TABLE") or ""
+    ).strip()
+    if forced:
+        _TABLE_NAME = forced
+        return _TABLE_NAME
+    base, attempts = _supabase_base_and_keys(env)
+    if base and attempts:
+        for table in ("inventario", "Inventario"):
+            for name, key, send_bearer in attempts:
+                url, headers, _ = _with_key(
+                    base, f"{table}?select=etiqueta&limit=1", name, key, send_bearer
+                )
+                _payload, error, _resp = _request_json("GET", url, headers=headers)
+                if not error:
+                    _TABLE_NAME = table
+                    return table
+    _TABLE_NAME = "inventario"
+    return _TABLE_NAME
+
+
 def invalidate_inventario_cache() -> None:
+    global _TABLE_NAME
+    _TABLE_NAME = None
     _CACHE["rows"] = None
     _CACHE["at"] = 0.0
     _CACHE["used"] = None
@@ -180,7 +221,7 @@ def count_inventario(filters_qs: str = "") -> tuple[int | None, str | None]:
     if not base or not attempts:
         return None, "Supabase no configurado."
 
-    qs = "inventario?select=id"
+    qs = f"{inventario_table()}?select=id"
     if filters_qs:
         qs = f"{qs}&{filters_qs.lstrip('&')}"
 
@@ -231,13 +272,14 @@ def list_por_campo(
     rows, error, _ = read_inventario()
     if error:
         return [], error
-    tokens = [t for t in valor.split() if len(t) > 1] or [valor]
+    tokens = [t for t in _fold_text(valor).split() if t] or [_fold_text(valor)]
     matched: list[dict] = []
     for row in rows:
-        blob = str(row.get(campo) or "").lower()
+        blob = _fold_text(row.get(campo))
         if not blob:
             continue
-        if all(t in blob for t in tokens):
+        blob_tokens = blob.split()
+        if all(t in blob_tokens or (len(t) > 1 and t in blob) for t in tokens):
             matched.append(row)
             if len(matched) >= max(1, min(limit, 50)):
                 break
@@ -271,7 +313,7 @@ def read_inventario(force: bool = False) -> tuple[list[dict], str | None, str | 
             to_idx = from_idx + _PAGE_SIZE - 1
             url, headers, _ = _with_key(
                 base,
-                "inventario?select=*&order=id.asc",
+                f"{inventario_table()}?select=*&order=id.asc",
                 name,
                 key,
                 send_bearer,
@@ -303,7 +345,7 @@ def get_by_id(row_id: int) -> tuple[dict | None, str | None]:
     if not base or not attempts:
         return None, "Supabase no configurado."
 
-    path_qs = f"inventario?id=eq.{int(row_id)}&select=*&limit=1"
+    path_qs = f"{inventario_table()}?id=eq.{int(row_id)}&select=*&limit=1"
     last_error = "No se encontró el registro"
     for name, key, send_bearer in attempts:
         url, headers, _ = _with_key(base, path_qs, name, key, send_bearer)
@@ -350,7 +392,7 @@ def listar_recientes(
         today = datetime.now(timezone.utc).date().isoformat()
         filters.append(f"created_at=gte.{today}T00:00:00")
 
-    path_qs = "inventario?" + "&".join(filters)
+    path_qs = f"{inventario_table()}?" + "&".join(filters)
     last_error = "No se pudieron leer registros recientes"
     for name, key, send_bearer in attempts:
         url, headers, _ = _with_key(base, path_qs, name, key, send_bearer)
@@ -368,38 +410,46 @@ def search_inventario(query: str, limit: int = 20) -> tuple[list[dict], str | No
     rows, error, _ = read_inventario()
     if error:
         return [], error
-    tokens = [t for t in query.lower().split() if len(t) > 1]
+    tokens = [t for t in _fold_text(query).split() if t]
     if not tokens:
         return rows[: max(1, min(limit, 50))], None
 
     scored: list[tuple[int, dict]] = []
     for row in rows:
+        etiqueta = _fold_text(row.get("etiqueta"))
+        persona = _fold_text(row.get("persona"))
+        articulo = _fold_text(row.get("articulo"))
+        area = _fold_text(row.get("area"))
         blob_parts = [
-            row.get("etiqueta"),
-            row.get("articulo"),
-            row.get("marca"),
-            row.get("modelo"),
-            row.get("serie"),
-            row.get("area"),
-            row.get("persona"),
-            row.get("origen"),
-            row.get("estado"),
-            row.get("observaciones"),
+            etiqueta,
+            articulo,
+            _fold_text(row.get("marca")),
+            _fold_text(row.get("modelo")),
+            _fold_text(row.get("serie")),
+            area,
+            persona,
+            _fold_text(row.get("origen")),
+            _fold_text(row.get("estado")),
+            _fold_text(row.get("observaciones")),
         ]
-        blob = " ".join(str(p or "").lower() for p in blob_parts)
+        blob = " ".join(p for p in blob_parts if p)
+        blob_tokens = set(blob.split())
+        area_tokens = set(area.split())
         score = 0
+        if tokens and all(t in area_tokens for t in tokens):
+            score += 40
         for t in tokens:
-            if t == str(row.get("etiqueta") or "").lower():
+            if t == etiqueta:
                 score += 15
-            elif t in str(row.get("etiqueta") or "").lower():
+            elif t in etiqueta:
                 score += 8
-            if t in str(row.get("persona") or "").lower():
+            if t in persona.split() or (len(t) > 1 and t in persona):
                 score += 8
-            if t in str(row.get("articulo") or "").lower():
+            if t in articulo.split() or (len(t) > 1 and t in articulo):
                 score += 6
-            if t in str(row.get("area") or "").lower():
-                score += 5
-            if t in blob:
+            if t in area_tokens or (len(t) > 1 and t in area):
+                score += 12
+            if t in blob_tokens or (len(t) > 1 and t in blob):
                 score += 2
         if score > 0:
             scored.append((score, row))
@@ -461,7 +511,7 @@ def update_inventario_row(row_id: int, fields: dict) -> tuple[dict | None, str |
     last_error = "No se pudo actualizar"
     for name, key, send_bearer in attempts:
         url, headers, _ = _with_key(
-            base, f"inventario?id=eq.{int(row_id)}", name, key, send_bearer
+            base, f"{inventario_table()}?id=eq.{int(row_id)}", name, key, send_bearer
         )
         headers["Prefer"] = "return=representation"
         payload, error, _resp = _request_json("PATCH", url, headers=headers, body=clean)
@@ -509,7 +559,7 @@ def create_inventario_row(fields: dict) -> tuple[dict | None, str | None]:
 
     last_error = "No se pudo crear el artículo"
     for name, key, send_bearer in attempts:
-        url, headers, _ = _with_key(base, "inventario", name, key, send_bearer)
+        url, headers, _ = _with_key(base, inventario_table(), name, key, send_bearer)
         headers["Prefer"] = "return=representation"
         payload, error, _resp = _request_json("POST", url, headers=headers, body=clean)
         if error:

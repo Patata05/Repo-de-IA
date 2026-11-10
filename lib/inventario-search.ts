@@ -4,12 +4,13 @@ function textOf(val: unknown) {
   return String(val ?? "").trim();
 }
 
-/** Comparación tipo Excel (sin acentos, minúsculas, espacios colapsados). */
+/** Comparación tipo Excel (sin acentos, minúsculas, puntuación ni espacios de más). */
 export function normalizeSearch(value: unknown): string {
   return textOf(value)
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -66,7 +67,13 @@ function fieldMatches(field: string, prepared: PreparedSearch): boolean {
   if (prepared.requireTrailingSpace) {
     return field.includes(`${prepared.q} `);
   }
-  return field.includes(prepared.q);
+  if (field.includes(prepared.q)) return true;
+  const fieldTokens = field.split(" ").filter(Boolean);
+  const queryTokens = prepared.q.split(" ").filter(Boolean);
+  if (queryTokens.length > 1 && queryTokens.every((tok) => fieldTokens.includes(tok))) {
+    return true;
+  }
+  return false;
 }
 
 export function indexMatchesPrepared(entry: RowSearchIndex, prepared: PreparedSearch): boolean {
