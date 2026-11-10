@@ -7,10 +7,18 @@ import type { InventarioRow } from "@/lib/supabase";
 
 export type ChatViewerQr = ChatQrPayload & { dataUrl?: string };
 
-const QR_PREVIEW_LIMIT = 3;
-const RESULT_PREVIEW_LIMIT = 3;
+const QR_PREVIEW_LIMIT = 7;
+const RESULT_PREVIEW_LIMIT = 20;
 
-export type ChatViewerOverview = "full" | "stats" | "areas" | "recent";
+export type ChatViewerOverview =
+  | "full"
+  | "stats"
+  | "areas"
+  | "areaTotal"
+  | "recent"
+  | "personas"
+  | "estado"
+  | "marcas";
 
 /** Avisa al sync del chat que el panel cambió de tamaño (Mostrar más/menos). */
 function notifyViewerLayout() {
@@ -24,6 +32,8 @@ type ChatViewerProps = {
   qrCards?: ChatViewerQr[];
   /** Resumen pedido en el chat (no se muestra en la bienvenida). */
   overview?: ChatViewerOverview;
+  /** Nombre de área (u otro foco) para incidencias concretas. */
+  overviewFocus?: string;
   onSelectItem?: (item: ChatApiItem | InventarioRow) => void;
 };
 
@@ -49,14 +59,20 @@ export default function ChatViewer({
   resultItems = [],
   qrCards = [],
   overview,
+  overviewFocus,
   onSelectItem,
 }: ChatViewerProps) {
   const hasQr = qrCards.some((card) => card.dataUrl || card.text);
   const showOverview = Boolean(overview) && !hasQr;
   const hasResults = !showOverview && (resultItems.length > 0 || hasQr);
   const showStats = overview === "full" || overview === "stats";
+  const showAreaTotal = overview === "areaTotal";
   const showAreas = overview === "full" || overview === "areas";
   const showRecent = overview === "full" || overview === "recent";
+  const showPersonas = overview === "personas";
+  const showEstado = overview === "estado";
+  const showMarcas = overview === "marcas";
+  const focusArea = textOf(overviewFocus);
   const [qrExpanded, setQrExpanded] = useState(false);
   const [overviewExpanded, setOverviewExpanded] = useState(false);
 
@@ -74,13 +90,69 @@ export default function ChatViewer({
   const areaPreviewLimit = 5;
   const maxArea = areasSorted[0]?.[1] || 1;
 
+  const personaCounts = new Map<string, number>();
+  for (const row of inventory) {
+    const persona = textOf(row.persona);
+    if (!persona) continue;
+    personaCounts.set(persona, (personaCounts.get(persona) ?? 0) + 1);
+  }
+  const personasSorted = [...personaCounts.entries()].sort(
+    (a, b) => b[1] - a[1],
+  );
+  const maxPersona = personasSorted[0]?.[1] || 1;
+  const personaPreviewLimit = 6;
+
+  const marcaCounts = new Map<string, number>();
+  for (const row of inventory) {
+    const marca = textOf(row.marca) || "Sin marca";
+    marcaCounts.set(marca, (marcaCounts.get(marca) ?? 0) + 1);
+  }
+  const marcasSorted = [...marcaCounts.entries()].sort((a, b) => b[1] - a[1]);
+  const marcaPreviewLimit = 8;
+
+  const estadoCounts = { activo: 0, inactivo: 0, otro: 0 };
+  for (const row of inventory) {
+    const v = textOf(row.estado).toLowerCase();
+    if (!v || v === "activo" || v === "active" || v === "si" || v === "sí") {
+      estadoCounts.activo += 1;
+    } else if (
+      v === "inactivo" ||
+      v === "baja" ||
+      v === "no" ||
+      v === "inactive"
+    ) {
+      estadoCounts.inactivo += 1;
+    } else {
+      estadoCounts.otro += 1;
+    }
+  }
+  const estadoTotal =
+    estadoCounts.activo + estadoCounts.inactivo + estadoCounts.otro || 1;
+
   const personas = new Set(
     inventory.map((row) => textOf(row.persona)).filter(Boolean),
   );
-  const activos = inventory.filter((row) => {
+  const activos = estadoCounts.activo;
+
+  const areaRows = showAreaTotal && focusArea
+    ? inventory.filter(
+        (row) =>
+          textOf(row.area).toLowerCase() === focusArea.toLowerCase(),
+      )
+    : [];
+  const areaPersonas = new Set(
+    areaRows.map((row) => textOf(row.persona)).filter(Boolean),
+  );
+  const areaActivos = areaRows.filter((row) => {
     const v = textOf(row.estado).toLowerCase();
-    return !(v === "inactivo" || v === "baja" || v === "no" || v === "inactive");
+    return !(
+      v === "inactivo" ||
+      v === "baja" ||
+      v === "no" ||
+      v === "inactive"
+    );
   }).length;
+
   const recentPreviewLimit = 5;
   const recentLimit = 10;
   const recentAll = [...inventory]
@@ -147,26 +219,46 @@ export default function ChatViewer({
       : personLabel || "Etiquetas"
     : overview === "areas"
       ? "Áreas"
-      : overview === "recent"
-        ? "Recientes"
-        : overview === "stats"
-          ? "Inventario"
-          : "En el inventario";
+      : overview === "areaTotal"
+        ? focusArea || "Área"
+        : overview === "recent"
+          ? "Recientes"
+          : overview === "stats"
+            ? "Totales"
+            : overview === "personas"
+              ? "Personas"
+              : overview === "estado"
+                ? "Estado"
+                : overview === "marcas"
+                  ? "Marcas"
+                  : "En el inventario";
 
   const contextSub = hasResults
     ? hasQr
       ? `${qrCards.length} código${qrCards.length === 1 ? "" : "s"} QR`
       : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
     : overview === "areas"
-      ? "Distribución por área"
-    : overview === "recent"
-      ? `${recentAll.length} últimos registros`
-      : overview === "stats"
-          ? "Totales"
-          : "Resumen en vivo";
+      ? `${areasSorted.length} áreas · distribución`
+      : overview === "areaTotal"
+        ? "Total del área"
+        : overview === "recent"
+          ? `${recentAll.length} últimos registros`
+          : overview === "stats"
+            ? "Conteo en vivo"
+            : overview === "personas"
+              ? `${personasSorted.length} personas con equipo`
+              : overview === "estado"
+                ? "Activos vs inactivos"
+                : overview === "marcas"
+                  ? `${marcasSorted.length} marcas`
+                  : "Resumen en vivo";
 
   return (
-    <div className="chat-viewer-sync-body">
+    <div
+      className={`chat-viewer-sync-body${
+        overview ? ` is-overview-${overview}` : ""
+      }${hasQr ? " is-qr" : ""}${hasResults && !hasQr ? " is-etiquetas" : ""}`}
+    >
       <header className="chat-viewer-head">
         <h2 className="chat-viewer-title">{contextLabel}</h2>
         <p className="chat-viewer-sub">{contextSub}</p>
@@ -176,7 +268,6 @@ export default function ChatViewer({
         (() => {
           const areasOnly = overview === "areas";
           const recentOnly = overview === "recent";
-          // Cerrado: stats + preview (llena el cuadro). Abierto: más detalle.
           const collapsedAreaLimit = 3;
           const collapsedRecentLimit = 3;
           const canCollapseFull =
@@ -187,8 +278,16 @@ export default function ChatViewer({
             areasOnly && areasSorted.length > areaPreviewLimit;
           const canCollapseRecent =
             recentOnly && recentAll.length > recentPreviewLimit;
+          const canCollapsePersonas =
+            showPersonas && personasSorted.length > personaPreviewLimit;
+          const canCollapseMarcas =
+            showMarcas && marcasSorted.length > marcaPreviewLimit;
           const canCollapseOverview =
-            canCollapseFull || canCollapseAreas || canCollapseRecent;
+            canCollapseFull ||
+            canCollapseAreas ||
+            canCollapseRecent ||
+            canCollapsePersonas ||
+            canCollapseMarcas;
           const visibleAreas = !showAreas
             ? []
             : areasOnly
@@ -207,6 +306,16 @@ export default function ChatViewer({
               : overviewExpanded
                 ? recentAll
                 : recentAll.slice(0, collapsedRecentLimit);
+          const visiblePersonas = showPersonas
+            ? overviewExpanded
+              ? personasSorted
+              : personasSorted.slice(0, personaPreviewLimit)
+            : [];
+          const visibleMarcas = showMarcas
+            ? overviewExpanded
+              ? marcasSorted
+              : marcasSorted.slice(0, marcaPreviewLimit)
+            : [];
           const moreCount = canCollapseFull
             ? Math.max(0, recentAll.length - collapsedRecentLimit) +
               Math.max(0, areasSorted.length - collapsedAreaLimit)
@@ -214,7 +323,11 @@ export default function ChatViewer({
               ? recentAll.length - recentPreviewLimit
               : canCollapseAreas
                 ? areasSorted.length - areaPreviewLimit
-                : 0;
+                : canCollapsePersonas
+                  ? personasSorted.length - personaPreviewLimit
+                  : canCollapseMarcas
+                    ? marcasSorted.length - marcaPreviewLimit
+                    : 0;
           return (
             <>
               <div className="chat-viewer-scroll">
@@ -223,9 +336,35 @@ export default function ChatViewer({
                     overviewExpanded ? " is-expanded" : ""
                   }`}
                 >
+                  {showAreaTotal && focusArea ? (
+                    <section
+                      className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total"
+                      aria-label={`Total de ${focusArea}`}
+                    >
+                      <div className="chat-viewer-stat">
+                        <span className="chat-viewer-stat-label">Registros</span>
+                        <strong>{formatNumber(areaRows.length)}</strong>
+                      </div>
+                      <div className="chat-viewer-stat is-text-value">
+                        <span className="chat-viewer-stat-label">Área</span>
+                        <strong title={focusArea}>{focusArea}</strong>
+                      </div>
+                      <div className="chat-viewer-stat">
+                        <span className="chat-viewer-stat-label">Personas</span>
+                        <strong>{formatNumber(areaPersonas.size)}</strong>
+                      </div>
+                      <div className="chat-viewer-stat">
+                        <span className="chat-viewer-stat-label">Activos</span>
+                        <strong>{formatNumber(areaActivos)}</strong>
+                      </div>
+                    </section>
+                  ) : null}
+
                   {showStats ? (
                     <section
-                      className="chat-viewer-card chat-viewer-stats"
+                      className={`chat-viewer-card chat-viewer-stats${
+                        overview === "stats" ? " is-hero-stats" : ""
+                      }`}
                       aria-label="Totales"
                     >
                       <div className="chat-viewer-stat">
@@ -248,13 +387,27 @@ export default function ChatViewer({
                   ) : null}
 
                   {showAreas && visibleAreas.length ? (
-                    <section className="chat-viewer-card" aria-label="Áreas">
-                      <h3 className="chat-viewer-section-title">Áreas</h3>
+                    <section
+                      className={`chat-viewer-card${
+                        areasOnly ? " chat-viewer-areas-hero" : ""
+                      }`}
+                      aria-label="Áreas"
+                    >
+                      <h3 className="chat-viewer-section-title">
+                        {areasOnly ? "Ranking por área" : "Áreas"}
+                      </h3>
                       <ul className="chat-viewer-bars">
-                        {visibleAreas.map(([area, count]) => (
+                        {visibleAreas.map(([area, count], index) => (
                           <li key={area} className="chat-viewer-bar-row">
                             <div className="chat-viewer-bar-meta">
-                              <span>{area}</span>
+                              <span className="chat-viewer-rank-line">
+                                {areasOnly ? (
+                                  <span className="chat-viewer-rank">
+                                    {index + 1}
+                                  </span>
+                                ) : null}
+                                <span>{area}</span>
+                              </span>
                               <span>{formatNumber(count)}</span>
                             </div>
                             <div className="chat-viewer-bar-track">
@@ -271,9 +424,148 @@ export default function ChatViewer({
                     </section>
                   ) : null}
 
+                  {showPersonas && visiblePersonas.length ? (
+                    <section
+                      className="chat-viewer-card chat-viewer-people-hero"
+                      aria-label="Personas"
+                    >
+                      <h3 className="chat-viewer-section-title">
+                        Asignaciones
+                      </h3>
+                      <ul className="chat-viewer-people">
+                        {visiblePersonas.map(([persona, count]) => {
+                          const initials = persona
+                            .split(/\s+/)
+                            .filter(Boolean)
+                            .slice(0, 2)
+                            .map((p) => p[0]?.toUpperCase() || "")
+                            .join("");
+                          return (
+                            <li key={persona} className="chat-viewer-people-row">
+                              <span
+                                className="chat-viewer-avatar"
+                                aria-hidden="true"
+                              >
+                                {initials || "?"}
+                              </span>
+                              <span className="chat-viewer-people-copy">
+                                <strong>{persona}</strong>
+                                <span>
+                                  {formatNumber(count)} artículo
+                                  {count === 1 ? "" : "s"}
+                                </span>
+                              </span>
+                              <span
+                                className="chat-viewer-people-meter"
+                                aria-hidden="true"
+                              >
+                                <span
+                                  style={{
+                                    width: `${Math.max(10, (count / maxPersona) * 100)}%`,
+                                  }}
+                                />
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </section>
+                  ) : null}
+
+                  {showEstado ? (
+                    <section
+                      className="chat-viewer-card chat-viewer-estado-hero"
+                      aria-label="Estado"
+                    >
+                      <h3 className="chat-viewer-section-title">Salud</h3>
+                      <div className="chat-viewer-estado-split">
+                        <div className="chat-viewer-estado-block is-activo">
+                          <span className="chat-viewer-stat-label">Activos</span>
+                          <strong>
+                            {formatNumber(estadoCounts.activo)}
+                          </strong>
+                          <span className="chat-viewer-estado-pct">
+                            {Math.round(
+                              (estadoCounts.activo / estadoTotal) * 100,
+                            )}
+                            %
+                          </span>
+                        </div>
+                        <div className="chat-viewer-estado-block is-inactivo">
+                          <span className="chat-viewer-stat-label">
+                            Inactivos
+                          </span>
+                          <strong>
+                            {formatNumber(estadoCounts.inactivo)}
+                          </strong>
+                          <span className="chat-viewer-estado-pct">
+                            {Math.round(
+                              (estadoCounts.inactivo / estadoTotal) * 100,
+                            )}
+                            %
+                          </span>
+                        </div>
+                      </div>
+                      <div
+                        className="chat-viewer-estado-track"
+                        aria-hidden="true"
+                      >
+                        <span
+                          className="is-activo"
+                          style={{
+                            width: `${(estadoCounts.activo / estadoTotal) * 100}%`,
+                          }}
+                        />
+                        <span
+                          className="is-inactivo"
+                          style={{
+                            width: `${(estadoCounts.inactivo / estadoTotal) * 100}%`,
+                          }}
+                        />
+                        {estadoCounts.otro ? (
+                          <span
+                            className="is-otro"
+                            style={{
+                              width: `${(estadoCounts.otro / estadoTotal) * 100}%`,
+                            }}
+                          />
+                        ) : null}
+                      </div>
+                      {estadoCounts.otro ? (
+                        <p className="chat-viewer-estado-note">
+                          Otros estados: {formatNumber(estadoCounts.otro)}
+                        </p>
+                      ) : null}
+                    </section>
+                  ) : null}
+
+                  {showMarcas && visibleMarcas.length ? (
+                    <section
+                      className="chat-viewer-card chat-viewer-marcas-hero"
+                      aria-label="Marcas"
+                    >
+                      <h3 className="chat-viewer-section-title">Top marcas</h3>
+                      <ul className="chat-viewer-chips">
+                        {visibleMarcas.map(([marca, count]) => (
+                          <li key={marca} className="chat-viewer-chip">
+                            <strong>{marca}</strong>
+                            <span>{formatNumber(count)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  ) : null}
+
                   {visibleRecent.length ? (
-                    <section className="chat-viewer-card" aria-label="Recientes">
-                      <h3 className="chat-viewer-section-title">Recientes</h3>
+                    <section
+                      className={`chat-viewer-card${
+                        recentOnly ? " chat-viewer-recent-hero" : ""
+                      }`}
+                      aria-label="Recientes"
+                    >
+                      <h3 className="chat-viewer-section-title">
+                        {recentOnly ? "Últimos movimientos" : "Recientes"}
+                      </h3>
                       <ul className="chat-viewer-list">
                         {visibleRecent.map((row, index) => {
                           const etiqueta =

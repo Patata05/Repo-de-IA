@@ -50,7 +50,7 @@ export function getChatApiBaseUrl() {
 export async function askInventoryChat(
   message: string,
   history: ChatApiHistoryItem[] = [],
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; memory?: string | null },
 ): Promise<ChatApiResponse> {
   const base = getChatApiBaseUrl();
   // Next proxy: /api/chat | Django directo: .../api/chat/
@@ -60,7 +60,11 @@ export async function askInventoryChat(
     response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, history }),
+      body: JSON.stringify({
+        message,
+        history,
+        memory: options?.memory || undefined,
+      }),
       signal: options?.signal,
     });
   } catch (error) {

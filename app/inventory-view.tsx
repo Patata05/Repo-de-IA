@@ -14,6 +14,7 @@ import {
   CircleDot,
   Lightbulb,
   Copy,
+  FileSpreadsheet,
   ImagePlus,
   ListChecks,
   MapPin,
@@ -53,8 +54,10 @@ import { createPortal } from "react-dom";
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import {
   addInventarioBulkAction,
+  deleteInventarioAction,
   deleteInventarioManyAction,
   restoreInventarioManyAction,
+  updateInventarioAction,
 } from "@/app/actions";
 import AddProductModal from "@/components/add-product-modal";
 import ChatViewer from "@/components/chat-viewer";
@@ -66,6 +69,20 @@ import {
 } from "@/lib/chat-api";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import { formatInventarioQrCompact } from "@/lib/inventario-qr";
+import {
+  answerFromMemoryAboutBefore,
+  buildCrossChatHistorySnippet,
+  buildRevertProposalReply,
+  formatChatMemoryForPrompt,
+  hydrateMemoryFromChatSessions,
+  ensureLastFieldChangeFromMessages,
+  looksLikeRevertPreviousValue,
+  rememberFieldChange,
+  rememberMutation,
+  rememberTotalSnapshot,
+  loadChatMemory,
+  type ChatFieldChange,
+} from "@/lib/chat-memory";
 import {
   buildSearchIndex,
   indexMatchesPrepared,
@@ -81,7 +98,15 @@ const CHAT_QUICK_ACTIONS = [
   { label: "Ideas de consulta", prompt: "¿Qué puedo preguntarte del inventario?", icon: Lightbulb },
 ] as const;
 
-type ViewerOverview = "full" | "stats" | "areas" | "recent";
+type ViewerOverview =
+  | "full"
+  | "stats"
+  | "areas"
+  | "areaTotal"
+  | "recent"
+  | "personas"
+  | "estado"
+  | "marcas";
 
 type ChatMessage = {
   id: number;
@@ -92,6 +117,8 @@ type ChatMessage = {
   qr?: ChatQrPayload[];
   /** Resumen del visor (solo si el usuario lo pide en el chat). */
   viewerOverview?: ViewerOverview;
+  /** Foco de la incidencia (ej. nombre de área en areaTotal). */
+  viewerFocus?: string;
 };
 type ChatQrCard = ChatQrPayload & { dataUrl: string };
 type ChatSession = {
@@ -230,14 +257,322 @@ function isQrBotMessage(message: ChatMessage) {
   );
 }
 
-/** "dame 5 etiquetas" (sin pedir QR) → lista de etiquetas, no códigos QR. */
+const SPANISH_COUNT_WORDS: Record<string, number> = {
+  un: 1,
+  uno: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10,
+  once: 11,
+  doce: 12,
+  trece: 13,
+  catorce: 14,
+  quince: 15,
+  dieciseis: 16,
+  diecisiete: 17,
+  dieciocho: 18,
+  diecinueve: 19,
+  veinte: 20,
+  treinta: 30,
+  cuarenta: 40,
+  cincuenta: 50,
+};
+
+const MAX_ETIQUETA_LIST = 50;
+
+/** Número pedido en el texto (dígito o palabra: trece, diez…). */
+function parseRequestedCount(userText: string): number | null {
+  const n = normalizeChatIntent(userText);
+  if (!n) return null;
+  const digit =
+    n.match(
+      /\b(\d{1,3})\s*(?:etiquet|registros?|articulos?|equipos?|qr|codigos?)\b/,
+    ) ||
+    n.match(
+      /\b(?:etiquet\w*|registros?|articulos?|equipos?)\s*(\d{1,3})\b/,
+    ) ||
+    n.match(
+      /\b(?:dame|muestra|mostrar|ensename|ensenar|ensena|ver|trae|genera|crea|haz)\s+(?:las?\s+|los?\s+)?(\d{1,3})\b/,
+    );
+  if (digit) {
+    const value = Number(digit[1]);
+    return Number.isFinite(value) ? value : null;
+  }
+  const words = Object.keys(SPANISH_COUNT_WORDS)
+    .sort((a, b) => b.length - a.length)
+    .join("|");
+  const word =
+    n.match(
+      new RegExp(
+        `\\b(${words})\\s*(?:etiquet|registros?|articulos?|equipos?|qr|codigos?)\\b`,
+      ),
+    ) ||
+    n.match(
+      new RegExp(
+        `\\b(?:dame|muestra|mostrar|ensename|ver|trae)\\s+(?:las?\\s+|los?\\s+)?(${words})\\b`,
+      ),
+    );
+  if (word) return SPANISH_COUNT_WORDS[word[1]] ?? null;
+  return null;
+}
+
+/**
+ * "dame N etiquetas" / "trece etiquetas de [área]" (sin QR).
+ * null = no forzar recorte; número = tope pedido (o todas si dijo "todas").
+ */
 function parseEtiquetaListAsk(userText: string): number | null {
   const n = normalizeChatIntent(userText);
   if (!n || !/\betiquet/.test(n)) return null;
   if (/\bqr\b/.test(n)) return null;
-  const m =
-    n.match(/\b(\d{1,2})\s*etiquet/) || n.match(/etiquet\w*\s*(\d{1,2})\b/);
-  return Math.max(1, Math.min(12, Number(m?.[1] || 5) || 5));
+  const count = parseRequestedCount(userText);
+  if (count != null) {
+    return Math.max(1, Math.min(MAX_ETIQUETA_LIST, count));
+  }
+  if (
+    intentHas(n, "todas", "todos") ||
+    /\betiquet\w*\s+(de|del|en)\b/.test(n) ||
+    (intentHas(
+      n,
+      "dame",
+      "muestra",
+      "mostrar",
+      "ensename",
+      "ensenar",
+      "ensena",
+      "ver",
+      "trae",
+      "lista",
+      "listar",
+    ) &&
+      /\betiquet/.test(n))
+  ) {
+    return MAX_ETIQUETA_LIST;
+  }
+  return null;
+}
+
+const AREA_STOP_WORDS = new Set([
+  "area",
+  "areas",
+  "de",
+  "del",
+  "la",
+  "el",
+  "los",
+  "las",
+  "en",
+  "un",
+  "una",
+  "dame",
+  "muestra",
+  "mostrar",
+  "ver",
+  "trae",
+  "lista",
+  "listar",
+  "busca",
+  "buscar",
+  "registro",
+  "registros",
+  "etiqueta",
+  "etiquetas",
+  "articulo",
+  "articulos",
+  "equipo",
+  "equipos",
+  "por",
+  "con",
+]);
+
+function looksLikeAreaQuery(plain: string) {
+  return (
+    /\b(area|areas|biblioteca|registro|registros|etiqueta|etiquetas|articulo|articulos|equipo|equipos|dame|muestra|mostrar|ver|lista|listar|busca|buscar)\b/.test(
+      plain,
+    ) || /\b(de|del|en)\s+[a-z0-9]{3,}/.test(plain)
+  );
+}
+
+/** Aguja de área desde el texto (ej. "biblioteca" aunque digan bbliteca). */
+function extractAreaNeedle(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const plain = normalizePlain(userText);
+  if (!plain || !looksLikeAreaQuery(plain)) return undefined;
+  const user = normalizeChatIntent(userText);
+  if (!user) return undefined;
+  const afterArea =
+    user.match(/\bareas?\s+(?:de\s+|del\s+)?(.+)$/) ||
+    user.match(
+      /\b(?:registros?|etiquetas?|articulos?|equipos?)\s+(?:de\s+|del\s+|en\s+)(.+)$/,
+    );
+  const raw = (afterArea?.[1] || user)
+    .split(/\s+/)
+    .filter((t) => t.length > 2 && !AREA_STOP_WORDS.has(t));
+  if (!raw.length) return undefined;
+
+  const { tokens: areaTokens } = getAreaSearchIndex(inventory);
+  let best: { token: string; score: number } | null = null;
+  for (const cand of raw) {
+    // Exacto / substring primero (barato).
+    for (const tok of areaTokens) {
+      if (cand === tok) {
+        return tok;
+      }
+      if (tok.includes(cand) || cand.includes(tok)) {
+        const score = Math.min(tok.length, cand.length) + 20;
+        if (!best || score > best.score) best = { token: tok, score };
+      }
+    }
+    if (best && best.score >= 24) continue;
+    const budget = typoBudget(cand);
+    if (budget <= 0) continue;
+    for (const tok of areaTokens) {
+      if (Math.abs(tok.length - cand.length) > budget) continue;
+      const dist = levenshtein(cand, tok);
+      if (dist <= budget) {
+        const score = tok.length + 10 - dist;
+        if (!best || score > best.score) best = { token: tok, score };
+        if (dist === 1) break;
+      }
+    }
+  }
+  return best?.token;
+}
+
+/** Área mencionada en el pedido (nombre canónico o aguja de filtro). */
+function matchAreaFromPrompt(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  if (!looksLikeAreaQuery(normalizePlain(userText))) return undefined;
+  return extractAreaNeedle(userText, inventory);
+}
+
+function rowsForAreaNeedle(
+  inventory: InventarioRow[],
+  needle: string,
+  limit: number,
+): InventarioRow[] {
+  const n = normalizePlain(needle);
+  if (!n) return [];
+  const out: InventarioRow[] = [];
+  for (const row of inventory) {
+    if (out.length >= limit) break;
+    if (!String(row.etiqueta ?? "").trim()) continue;
+    const a = normalizePlain(String(row.area ?? ""));
+    if (!a) continue;
+    if (a === n || a.includes(n) || n.includes(a)) {
+      out.push(row);
+      continue;
+    }
+    // Solo fuzzy si no hubo includes (y con pocos tokens).
+    const toks = a.split(" ");
+    if (
+      toks.some((tok) => {
+        if (tok === n || tok.includes(n) || n.includes(tok)) return true;
+        const budget = typoBudget(tok);
+        return (
+          budget > 0 &&
+          Math.abs(tok.length - n.length) <= budget &&
+          levenshtein(tok, n) <= budget
+        );
+      })
+    ) {
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+/** "dame los registros/etiquetas del área X" → lista local sin LLM. */
+function detectAreaListAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): { area: string; limit: number } | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  if (detectAreaTotalAsk(userText, inventory)) return undefined;
+  const wantsList = intentHas(
+    n,
+    "dame",
+    "muestra",
+    "mostrar",
+    "ensename",
+    "ensenar",
+    "ensena",
+    "ver",
+    "trae",
+    "lista",
+    "listar",
+    "busca",
+    "buscar",
+  );
+  const hasTarget = intentHas(
+    n,
+    "registro",
+    "registros",
+    "etiqueta",
+    "etiquetas",
+    "articulo",
+    "articulos",
+    "equipo",
+    "equipos",
+  );
+  const areaCue =
+    intentHas(n, "area", "areas") || /\b(de|del|en)\b/.test(n);
+  if (!wantsList || (!hasTarget && !areaCue)) return undefined;
+  // Ranking de áreas (todas) ≠ registros de un área.
+  if (
+    intentHas(n, "areas") &&
+    intentHas(n, "todas", "todos", "ranking", "por") &&
+    !hasTarget
+  ) {
+    return undefined;
+  }
+  const area = matchAreaFromPrompt(userText, inventory);
+  if (!area) return undefined;
+  const count = parseRequestedCount(userText);
+  return {
+    area,
+    limit: Math.max(1, Math.min(MAX_ETIQUETA_LIST, count ?? MAX_ETIQUETA_LIST)),
+  };
+}
+
+function buildAreaListReply(area: string, rows: InventarioRow[]) {
+  const n = rows.length;
+  if (!n) {
+    return `No encontré registros en **${area}**. ¿Quieres revisar el nombre del área o ver el ranking de áreas?`;
+  }
+  const label = area.length <= 24 ? area : area.slice(0, 1).toUpperCase() + area.slice(1);
+  return (
+    `Listo: en el panel derecho tienes **${n}** registro${n === 1 ? "" : "s"} de **${label}**.\n\n` +
+    `¿Quieres filtrar por persona, generar QR de un lote o ver otra área?`
+  );
+}
+
+/** Pedido de borrar un registro del inventario (no chats). */
+function looksLikeDeleteRecordAsk(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n || isNonConcreteChatAsk(userText)) return false;
+  const deleteVerb =
+    /\b(elimina|eliminar|elimine|eliminaras|borra|borrar|borre|quita|quitar|suprimir)\b/.test(
+      n,
+    );
+  if (!deleteVerb) return false;
+  if (/\b(chat|busqueda|conversacion|mensaje)\b/.test(n)) return false;
+  return (
+    /\b(registro|registros|etiqueta|etiquetas|articulo|articulos|equipo|equipos|este|esta|ese|esa|uno|un)\b/.test(
+      n,
+    ) || /\b\d{3,}\b/.test(n)
+  );
 }
 
 function userAskedQr(userText: string): boolean {
@@ -260,8 +595,34 @@ function messageHasSideData(message: ChatMessage) {
   );
 }
 
-/** Normaliza texto para tolerar typos (sin acentos, minúsculas). */
-function normalizeChatIntent(raw: string) {
+/** Distancia de edición para corregir faltas de ortografía. */
+function levenshtein(a: string, b: string) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  if (Math.abs(a.length - b.length) > 2) return 99;
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = i - 1;
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cur = row[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + cost);
+      prev = cur;
+    }
+  }
+  return row[b.length];
+}
+
+function typoBudget(word: string) {
+  if (word.length <= 3) return 0;
+  if (word.length <= 5) return 1;
+  return 2;
+}
+
+/** Solo minúsculas/acentos — NO corre ortografía (rápido para áreas del inventario). */
+function normalizePlain(raw: string) {
   return String(raw || "")
     .toLowerCase()
     .normalize("NFD")
@@ -271,12 +632,671 @@ function normalizeChatIntent(raw: string) {
     .trim();
 }
 
+type AreaSearchIndex = {
+  tokens: string[];
+  byToken: Map<string, string[]>;
+  size: number;
+};
+
+let areaIndexCache: AreaSearchIndex | null = null;
+let areaIndexSize = -1;
+
+function getAreaSearchIndex(inventory: InventarioRow[]): AreaSearchIndex {
+  if (areaIndexCache && areaIndexSize === inventory.length) {
+    return areaIndexCache;
+  }
+  const tokenSet = new Set<string>();
+  const byToken = new Map<string, string[]>();
+  for (const row of inventory) {
+    const area = String(row.area ?? "").trim();
+    if (!area) continue;
+    const norm = normalizePlain(area);
+    if (!norm) continue;
+    for (const tok of norm.split(" ")) {
+      if (tok.length <= 2) continue;
+      tokenSet.add(tok);
+      const list = byToken.get(tok);
+      if (list) {
+        if (list.length < 8 && !list.includes(area)) list.push(area);
+      } else {
+        byToken.set(tok, [area]);
+      }
+    }
+  }
+  areaIndexCache = {
+    tokens: Array.from(tokenSet),
+    byToken,
+    size: inventory.length,
+  };
+  areaIndexSize = inventory.length;
+  return areaIndexCache;
+}
+
+const INTENT_BY_PREFIX = new Map<string, string[]>();
+function intentCandidatesFor(token: string): string[] {
+  if (!INTENT_BY_PREFIX.size) {
+    for (const canon of INTENT_CANONICAL) {
+      const key = canon.slice(0, 1);
+      const list = INTENT_BY_PREFIX.get(key);
+      if (list) list.push(canon);
+      else INTENT_BY_PREFIX.set(key, [canon]);
+    }
+  }
+  const budget = typoBudget(token);
+  if (budget <= 0) return [];
+  const same = INTENT_BY_PREFIX.get(token.slice(0, 1)) || [];
+  // Prefijo distinto: solo palabras de largo parecido (pocas).
+  const out = same.filter((c) => Math.abs(c.length - token.length) <= budget);
+  if (out.length) return out;
+  return (INTENT_CANONICAL as readonly string[]).filter(
+    (c) => Math.abs(c.length - token.length) <= budget,
+  );
+}
+
+/** Vocabulario del detector (formas canónicas). */
+const INTENT_CANONICAL = [
+  "area",
+  "areas",
+  "persona",
+  "personas",
+  "marca",
+  "marcas",
+  "estado",
+  "activo",
+  "activos",
+  "inactivo",
+  "inactivos",
+  "reciente",
+  "recientes",
+  "inventario",
+  "inventarios",
+  "general",
+  "completo",
+  "resumen",
+  "total",
+  "totales",
+  "todo",
+  "conteo",
+  "panorama",
+  "dashboard",
+  "etiqueta",
+  "etiquetas",
+  "codigo",
+  "codigos",
+  "qr",
+  "dame",
+  "muestra",
+  "mostrar",
+  "ver",
+  "quiero",
+  "lista",
+  "listar",
+  "desglose",
+  "todas",
+  "todos",
+  "cuantos",
+  "cuantas",
+  "cuanto",
+  "cuanta",
+  "articulo",
+  "articulos",
+  "registro",
+  "registros",
+  "ultimo",
+  "ultimos",
+  "equipo",
+  "equipos",
+  "top",
+  "por",
+  "ensename",
+  "ensenar",
+  "ensena",
+  "crea",
+  "crear",
+  "genera",
+  "generar",
+  "haz",
+  "hacer",
+  "abre",
+  "abrir",
+  "trae",
+  "sube",
+  "subir",
+  "importa",
+  "importar",
+  "carga",
+  "cargar",
+  "cambia",
+  "cambiar",
+  "actualiza",
+  "actualizar",
+] as const;
+
+const INTENT_ALIAS: Record<string, string> = {
+  // faltas frecuentes / acentos ya quitados
+  areea: "area",
+  areaz: "areas",
+  aresa: "areas",
+  ares: "areas",
+  areass: "areas",
+  persnas: "personas",
+  perssonas: "personas",
+  personsa: "personas",
+  marcaa: "marca",
+  marcass: "marcas",
+  inventaro: "inventario",
+  inventrio: "inventario",
+  invetario: "inventario",
+  inventaroio: "inventario",
+  generla: "general",
+  genral: "general",
+  jeneral: "general",
+  resmen: "resumen",
+  resumne: "resumen",
+  recietes: "recientes",
+  recintes: "recientes",
+  etiqetas: "etiquetas",
+  etiqeutas: "etiquetas",
+  etiqutas: "etiquetas",
+  regsitros: "registros",
+  regsitro: "registro",
+  registtros: "registros",
+  bblioteca: "biblioteca",
+  bbliteca: "biblioteca",
+  bibliioteca: "biblioteca",
+  codgos: "codigos",
+  codgio: "codigo",
+  activso: "activos",
+  inactivso: "inactivos",
+  ensename: "muestra",
+  ensenarme: "muestra",
+  muestrame: "muestra",
+  dimelos: "dame",
+  dimelo: "dame",
+  gsuatria: "gustaria",
+  gustaria: "gustaria",
+  resgittos: "registros",
+  resgitto: "registro",
+  resgistro: "registro",
+  eliminaras: "eliminar",
+  elimnar: "eliminar",
+  elminar: "eliminar",
+};
+
+const INTENT_CANONICAL_SET = new Set<string>(INTENT_CANONICAL as readonly string[]);
+const normalizeIntentCache = new Map<string, string>();
+
+function correctIntentToken(token: string) {
+  if (!token) return token;
+  if (INTENT_ALIAS[token]) return INTENT_ALIAS[token];
+  if (INTENT_CANONICAL_SET.has(token)) return token;
+  const budget = typoBudget(token);
+  if (budget <= 0) return token;
+  let best = token;
+  let bestDist = Infinity;
+  for (const canon of intentCandidatesFor(token)) {
+    const dist = levenshtein(token, canon);
+    if (dist < bestDist && dist <= budget) {
+      bestDist = dist;
+      best = canon;
+      if (dist === 1) break;
+    }
+  }
+  return best;
+}
+
+/** Normaliza + corrige typos de intención (áreas, personas, inventario…). */
+function normalizeChatIntent(raw: string) {
+  const key = String(raw || "");
+  const cached = normalizeIntentCache.get(key);
+  if (cached !== undefined) return cached;
+  const base = key
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const result = !base
+    ? ""
+    : base
+        .split(" ")
+        .map((tok) => correctIntentToken(tok))
+        .join(" ");
+  if (normalizeIntentCache.size > 400) normalizeIntentCache.clear();
+  normalizeIntentCache.set(key, result);
+  return result;
+}
+
+function intentHas(user: string, ...words: string[]) {
+  const set = new Set(user.split(/\s+/));
+  return words.some((w) => set.has(w));
+}
+
+/** Total de un área concreta → cuadro de totales con el nombre del área. */
+function detectAreaTotalAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const user = normalizeChatIntent(userText);
+  if (!user) return undefined;
+  // "todas las areas" es ranking, no total de una.
+  if (
+    intentHas(user, "todas", "todos") &&
+    intentHas(user, "areas", "area")
+  ) {
+    return undefined;
+  }
+  const wantsTotal =
+    intentHas(
+      user,
+      "cuantos",
+      "cuantas",
+      "cuanto",
+      "cuanta",
+      "total",
+      "totales",
+      "conteo",
+    ) || /\bhay\b/.test(user);
+  if (!wantsTotal) return undefined;
+
+  const hasAreaCue =
+    intentHas(user, "area", "areas") ||
+    /\b(en|del|de)\b/.test(user);
+  if (!hasAreaCue) return undefined;
+
+  const needle = extractAreaNeedle(userText, inventory);
+  if (!needle) return undefined;
+  // Nombre legible: primer área real que contenga la aguja.
+  const hit = inventory.find((row) =>
+    normalizePlain(String(row.area ?? "")).includes(normalizePlain(needle)),
+  );
+  return hit?.area?.trim() || needle;
+}
+
+/** Confirmaciones / muletillas: no abrir incidencia (no pidieron dato concreto). */
+function isNonConcreteChatAsk(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return true;
+  if (
+    /^(ok|okay|okey|oke|vale|va|sale|bueno|bien|gracias|thanks|thank you|de acuerdo|perfecto|listo|entendido|claro|dale|jaj+|jaja+|jeje+|xd|sip|nop|nel|mmm+|ah+|eh+|si|no)$/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  // Frases cortas de acuse sin pedido de dato.
+  if (
+    n.split(/\s+/).length <= 3 &&
+    /^(ok|okay|okey|vale|gracias|perfecto|listo|entendido|claro|de acuerdo|esta bien|está bien)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Saludos / “qué se puede hacer”: conversación en texto; incidencia solo si aporta. */
+function isExploratoryChatAsk(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return true;
+  if (isNonConcreteChatAsk(userText)) return true;
+  if (
+    /\b(que se puede|que puedes|que puedo|que hacemos|que hay para|que hay de nuevo|el dia de hoy|para que sirves|como te uso|como funciona|en que me ayudas|opciones|gustaria saber|quisiera saber|me ayudas)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  const greetingLed =
+    /^(hola|buenas|buen dia|buenos dias|buenas tardes|buenas noches|hey|saludos)\b/.test(
+      n,
+    );
+  if (!greetingLed) return false;
+  const hasDataAsk = intentHas(
+    n,
+    "etiqueta",
+    "etiquetas",
+    "qr",
+    "codigo",
+    "codigos",
+    "area",
+    "areas",
+    "persona",
+    "personas",
+    "marca",
+    "marcas",
+    "inventario",
+    "recientes",
+    "total",
+    "totales",
+    "cuantos",
+    "cuantas",
+    "activo",
+    "activos",
+    "estado",
+  );
+  return !hasDataAsk;
+}
+
+/**
+ * El usuario pide VER el resultado (panel derecho obligatorio).
+ * No aplica a instrucciones puras (sube/importa/cambia) donde la IA decide.
+ */
+function wantsSidePanelShow(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n || isNonConcreteChatAsk(userText)) return false;
+  if (
+    /\b(lado derecho|panel derecho|visor|a la derecha|en el panel|en el visor)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+
+  const showVerb = intentHas(
+    n,
+    "muestra",
+    "mostrar",
+    "ensena",
+    "ensenar",
+    "ensename",
+    "ver",
+    "dame",
+    "trae",
+    "abre",
+    "abrir",
+    "crea",
+    "crear",
+    "genera",
+    "generar",
+    "haz",
+    "hacer",
+  );
+  if (!showVerb) return false;
+
+  // Instrucción de escritura/carga sin verbo de ver → la IA decide el panel.
+  const actionOnly =
+    intentHas(
+      n,
+      "sube",
+      "subir",
+      "importa",
+      "importar",
+      "carga",
+      "cargar",
+      "cambia",
+      "cambiar",
+      "actualiza",
+      "actualizar",
+      "corrige",
+      "corregir",
+      "restaura",
+      "restaurar",
+    ) &&
+    !intentHas(
+      n,
+      "muestra",
+      "mostrar",
+      "ensename",
+      "ensenar",
+      "ensena",
+      "dame",
+      "ver",
+      "trae",
+      "crea",
+      "crear",
+      "genera",
+      "generar",
+    );
+  if (actionOnly) return false;
+
+  if (/\b\d{3,}\b/.test(n)) return true;
+  if (
+    intentHas(
+      n,
+      "registro",
+      "registros",
+      "etiqueta",
+      "etiquetas",
+      "ficha",
+      "detalle",
+      "articulo",
+      "articulos",
+      "qr",
+      "codigo",
+      "codigos",
+      "resultado",
+      "resultados",
+      "inventario",
+      "area",
+      "areas",
+      "persona",
+      "personas",
+      "recientes",
+      "resumen",
+      "totales",
+      "este",
+      "esta",
+      "ese",
+      "esa",
+      "eso",
+      "aqui",
+    )
+  ) {
+    return true;
+  }
+  // "muéstrame" / "enséñame" / "dame" corto → contexto reciente al panel.
+  return /^(muestra|mostrar|ensename|ensenar|ensena|dame|ver|trae|crea|crear|genera|generar)\b/.test(
+    n,
+  );
+}
+
+/** Pedido de un registro / etiqueta / ficha concreta. */
+function looksLikeRecordLookup(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n || isNonConcreteChatAsk(userText)) return false;
+  if (wantsSidePanelShow(userText)) return true;
+  const hasCode = /\b\d{3,}\b/.test(n) || /\betiqueta\b/.test(n);
+  const asksRecord = intentHas(
+    n,
+    "registro",
+    "registros",
+    "etiqueta",
+    "etiquetas",
+    "articulo",
+    "articulos",
+    "detalle",
+    "ficha",
+    "dame",
+    "ver",
+    "busca",
+    "buscar",
+    "muestra",
+    "mostrar",
+    "ensena",
+    "ensenar",
+    "ensename",
+    "trae",
+    "encuentra",
+    "abre",
+    "abrir",
+    "este",
+    "esta",
+    "ese",
+    "esa",
+  );
+  if (hasCode && asksRecord) return true;
+  if (
+    intentHas(n, "detalle", "ficha", "registro") &&
+    (hasCode ||
+      intentHas(n, "etiqueta", "articulo", "este", "esta", "ese", "esa"))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function hasConcreteInventoryAsk(
+  userText: string,
+  inventory: InventarioRow[],
+) {
+  if (detectAreaTotalAsk(userText, inventory)) return true;
+  if (detectViewerOverview(userText)) return true;
+  if (parseEtiquetaListAsk(userText) != null) return true;
+  if (userAskedQr(userText)) return true;
+  if (looksLikeRecordLookup(userText)) return true;
+  if (wantsSidePanelShow(userText)) return true;
+  return false;
+}
+
+function resolveRecordRowsFromPrompt(
+  userText: string,
+  botText: string,
+  inventory: InventarioRow[],
+  max = 8,
+): InventarioRow[] {
+  if (!inventory.length) return [];
+  const tags = [
+    ...extractEtiquetasFromText(botText),
+    ...extractEtiquetasFromText(userText),
+  ];
+  for (const match of String(userText).matchAll(/\b(\d{3,})\b/g)) {
+    tags.push(match[1]);
+  }
+  for (const match of String(botText).matchAll(
+    /(?:etiqueta|id)\s+\*{0,2}(\d{3,})\*{0,2}/gi,
+  )) {
+    tags.push(match[1]);
+  }
+
+  const rows: InventarioRow[] = [];
+  const seen = new Set<string>();
+  for (const tag of tags) {
+    if (rows.length >= max) break;
+    const needle = String(tag || "")
+      .trim()
+      .toLowerCase();
+    if (!needle) continue;
+    const byEtiqueta = inventory.find(
+      (row) =>
+        String(row.etiqueta ?? "")
+          .trim()
+          .toLowerCase() === needle,
+    );
+    if (byEtiqueta) {
+      const key =
+        byEtiqueta.id != null
+          ? `id:${byEtiqueta.id}`
+          : `etq:${needle}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        rows.push(byEtiqueta);
+      }
+      continue;
+    }
+    if (/^\d+$/.test(needle)) {
+      const id = Number(needle);
+      const byId = inventory.find((row) => Number(row.id) === id);
+      if (byId) {
+        const key = `id:${byId.id}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          rows.push(byId);
+        }
+      }
+    }
+  }
+  return rows;
+}
+
+/** Registro del contexto reciente (memoria / mensajes) cuando no hay código en el prompt. */
+function resolveContextualRecordRows(
+  inventory: InventarioRow[],
+  recentMessages: Array<{ from: string; text: string }>,
+  max = 4,
+): InventarioRow[] {
+  if (!inventory.length) return [];
+  const tags: string[] = [];
+  try {
+    const change = loadChatMemory().lastFieldChange;
+    if (change?.etiqueta) tags.push(String(change.etiqueta));
+    if (change?.id != null) tags.push(String(change.id));
+  } catch {
+    /* noop */
+  }
+  for (let i = recentMessages.length - 1; i >= 0 && tags.length < 8; i -= 1) {
+    const message = recentMessages[i];
+    if (!message.text) continue;
+    tags.push(...extractEtiquetasFromText(message.text));
+    for (const match of message.text.matchAll(/\b(\d{3,})\b/g)) {
+      tags.push(match[1]);
+    }
+  }
+  const fakePrompt = tags.join(" ");
+  if (!fakePrompt.trim()) return [];
+  return resolveRecordRowsFromPrompt(fakePrompt, fakePrompt, inventory, max);
+}
+
+/**
+ * Tip interactivo opcional (no siempre): elige la incidencia más útil
+ * o nada, para no saturar.
+ */
+function pickDiscoveryTip(
+  userText: string,
+): ViewerOverview | undefined {
+  const n = normalizeChatIntent(userText);
+  // Mayoría solo texto; a veces un tip útil a la derecha.
+  if (Math.random() > 0.34) return undefined;
+  if (/\b(hoy|dia|nuev|recient)\b/.test(n)) return "recent";
+  const roll = Math.random();
+  if (roll < 0.4) return "stats";
+  if (roll < 0.7) return "areas";
+  return "recent";
+}
+
+/** Pausa mínima para ver “escribiendo…” (corta; lo lento era el LLM). */
+function assistantTypingDelayMs(reply: string) {
+  const len = String(reply || "").trim().length;
+  return Math.min(700, Math.max(280, 220 + Math.min(len, 160)));
+}
+
+function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
+  const needle = area.trim().toLowerCase();
+  const rows = inventory.filter(
+    (row) => String(row.area ?? "").trim().toLowerCase() === needle,
+  );
+  const personas = new Set(
+    rows.map((row) => String(row.persona ?? "").trim()).filter(Boolean),
+  );
+  const activos = rows.filter((row) => {
+    const v = String(row.estado ?? "")
+      .trim()
+      .toLowerCase();
+    return !(
+      v === "inactivo" ||
+      v === "baja" ||
+      v === "no" ||
+      v === "inactive"
+    );
+  }).length;
+  const n = rows.length;
+  return (
+    `En **${area}** hay **${n}** registro${n === 1 ? "" : "s"}: ` +
+    `**${personas.size}** persona${personas.size === 1 ? "" : "s"} y ` +
+    `**${activos}** activo${activos === 1 ? "" : "s"}.\n\n` +
+    `El detalle está en el visor derecho.\n\n` +
+    `¿Quieres ver los artículos del área, filtrar por persona o generar QR de un lote?`
+  );
+}
+
 function detectViewerOverview(userText: string): ViewerOverview | undefined {
-  // Solo el mensaje del usuario (la respuesta del bot puede listar capacidades).
+  // Solo incidencia visual/contable (estilo Google): no en cada mensaje.
   const user = normalizeChatIntent(userText);
   if (!user || /^(hola|buenas|hey|hi|hello)\b/.test(user)) return undefined;
 
-  // "cuántos registros tiene GARCIA…" / por persona o área → NO es overview global.
+  // "cuántos tiene GARCIA…" → lista de esa persona, no overview global.
   const stop = new Set([
     "cuantos",
     "cuantas",
@@ -302,52 +1322,123 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
     "me",
     "dame",
     "muestra",
+    "mostrar",
     "ver",
     "quiero",
+    "lista",
+    "listar",
     "persona",
     "personas",
     "area",
     "areas",
+    "marca",
+    "marcas",
+    "estado",
+    "activo",
+    "activos",
+    "inactivo",
+    "inactivos",
+    "todas",
+    "todos",
+    "top",
+    "por",
   ]);
   const extraTokens = user
     .split(/\s+/)
-    .map((t) => t.replace(/[^a-z0-9áéíóúñ]/gi, ""))
     .filter((t) => t.length > 1 && !stop.has(t));
   const asksSpecificOwner =
-    (/\b(tiene|tienen)\b/.test(user) && /\bcuant[oa]s?\b/.test(user)) ||
-    (/\bcuant[oa]s?\b/.test(user) && extraTokens.length >= 2);
+    (/\b(tiene|tienen)\b/.test(user) && intentHas(user, "cuantos", "cuantas", "cuanto", "cuanta")) ||
+    (intentHas(user, "cuantos", "cuantas", "cuanto", "cuanta") &&
+      extraTokens.length >= 2);
 
-  // Resumen / inventario general (tolera: generla, genral, "en general", etc.)
+  const askVerb = intentHas(
+    user,
+    "dame",
+    "muestra",
+    "mostrar",
+    "ver",
+    "quiero",
+    "lista",
+    "listar",
+    "ensename",
+    "ensenar",
+  );
+
   if (
-    /\bresumen(\s+en\s+vivo)?\b|\bresumen\s+del\s+inventario\b|\bpanorama\b|\bdashboard\b/.test(
-      user,
-    ) ||
-    (/\binventari[oa]\b|\binventario\b/.test(user) &&
-      /\b(gen\w*|completo|total|todo|general|generla|genral)\b/.test(user)) ||
-    /^(dame|muestra|ver|quiero)\s+(el\s+)?inventari[oa]\s*$/.test(user)
-  ) {
-    return "full";
-  }
-  if (
-    /\bregistros?\s+recientes\b|\bregsitros?\s+recientes\b|\bultimos?\s+registros\b|\bmuestra\s+recientes\b|\bdame\s+(los\s+|lso\s+)?registros?\s+recientes\b|\bdame\s+recientes\b|\bultimos?\s+articulos\b|\brecientes\b/.test(
-      user,
-    )
+    intentHas(user, "recientes", "reciente") ||
+    (intentHas(user, "ultimos", "ultimo") &&
+      intentHas(user, "registros", "registro", "articulos", "articulo"))
   ) {
     return "recent";
   }
+
+  // Ranking de áreas ≠ "registros/etiquetas del área X" (eso es lista de fichas).
+  const wantsRecordsOfArea = intentHas(
+    user,
+    "registro",
+    "registros",
+    "etiqueta",
+    "etiquetas",
+    "articulo",
+    "articulos",
+    "equipo",
+    "equipos",
+  );
   if (
-    /\blista\s+de\s+areas\b|\bcuantas\s+areas\b|\bareas\s+del\s+inventario\b|\btop\s+areas\b|\bdame\s+(las\s+)?areas\b|\bmuestra\s+(las\s+)?areas\b|\bpor\s+area\b|\bdesglose\s+por\s+area\b|\bareas?\s*$/.test(
-      user,
-    ) ||
-    /^(areas?|por\s+areas?)$/.test(user)
+    !wantsRecordsOfArea &&
+    intentHas(user, "areas", "area") &&
+    (askVerb ||
+      intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
+      /^(areas?|por\s+areas?)$/.test(user))
   ) {
     return "areas";
   }
+
   if (
     !asksSpecificOwner &&
-    /\binventario\s+total\b|\btotal\s+del\s+inventario\b|\btotal\s+exacto\b|\bconteo\s+total\b|\bcuantos\s+(articulos|registros|hay)(\s+(hay|en\s+total|en\s+el\s+inventario))?\s*$/.test(
-      user,
-    )
+    intentHas(user, "personas", "persona") &&
+    (askVerb ||
+      intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
+      /^(personas?|por\s+personas?)$/.test(user))
+  ) {
+    return "personas";
+  }
+
+  if (
+    intentHas(user, "estado", "activos", "activo", "inactivos", "inactivo") &&
+    (askVerb ||
+      intentHas(user, "por", "desglose", "cuantos", "cuantas") ||
+      /^(estado|activos|inactivos|por\s+estado)$/.test(user))
+  ) {
+    return "estado";
+  }
+
+  if (
+    intentHas(user, "marcas", "marca") &&
+    (askVerb ||
+      intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
+      /^(marcas?|por\s+marcas?)$/.test(user))
+  ) {
+    return "marcas";
+  }
+
+  if (
+    intentHas(user, "resumen", "panorama", "dashboard") ||
+    (intentHas(user, "inventario", "inventarios") &&
+      intentHas(user, "general", "completo", "total", "totales", "todo", "todos")) ||
+    (/^(dame|muestra|ver|quiero)\s+(el\s+)?inventarios?\s*$/.test(user))
+  ) {
+    return "full";
+  }
+
+  if (
+    !asksSpecificOwner &&
+    (intentHas(user, "conteo") ||
+      (intentHas(user, "total", "totales") &&
+        intentHas(user, "inventario", "inventarios")) ||
+      (intentHas(user, "cuantos", "cuantas") &&
+        intentHas(user, "articulos", "registros", "hay") &&
+        extraTokens.length === 0))
   ) {
     return "stats";
   }
@@ -1690,6 +2781,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [pendingChatImport, setPendingChatImport] = useState<NewInventarioItem[] | null>(
     null,
   );
+  const [pendingFieldRevert, setPendingFieldRevert] = useState<ChatFieldChange | null>(
+    null,
+  );
+  const [pendingChatDeleteRow, setPendingChatDeleteRow] =
+    useState<InventarioRow | null>(null);
+  const [chatDeleteBusy, setChatDeleteBusy] = useState(false);
+  const [chatDropActive, setChatDropActive] = useState(false);
   const [chatQrByMsg, setChatQrByMsg] = useState<Record<number, ChatQrCard[]>>({});
   const [infoOpen, setInfoOpen] = useState(false);
   const [dark, setDark] = useState(true);
@@ -1709,7 +2807,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const activeChatIdRef = useRef<string | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
   const chatRequestGenRef = useRef(0);
+  const pendingChatImportRef = useRef<NewInventarioItem[] | null>(null);
+  const pendingFieldRevertRef = useRef<ChatFieldChange | null>(null);
   const chatStarted = messages.some((message) => message.from === "user");
+  const chatComposerBusy = useMemo(
+    () =>
+      messages.some((message) => {
+        if (message.from !== "bot") return false;
+        const text = String(message.text || "").trim();
+        return /^(consultando el inventario|importando)\b/i.test(text);
+      }),
+    [messages],
+  );
   const hasAnySidePanel = useMemo(
     () => messages.some((message) => messageHasSideData(message)),
     [messages],
@@ -1726,6 +2835,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             : [],
           qrCards: chatQrByMsg[message.id] || [],
           overview: message.viewerOverview,
+          overviewFocus: message.viewerFocus,
         })),
     [messages, chatQrByMsg],
   );
@@ -1788,6 +2898,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const loaded = loadChatSessions();
     setChatSessions(loaded);
     chatHydratedRef.current = true;
+    hydrateMemoryFromChatSessions(loaded, rows.length || items.length);
     const activeId = loadActiveChatId();
     if (!activeId) return;
     const session = loaded.find((item) => item.id === activeId);
@@ -1863,6 +2974,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     addOpen: isAddModalOpen,
     detailId: selectedProduct?.id != null ? Number(selectedProduct.id) : null,
   };
+
+  // Memoria compartida entre chats: snapshot del total actual.
+  useEffect(() => {
+    if (!items.length) return;
+    rememberTotalSnapshot(items.length, {
+      chatId: activeChatIdRef.current,
+      note: `Total inventario en app: ${items.length}`,
+    });
+  }, [items.length]);
 
   // Fusiona props del servidor sin pisar ediciones locales más recientes
   useEffect(() => {
@@ -2564,6 +3684,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           resultItems: ChatApiItem[];
           qr: ChatQrPayload[];
           viewerOverview?: ViewerOverview;
+          viewerFocus?: string;
         }
       | undefined;
     const nextMessages = messages.map((message, index) => {
@@ -2603,6 +3724,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           resultItems,
           qr: undefined,
           viewerOverview: undefined,
+          viewerFocus: undefined,
         };
       }
 
@@ -2610,21 +3732,60 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const botPending = /^consultando el inventario/i.test(
         String(message.text || "").trim(),
       );
+      // Acuses / exploración: no forzar incidencia (salvo tip ya guardado).
+      if (
+        !hasConcreteInventoryAsk(userText, items) &&
+        isExploratoryChatAsk(userText)
+      ) {
+        // No recuperar QR/items basura; deja overview solo si ya venía de tip.
+        if (
+          (Array.isArray(message.qr) && message.qr.length) ||
+          (Array.isArray(message.resultItems) &&
+            message.resultItems.length > 0 &&
+            !message.viewerOverview)
+        ) {
+          changed = true;
+          clearQrMsgIds.push(message.id);
+          lastSide = {
+            resultItems: [],
+            qr: [],
+            viewerOverview: message.viewerOverview,
+            viewerFocus: message.viewerFocus,
+          };
+          return {
+            ...message,
+            resultItems: undefined,
+            qr: undefined,
+          };
+        }
+        return message;
+      }
+
       if (
         !botPending &&
         !message.viewerOverview &&
         !(Array.isArray(message.qr) && message.qr.length) &&
-        etiquetaLimit == null
+        etiquetaLimit == null &&
+        hasConcreteInventoryAsk(userText, items)
       ) {
-        const overview = detectViewerOverview(userText);
+        const focusArea = detectAreaTotalAsk(userText, items);
+        const overview = focusArea
+          ? ("areaTotal" as ViewerOverview)
+          : detectViewerOverview(userText);
         if (overview) {
           changed = true;
-          lastSide = { resultItems: [], qr: [], viewerOverview: overview };
+          lastSide = {
+            resultItems: [],
+            qr: [],
+            viewerOverview: overview,
+            viewerFocus: focusArea,
+          };
           return {
             ...message,
             resultItems: [],
             qr: undefined,
             viewerOverview: overview,
+            viewerFocus: focusArea,
           };
         }
       }
@@ -2634,6 +3795,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (!isQrBotMessage(message)) return message;
       if (Array.isArray(message.qr) && message.qr.length > 0) return message;
       if (message.viewerOverview) return message;
+      if (!userAskedQr(userText)) return message;
       const rows = resolveQrRowsFromPrompt(userText, message.text || "", items);
       if (!rows.length) return message;
       const side = buildQrSideFromRows(rows);
@@ -2683,9 +3845,105 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     /\.(xlsx|xls|csv|txt)$/i.test(name);
 
   const isAffirmativeChat = (value: string) =>
-    /^(sí|si|confirma|confirmo|adelante|ok|dale|importar|hazlo)\b/i.test(
+    /^(sí|si|yes|confirma|confirmo|adelante|ok|okay|okey|vale|dale|claro|listo|de acuerdo|importar|hazlo|procede|proceder)\b/i.test(
       value.trim(),
     );
+
+  const wantsImmediateImport = (value: string) =>
+    /\b(importa|importar|sube|subir|carga|cargar|confirma|confirmar|adelante|hazlo)\b/i.test(
+      value.trim(),
+    );
+
+  const asksChatFileImport = (value: string) =>
+    /\b(importar|subir|cargar|pasa(?:rme)?|adjunt(?:ar|a)?)\b[\s\S]{0,40}\b(excel|csv|archivo|xlsx|xls)\b|\b(excel|csv|xlsx|xls)\b[\s\S]{0,40}\b(importar|subir|cargar|pasar|adjunt)/i.test(
+      value.trim(),
+    );
+
+  const CHAT_IMPORT_CHUNK = 100;
+
+  const setPendingChatImportSafe = (items: NewInventarioItem[] | null) => {
+    pendingChatImportRef.current = items;
+    setPendingChatImport(items);
+  };
+
+  const setPendingFieldRevertSafe = (change: ChatFieldChange | null) => {
+    pendingFieldRevertRef.current = change;
+    setPendingFieldRevert(change);
+  };
+
+  const confirmChatDeleteRecord = async () => {
+    const target = pendingChatDeleteRow;
+    if (!target?.id || chatDeleteBusy) return;
+    setChatDeleteBusy(true);
+    try {
+      const result = await deleteInventarioAction(Number(target.id));
+      if (!result.success) {
+        setChatDeleteBusy(false);
+        setPendingChatDeleteRow(null);
+        const sessionId = activeChatIdRef.current;
+        if (sessionId) {
+          const botId = chatId.current++;
+          const fail =
+            result.error || "No se pudo eliminar el registro.";
+          const next = [
+            ...messagesRef.current,
+            {
+              id: botId,
+              from: "bot" as const,
+              text: fail,
+              at: Date.now(),
+            },
+          ];
+          messagesRef.current = next;
+          setMessages(next);
+          upsertChatSession(sessionId, next);
+        }
+        return;
+      }
+      const totalBefore = items.length;
+      setItems((prev) => prev.filter((row) => Number(row.id) !== Number(target.id)));
+      if (selectedProduct?.id != null && Number(selectedProduct.id) === Number(target.id)) {
+        setSelectedProduct(null);
+      }
+      rememberMutation({
+        kind: "delete",
+        summary: `Eliminé etiqueta ${target.etiqueta || target.id}`,
+        totalBefore,
+        totalAfter: Math.max(0, totalBefore - 1),
+        count: 1,
+        ids: [Number(target.id)],
+        chatId: activeChatIdRef.current,
+        fact: `Eliminado: ${target.etiqueta || target.id} (${target.articulo || "sin artículo"})`,
+      });
+      const label =
+        String(target.etiqueta ?? "").trim() || `ID ${target.id}`;
+      const ok =
+        `Listo: eliminé **${label}**${
+          target.articulo ? ` — ${target.articulo}` : ""
+        } del inventario.`;
+      const sessionId = activeChatIdRef.current;
+      if (sessionId) {
+        const botId = chatId.current++;
+        const next = [
+          ...messagesRef.current,
+          {
+            id: botId,
+            from: "bot" as const,
+            text: ok,
+            at: Date.now(),
+            resultItems: [],
+            qr: [],
+          },
+        ];
+        messagesRef.current = next;
+        setMessages(next);
+        upsertChatSession(sessionId, next);
+      }
+    } finally {
+      setChatDeleteBusy(false);
+      setPendingChatDeleteRow(null);
+    }
+  };
 
   const finishBotReply = (
     sessionId: string,
@@ -2695,6 +3953,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       resultItems?: ChatApiItem[];
       qr?: ChatQrPayload[];
       viewerOverview?: ViewerOverview;
+      viewerFocus?: string;
     },
   ) => {
     const finalMessages = messagesRef.current.map((m) =>
@@ -2708,6 +3967,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   resultItems: side.resultItems || [],
                   qr: side.qr || [],
                   viewerOverview: side.viewerOverview,
+                  viewerFocus: side.viewerFocus,
                 }
               : null),
           }
@@ -2744,9 +4004,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     void sendChat(text);
   };
 
-  const sendChat = async (value: string) => {
+  const sendChat = async (
+    value: string,
+    attachOverride?: {
+      kind: "image" | "file";
+      name: string;
+      file?: File;
+    } | null,
+  ) => {
     const text = value.trim();
-    const attach = pendingAttach;
+    const attach =
+      attachOverride !== undefined ? attachOverride : pendingAttach;
     if (!text && !attach) return;
     const userId = chatId.current++;
     const botId = chatId.current++;
@@ -2802,14 +4070,21 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       });
     }
 
-    const history = cleaned
+    const currentHistory = cleaned
       .filter((m) => m.text.trim() && !isTypingBot(m))
-      .slice(-6)
+      .slice(-8)
       .map((m) => ({
         role: (m.from === "user" ? "user" : "assistant") as "user" | "assistant",
         content:
           m.text.length > 500 ? `${m.text.slice(0, 499)}…` : m.text,
       }));
+    const crossHistory = buildCrossChatHistorySnippet(
+      chatSessions,
+      sessionId,
+      2,
+      2,
+    );
+    const history = [...crossHistory, ...currentHistory].slice(-10);
 
     const pendingMessages: ChatMessage[] = [
       ...cleaned,
@@ -2824,36 +4099,288 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     messagesRef.current = pendingMessages;
     setMessages(pendingMessages);
     upsertChatSession(sessionId, pendingMessages);
+    const typingStartedAt = Date.now();
+    const ensureTypingPause = async (replyText: string) => {
+      const wait =
+        assistantTypingDelayMs(replyText) - (Date.now() - typingStartedAt);
+      if (wait > 0) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = window.setTimeout(resolve, wait);
+          const onAbort = () => {
+            window.clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+          };
+          if (controller.signal.aborted) {
+            onAbort();
+            return;
+          }
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      if (
+        requestGen !== chatRequestGenRef.current ||
+        controller.signal.aborted
+      ) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+    };
 
-    // Confirmar importación Excel/CSV pendiente
-    if (pendingChatImport?.length && isAffirmativeChat(text)) {
+    const runBulkChatImport = async (
+      rows: NewInventarioItem[],
+      sourceLabel: string,
+    ) => {
+      setPendingChatImportSafe(null);
+      const saved: InventarioRow[] = [];
+      let lastError = "";
+      const total = rows.length;
+      for (let i = 0; i < rows.length; i += CHAT_IMPORT_CHUNK) {
+        if (
+          requestGen !== chatRequestGenRef.current ||
+          controller.signal.aborted
+        ) {
+          throw new DOMException("Aborted", "AbortError");
+        }
+        const chunk = rows.slice(i, i + CHAT_IMPORT_CHUNK);
+        const done = Math.min(i + chunk.length, total);
+        const progressText =
+          total > CHAT_IMPORT_CHUNK
+            ? `Importando “${sourceLabel}”… ${done}/${total}`
+            : `Importando “${sourceLabel}”…`;
+        const progressing = messagesRef.current.map((m) =>
+          m.id === botId ? { ...m, text: progressText, at: Date.now() } : m,
+        );
+        messagesRef.current = progressing;
+        setMessages(progressing);
+
+        const result = await addInventarioBulkAction(chunk);
+        if (result.success && result.data?.length) {
+          saved.push(...result.data);
+        } else if (result.error) {
+          lastError = result.error;
+          if (!saved.length) break;
+        }
+      }
+
+      if (!saved.length) {
+        const failText = lastError || "No se pudo importar el archivo.";
+        await ensureTypingPause(failText);
+        finishBotReply(sessionId, botId, failText);
+        return;
+      }
+
+      const totalBefore = items.length;
+      const stamp = new Date().toISOString();
+      setItems((prev) => [
+        ...saved.map((row) => ({ ...row, updated_at: stamp })),
+        ...prev,
+      ]);
+      const totalAfter = totalBefore + saved.length;
+      rememberMutation({
+        kind: "import",
+        summary: `Importé ${saved.length} artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”`,
+        totalBefore,
+        totalAfter,
+        count: saved.length,
+        ids: saved.map((row) => row.id).filter((id): id is number => id != null),
+        chatId: sessionId,
+        fact: `Import “${sourceLabel}”: +${saved.length} (antes ${totalBefore} → ahora ${totalAfter})`,
+      });
+      const skipped = total - saved.length;
+      const skipNote =
+        skipped > 0
+          ? `\n${skipped} fila${skipped === 1 ? "" : "s"} no se importaron (duplicados u error).`
+          : "";
+      const finalReply =
+        `Listo: importé **${saved.length}** artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”.\n` +
+        `Inventario: **${totalBefore}** → **${totalAfter}** registros.${skipNote}\n\n` +
+        `Te dejé el inventario general en el panel derecho (totales, áreas y recientes).`;
+
+      // Efecto “escribiendo…” al cerrar (el import largo ya gastó la pausa inicial).
+      const wrapping = messagesRef.current.map((m) =>
+        m.id === botId
+          ? { ...m, text: "Consultando el inventario…", at: Date.now() }
+          : m,
+      );
+      messagesRef.current = wrapping;
+      setMessages(wrapping);
+      await new Promise<void>((resolve, reject) => {
+        const wait = assistantTypingDelayMs(finalReply);
+        const timer = window.setTimeout(resolve, wait);
+        const onAbort = () => {
+          window.clearTimeout(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+        };
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+      });
+      if (
+        requestGen !== chatRequestGenRef.current ||
+        controller.signal.aborted
+      ) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+
+      finishBotReply(sessionId, botId, finalReply, {
+        resultItems: [],
+        qr: [],
+        viewerOverview: "full",
+      });
+    };
+
+    // Confirmar restauración del valor anterior de un campo
+    const pendingRevert =
+      pendingFieldRevertRef.current || pendingFieldRevert;
+    if (pendingRevert && isAffirmativeChat(text)) {
       try {
-        const result = await addInventarioBulkAction(pendingChatImport);
-        setPendingChatImport(null);
-        if (!result.success || !result.data?.length) {
+        let targetId = pendingRevert.id != null ? Number(pendingRevert.id) : null;
+        if (targetId == null && pendingRevert.etiqueta) {
+          const row = items.find(
+            (item) =>
+              String(item.etiqueta ?? "")
+                .trim()
+                .toLowerCase() ===
+              String(pendingRevert.etiqueta)
+                .trim()
+                .toLowerCase(),
+          );
+          targetId = row?.id != null ? Number(row.id) : null;
+        }
+        if (targetId == null) {
+          setPendingFieldRevertSafe(null);
           finishBotReply(
             sessionId,
             botId,
-            result.error || "No se pudo importar el archivo.",
+            "No pude ubicar el registro para restaurar el valor. Dime la etiqueta exacta.",
+          );
+          return;
+        }
+        const patch: Partial<NewInventarioItem> = {
+          [pendingRevert.field]: pendingRevert.oldValue,
+        } as Partial<NewInventarioItem>;
+        const result = await updateInventarioAction(targetId, patch);
+        setPendingFieldRevertSafe(null);
+        if (!result.success || !result.data) {
+          finishBotReply(
+            sessionId,
+            botId,
+            result.error || "No se pudo restaurar el valor anterior.",
           );
           return;
         }
         const stamp = new Date().toISOString();
-        setItems((prev) => [
-          ...result.data!.map((row) => ({ ...row, updated_at: stamp })),
-          ...prev,
-        ]);
+        setItems((prev) =>
+          prev.map((row) =>
+            Number(row.id) === targetId
+              ? { ...row, ...result.data!, updated_at: stamp }
+              : row,
+          ),
+        );
+        rememberFieldChange({
+          id: result.data.id,
+          etiqueta: result.data.etiqueta,
+          articulo: result.data.articulo,
+          field: pendingRevert.field,
+          oldValue: pendingRevert.newValue,
+          newValue: pendingRevert.oldValue,
+          chatId: sessionId,
+        });
+        const label =
+          result.data.etiqueta || String(result.data.id ?? targetId);
+        const finalReply =
+          `Listo: restauré **${pendingRevert.field}** de “**${pendingRevert.newValue}**” a “**${pendingRevert.oldValue}**” en **${label}**.`;
+        await ensureTypingPause(finalReply);
+        finishBotReply(sessionId, botId, finalReply, {
+          resultItems: [rowToChatApiItem(result.data)],
+          qr: [],
+        });
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setPendingFieldRevertSafe(null);
         finishBotReply(
           sessionId,
           botId,
-          `Listo: importé ${result.data.length} artículo${result.data.length === 1 ? "" : "s"} al inventario.`,
-          {
-            resultItems: result.data.slice(0, 12).map((row) => rowToChatApiItem(row)),
-            qr: [],
-          },
+          err instanceof Error ? err.message : "Error al restaurar el valor.",
         );
+      }
+      return;
+    }
+
+    // Eliminar registro → aviso modal (mismo estilo que borrar chat)
+    if (looksLikeDeleteRecordAsk(userText || text)) {
+      try {
+        let target =
+          resolveRecordRowsFromPrompt(userText || text, "", items, 1)[0] ||
+          resolveContextualRecordRows(
+            items,
+            messagesRef.current.map((m) => ({
+              from: m.from,
+              text: m.text || "",
+            })),
+            1,
+          )[0] ||
+          null;
+        if (!target) {
+          const ask =
+            "Claro. Para eliminar necesito la **etiqueta** (o el id) del registro.\n\n" +
+            "Ejemplo: `elimina la etiqueta 310285`.\n\n" +
+            "Siempre te pediré confirmación antes de borrarlo.";
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        }
+        setPendingChatDeleteRow(target);
+        const label =
+          String(target.etiqueta ?? "").trim() ||
+          (target.id != null ? `ID ${target.id}` : "el registro");
+        const art = String(target.articulo ?? "").trim();
+        const replyText =
+          `Voy a eliminar **${label}**${art ? ` — ${art}` : ""}.\n\n` +
+          `Confirma en el aviso: **Borrar** para continuar o **Cancelar** para dejarlo.`;
+        await ensureTypingPause(replyText);
+        finishBotReply(sessionId, botId, replyText, {
+          resultItems: [rowToChatApiItem(target)],
+          qr: [],
+        });
+      } catch {
+        /* abort */
+      }
+      return;
+    }
+
+    // Pedir restaurar el nombre/valor de antes → propuesta con memoria
+    if (looksLikeRevertPreviousValue(text)) {
+      const mem = ensureLastFieldChangeFromMessages(
+        messagesRef.current.map((m) => ({
+          from: m.from,
+          text: m.text || "",
+        })),
+      );
+      const proposal = buildRevertProposalReply(mem);
+      if (mem.lastFieldChange) {
+        setPendingFieldRevertSafe(mem.lastFieldChange);
+      }
+      try {
+        await ensureTypingPause(proposal || "");
+        finishBotReply(sessionId, botId, proposal || "No tengo ese cambio en memoria.");
+      } catch {
+        /* abort */
+      }
+      return;
+    }
+
+    // Confirmar importación Excel/CSV pendiente
+    const pendingRows = pendingChatImportRef.current?.length
+      ? pendingChatImportRef.current
+      : pendingChatImport;
+    if (pendingRows?.length && isAffirmativeChat(text)) {
+      try {
+        await runBulkChatImport(pendingRows, "archivo pendiente");
       } catch (err: unknown) {
-        setPendingChatImport(null);
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setPendingChatImportSafe(null);
         finishBotReply(
           sessionId,
           botId,
@@ -2863,7 +4390,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
-    // Adjuntar Excel/CSV → vista previa y pedir confirmación
+    // Adjuntar Excel/CSV → parsear; importar ya o pedir confirmación
     if (attach?.file && isSpreadsheetName(attach.name)) {
       try {
         const origen =
@@ -2872,6 +4399,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             : "S/O";
         const parsed = await parseInventarioImportFile(attach.file, origen);
         if (!parsed.items.length) {
+          setPendingChatImportSafe(null);
           finishBotReply(
             sessionId,
             botId,
@@ -2879,7 +4407,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           );
           return;
         }
-        setPendingChatImport(parsed.items);
+        if (wantsImmediateImport(text)) {
+          await runBulkChatImport(parsed.items, attach.name);
+          return;
+        }
+        setPendingChatImportSafe(parsed.items);
         const sample = parsed.items
           .slice(0, 5)
           .map((item) => `• ${item.etiqueta} — ${item.articulo}`)
@@ -2891,9 +4423,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         finishBotReply(
           sessionId,
           botId,
-          `Leí ${parsed.items.length} fila${parsed.items.length === 1 ? "" : "s"} de “${attach.name}” (origen ${origen}).\n${sample}${more}\n\n¿Confirmas importarlas? Responde sí.`,
+          `Leí ${parsed.items.length} fila${parsed.items.length === 1 ? "" : "s"} de “${attach.name}” (origen ${origen}).\n${sample}${more}\n\n¿Confirmas importarlas todas? Responde sí (o escribe importar).`,
         );
       } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setPendingChatImportSafe(null);
         finishBotReply(
           sessionId,
           botId,
@@ -2905,12 +4439,75 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
+    // Pedir Excel/CSV sin adjunto → guía del clip en este chat
+    if (!attach && asksChatFileImport(userText || text)) {
+      finishBotReply(
+        sessionId,
+        botId,
+        "Para subir el Excel o CSV aquí en el chat: pulsa + → «Excel / CSV» (o arrástralo al cuadro). El archivo se queda adjunto; cuando quieras, pulsa enviar. Luego te muestro la vista previa y pido confirmación antes de cargar todas las filas.",
+      );
+      return;
+    }
+
     let reply = "Sin respuesta del asistente.";
     let sideItems: ChatApiItem[] = [];
     let mutated = false;
     let qrPayloads: ChatQrPayload[] = [];
+
+    // Memoria compartida: “cuántos había antes”, continuidad entre chats.
+    const memoryBeforeReply = answerFromMemoryAboutBefore(userText || text);
+    if (memoryBeforeReply) {
+      try {
+        await ensureTypingPause(memoryBeforeReply);
+        finishBotReply(sessionId, botId, memoryBeforeReply);
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+      return;
+    }
+
+    // Total de un área: respuesta + incidencia locales (exacto, con pausa de tipeo).
+    const earlyArea = detectAreaTotalAsk(userText || text, items);
+    if (earlyArea) {
+      try {
+        const localReply = buildAreaTotalReply(earlyArea, items);
+        await ensureTypingPause(localReply);
+        finishBotReply(sessionId, botId, localReply, {
+          resultItems: [],
+          qr: [],
+          viewerOverview: "areaTotal",
+          viewerFocus: earlyArea,
+        });
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+      return;
+    }
+
+    // Lista de registros/etiquetas de un área → local (tablita, no ranking de áreas).
+    const earlyAreaList = detectAreaListAsk(userText || text, items);
+    if (earlyAreaList) {
+      try {
+        const rows = rowsForAreaNeedle(
+          items,
+          earlyAreaList.area,
+          earlyAreaList.limit,
+        );
+        const localReply = buildAreaListReply(earlyAreaList.area, rows);
+        await ensureTypingPause(localReply);
+        finishBotReply(sessionId, botId, localReply, {
+          resultItems: rows.map((row) => rowToChatApiItem(row)),
+          qr: [],
+        });
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+      return;
+    }
+
     const data = await askInventoryChat(userText || text, history, {
       signal: controller.signal,
+      memory: formatChatMemoryForPrompt(),
     });
     if (
       requestGen !== chatRequestGenRef.current ||
@@ -2924,9 +4521,61 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     mutated = Boolean(data.mutated);
     qrPayloads = data.qr || [];
 
-    // Etiquetas ≠ QR: listar N etiquetas sin botón/códigos QR.
-    const etiquetaLimit = parseEtiquetaListAsk(userText || text);
-    const wantsQr = userAskedQr(userText || text);
+    // Solo incidencia si el pedido es concreto o hubo escritura; saludos → texto (± tip).
+    const forceSidePanel = wantsSidePanelShow(userText || text);
+    const concreteAsk =
+      hasConcreteInventoryAsk(userText || text, items) || forceSidePanel;
+    const exploratoryAsk =
+      !concreteAsk && !mutated && isExploratoryChatAsk(userText || text);
+    if (!concreteAsk && !mutated) {
+      sideItems = [];
+      qrPayloads = [];
+    } else if (
+      !sideItems.length &&
+      !qrPayloads.length &&
+      (looksLikeRecordLookup(userText || text) ||
+        forceSidePanel ||
+        mutated) &&
+      items.length
+    ) {
+      // Recuperar ficha en el visor (prompt, reply o contexto reciente).
+      let recovered = resolveRecordRowsFromPrompt(
+        userText || text,
+        reply,
+        items,
+      );
+      if (!recovered.length) {
+        recovered = resolveContextualRecordRows(
+          items,
+          messagesRef.current.map((m) => ({
+            from: m.from,
+            text: m.text || "",
+          })),
+        );
+      }
+      sideItems = recovered.map((row) => rowToChatApiItem(row));
+    }
+
+    // Pedido de VER: si aún no hay items, armar overview acertado (inventario/áreas…).
+    let forcedOverview: ViewerOverview | undefined;
+    if (
+      forceSidePanel &&
+      !sideItems.length &&
+      !qrPayloads.length &&
+      !userAskedQr(userText || text)
+    ) {
+      forcedOverview =
+        detectViewerOverview(userText || text) ||
+        (intentHas(normalizeChatIntent(userText || text), "inventario", "resumen", "totales", "general")
+          ? "full"
+          : undefined);
+    }
+
+    // Etiquetas ≠ QR: listar exactamente lo pedido (o todas las del filtro si hay menos).
+    const etiquetaLimit = concreteAsk
+      ? parseEtiquetaListAsk(userText || text)
+      : null;
+    const wantsQr = concreteAsk && userAskedQr(userText || text);
 
     if (etiquetaLimit != null) {
       if (!sideItems.length && qrPayloads.length) {
@@ -2946,16 +4595,42 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         }));
       }
       qrPayloads = [];
-      if (sideItems.length < etiquetaLimit && items.length) {
-        const seen = new Set(
-          sideItems.map((item) =>
+      const areaFilter = matchAreaFromPrompt(userText || text, items);
+      const areaNorm = areaFilter ? normalizeChatIntent(areaFilter) : "";
+      const pool = areaFilter
+        ? items.filter(
+            (row) =>
+              normalizeChatIntent(String(row.area ?? "")) === areaNorm ||
+              normalizeChatIntent(String(row.area ?? "")).includes(areaNorm) ||
+              areaNorm.includes(normalizeChatIntent(String(row.area ?? ""))),
+          )
+        : items;
+      // Preferir coincidencias del área: reconstruir lista limpia desde el pool.
+      if (pool.length) {
+        const seen = new Set<string>();
+        const filled: ChatApiItem[] = [];
+        for (const item of sideItems) {
+          if (filled.length >= etiquetaLimit) break;
+          const key =
             item.id != null
               ? `id:${item.id}`
-              : `etq:${String(item.etiqueta ?? "").toLowerCase()}`,
-          ),
-        );
-        for (const row of items) {
-          if (sideItems.length >= etiquetaLimit) break;
+              : `etq:${String(item.etiqueta ?? "").toLowerCase()}`;
+          if (seen.has(key)) continue;
+          if (areaFilter) {
+            const itemArea = normalizeChatIntent(String(item.area ?? ""));
+            if (
+              itemArea !== areaNorm &&
+              !itemArea.includes(areaNorm) &&
+              !areaNorm.includes(itemArea)
+            ) {
+              continue;
+            }
+          }
+          seen.add(key);
+          filled.push(item);
+        }
+        for (const row of pool) {
+          if (filled.length >= etiquetaLimit) break;
           const key =
             row.id != null
               ? `id:${row.id}`
@@ -2963,10 +4638,16 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           if (seen.has(key)) continue;
           if (!String(row.etiqueta ?? "").trim()) continue;
           seen.add(key);
-          sideItems.push(rowToChatApiItem(row));
+          filled.push(rowToChatApiItem(row));
         }
+        // Sentido común: si pidió 13 y hay 10, entrega las 10.
+        sideItems = filled.slice(
+          0,
+          Math.min(etiquetaLimit, filled.length || etiquetaLimit),
+        );
+      } else {
+        sideItems = sideItems.slice(0, etiquetaLimit);
       }
-      sideItems = sideItems.slice(0, etiquetaLimit);
     }
 
     // Si el usuario pidió QR/códigos y el backend no mandó payloads, armarlos.
@@ -3024,13 +4705,58 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       });
     }
 
-    // Incidencias del visor: QR ≠ resumen. Prioriza lo que pidió el usuario.
-    const askedOverview = detectViewerOverview(userText || text);
-    const overview = qrPayloads.length ? undefined : askedOverview;
-    // Si pidió resumen, no mezclar lista de búsqueda en el panel.
+    // Incidencias: concreto → panel pedido; mutación → etiqueta; VER → obligatorio; tip si explora.
+    const areaListAsk = detectAreaListAsk(userText || text, items);
+    if (areaListAsk && !sideItems.length && !qrPayloads.length) {
+      sideItems = rowsForAreaNeedle(
+        items,
+        areaListAsk.area,
+        areaListAsk.limit,
+      ).map((row) => rowToChatApiItem(row));
+    }
+    const focusArea = concreteAsk
+      ? detectAreaTotalAsk(userText || text, items)
+      : undefined;
+    let askedOverview: ViewerOverview | undefined = mutated || areaListAsk
+      ? undefined
+      : concreteAsk
+        ? focusArea
+          ? "areaTotal"
+          : detectViewerOverview(userText || text) || forcedOverview
+        : exploratoryAsk
+          ? pickDiscoveryTip(userText || text)
+          : forcedOverview;
+    // Si hay etiqueta/QR / lista de área, no tapar con ranking de Áreas.
+    const overview =
+      qrPayloads.length ||
+      (mutated && sideItems.length) ||
+      Boolean(areaListAsk && sideItems.length) ||
+      (sideItems.length &&
+        (forceSidePanel || looksLikeRecordLookup(userText || text)) &&
+        !forcedOverview)
+        ? undefined
+        : askedOverview || forcedOverview;
+    const viewerFocus =
+      overview === "areaTotal" && focusArea ? focusArea : undefined;
     if (overview) {
       sideItems = [];
       qrPayloads = [];
+    }
+    if (
+      overview &&
+      exploratoryAsk &&
+      !/\bvisor|panel derecho|derecha\b/i.test(reply)
+    ) {
+      reply =
+        `${reply}\n\nTe dejé un vistazo rápido en el panel derecho por si quieres explorar.`.trim();
+    }
+    if (mutated) {
+      reply = reply
+        .replace(
+          /\n*\s*Te dejé un vistazo rápido en el panel derecho por si quieres explorar\.?\s*/gi,
+          "\n",
+        )
+        .trim();
     }
     const hasNewSide =
       sideItems.length > 0 || qrPayloads.length > 0 || Boolean(overview);
@@ -3044,6 +4770,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
     if (mutated && sideItems.length) {
       const stamp = new Date().toISOString();
+      const totalBefore = items.length;
+      const existingIds = new Set(
+        items
+          .map((row) => (row.id != null ? Number(row.id) : null))
+          .filter((id): id is number => id != null),
+      );
+      const createdIds: number[] = [];
+      const updatedIds: number[] = [];
+      for (const item of sideItems) {
+        if (item.id == null) continue;
+        const id = Number(item.id);
+        if (existingIds.has(id)) updatedIds.push(id);
+        else createdIds.push(id);
+      }
       setItems((prev) => {
         const next = [...prev];
         for (const item of sideItems) {
@@ -3070,23 +4810,83 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         }
         return next;
       });
+      if (createdIds.length) {
+        rememberMutation({
+          kind: "create",
+          summary: `Alta de ${createdIds.length} artículo${createdIds.length === 1 ? "" : "s"} por chat`,
+          totalBefore,
+          totalAfter: totalBefore + createdIds.length,
+          count: createdIds.length,
+          ids: createdIds,
+          chatId: sessionId,
+        });
+      } else if (updatedIds.length) {
+        rememberMutation({
+          kind: "update",
+          summary: `Actualicé ${updatedIds.length} registro${updatedIds.length === 1 ? "" : "s"} por chat`,
+          totalBefore,
+          totalAfter: totalBefore,
+          count: updatedIds.length,
+          ids: updatedIds,
+          chatId: sessionId,
+        });
+        for (const id of updatedIds) {
+          const before = items.find((row) => Number(row.id) === id);
+          const after = sideItems.find((item) => Number(item.id) === id);
+          if (!before || !after) continue;
+          const fields: Array<keyof InventarioRow> = [
+            "persona",
+            "area",
+            "articulo",
+            "marca",
+            "modelo",
+            "serie",
+            "estado",
+            "etiqueta",
+            "observaciones",
+          ];
+          for (const field of fields) {
+            const oldValue = String(before[field] ?? "").trim();
+            const newValue = String(after[field] ?? "").trim();
+            if (oldValue === newValue) continue;
+            rememberFieldChange({
+              id,
+              etiqueta: after.etiqueta ?? before.etiqueta,
+              articulo: after.articulo ?? before.articulo,
+              field,
+              oldValue: oldValue || "(vacío)",
+              newValue: newValue || "(vacío)",
+              chatId: sessionId,
+            });
+            break;
+          }
+        }
+      }
     }
 
     // Chat: primero la incidencia (texto); la tabla va al visor o al final del mensaje.
     const chatReply = overview
       ? stripChatMarkdownTables(reply)
       : reorderChatProseThenTable(reply);
+    const finalReply = chatReply || reply;
+
+    try {
+      await ensureTypingPause(finalReply);
+    } catch {
+      return;
+    }
 
     finishBotReply(
       sessionId,
       botId,
-      chatReply || reply,
+      finalReply,
       hasNewSide
         ? {
             // Si hay resumen/overview, no mandar items: el visor muestra la tabla.
             resultItems: overview ? [] : sideItems,
             qr: qrPayloads,
             viewerOverview: overview,
+            viewerFocus,
           }
         : undefined,
     );
@@ -4074,127 +5874,210 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                     </div>
                   )}
                 </div>
-                <div className="chat-composer-dock">
-                  {pendingAttach ? (
-                    <div className="chat-attach-chip">
-                      {pendingAttach.kind === "image" ? (
-                        <ImagePlus size={14} aria-hidden="true" />
-                      ) : (
-                        <Paperclip size={14} aria-hidden="true" />
-                      )}
-                      <span>{pendingAttach.name}</span>
-                      <button
-                        type="button"
-                        aria-label="Quitar archivo"
-                        onClick={() => setPendingAttach(null)}
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ) : null}
+                <div
+                  className={
+                    chatDropActive
+                      ? "chat-composer-dock is-drop-active"
+                      : "chat-composer-dock"
+                  }
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setChatDropActive(true);
+                  }}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setChatDropActive(true);
+                  }}
+                  onDragLeave={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (
+                      !event.currentTarget.contains(event.relatedTarget as Node)
+                    ) {
+                      setChatDropActive(false);
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setChatDropActive(false);
+                    const file = event.dataTransfer.files?.[0];
+                    if (!file) return;
+                    if (file.type.startsWith("image/")) {
+                      setPendingAttach({
+                        kind: "image",
+                        name: file.name,
+                        file,
+                      });
+                      return;
+                    }
+                    setPendingAttach({
+                      kind: "file",
+                      name: file.name,
+                      file,
+                    });
+                  }}
+                >
                   <form
-                    className="chat-composer is-docked"
+                    className={[
+                      "chat-composer",
+                      "is-docked",
+                      pendingAttach ? "has-attach" : "",
+                      chatComposerBusy ? "is-loading" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
                     onSubmit={(event) => {
                       event.preventDefault();
                       if (!draft.trim() && !pendingAttach) return;
                       void sendChat(draft);
                     }}
                   >
-                    <div className="chat-attach-wrap" ref={chatAttachRef}>
-                      <input
-                        ref={chatImageInputRef}
-                        type="file"
-                        accept="image/*"
-                        hidden
-                        onChange={(event) => {
-                          const file = event.target.files?.[0];
-                          if (file) {
-                            setPendingAttach({
-                              kind: "image",
-                              name: file.name,
-                              file,
-                            });
-                            setAttachMenuOpen(false);
+                    {pendingAttach ? (
+                      <div className="chat-attach-preview">
+                        <span
+                          className={
+                            pendingAttach.kind === "image"
+                              ? "chat-attach-preview-icon is-image"
+                              : "chat-attach-preview-icon is-sheet"
                           }
-                          event.target.value = "";
-                        }}
-                      />
-                      <input
-                        ref={chatFileInputRef}
-                        type="file"
-                        accept=".csv,.txt,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        hidden
-                        onChange={(event) => {
-                          const file = event.target.files?.[0];
-                          if (file) {
-                            setPendingAttach({
-                              kind: "file",
-                              name: file.name,
-                              file,
-                            });
-                            setAttachMenuOpen(false);
-                          }
-                          event.target.value = "";
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className={
-                          attachMenuOpen
-                            ? "chat-composer-icon is-active"
-                            : "chat-composer-icon"
-                        }
-                        aria-label="Adjuntar"
-                        aria-expanded={attachMenuOpen}
-                        aria-haspopup="menu"
-                        title="Adjuntar"
-                        onClick={() => setAttachMenuOpen((open) => !open)}
-                      >
-                        <Plus size={18} strokeWidth={2} />
-                      </button>
-                      {attachMenuOpen ? (
-                        <div className="chat-attach-menu" role="menu">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            className="chat-attach-option"
-                            onClick={() => chatImageInputRef.current?.click()}
-                          >
-                            <ImagePlus size={18} strokeWidth={1.8} aria-hidden="true" />
-                            <span>Agregar imágenes</span>
-                          </button>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            className="chat-attach-option"
-                            onClick={() => chatFileInputRef.current?.click()}
-                          >
-                            <Paperclip size={18} strokeWidth={1.8} aria-hidden="true" />
-                            <span>Excel / CSV</span>
-                          </button>
+                          aria-hidden="true"
+                        >
+                          {pendingAttach.kind === "image" ? (
+                            <ImagePlus size={18} strokeWidth={1.8} />
+                          ) : (
+                            <FileSpreadsheet size={18} strokeWidth={1.8} />
+                          )}
+                        </span>
+                        <div className="chat-attach-preview-meta">
+                          <span className="chat-attach-preview-name">
+                            {pendingAttach.name}
+                          </span>
+                          <span className="chat-attach-preview-kind">
+                            {pendingAttach.kind === "image"
+                              ? "Imagen · lista para enviar"
+                              : /\.csv$/i.test(pendingAttach.name)
+                                ? "CSV · listo para enviar"
+                                : "Excel · listo para enviar"}
+                          </span>
                         </div>
-                      ) : null}
+                        <button
+                          type="button"
+                          className="chat-attach-preview-remove"
+                          aria-label="Quitar archivo"
+                          onClick={() => setPendingAttach(null)}
+                        >
+                          <X size={15} strokeWidth={2} />
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="chat-composer-row">
+                      <div className="chat-attach-wrap" ref={chatAttachRef}>
+                        <input
+                          ref={chatImageInputRef}
+                          type="file"
+                          accept="image/*"
+                          hidden
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file) {
+                              setPendingAttach({
+                                kind: "image",
+                                name: file.name,
+                                file,
+                              });
+                              setAttachMenuOpen(false);
+                            }
+                            event.target.value = "";
+                          }}
+                        />
+                        <input
+                          ref={chatFileInputRef}
+                          type="file"
+                          accept=".csv,.txt,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                          hidden
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file) {
+                              setPendingAttach({
+                                kind: "file",
+                                name: file.name,
+                                file,
+                              });
+                              setAttachMenuOpen(false);
+                            }
+                            event.target.value = "";
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className={
+                            attachMenuOpen
+                              ? "chat-composer-icon is-active"
+                              : "chat-composer-icon"
+                          }
+                          aria-label="Adjuntar Excel o CSV"
+                          aria-expanded={attachMenuOpen}
+                          aria-haspopup="menu"
+                          title="Adjuntar Excel / CSV"
+                          onClick={() => setAttachMenuOpen((open) => !open)}
+                        >
+                          <Plus size={18} strokeWidth={2} />
+                        </button>
+                        {attachMenuOpen ? (
+                          <div className="chat-attach-menu" role="menu">
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="chat-attach-option"
+                              onClick={() => chatImageInputRef.current?.click()}
+                            >
+                              <ImagePlus size={18} strokeWidth={1.8} aria-hidden="true" />
+                              <span>Agregar imágenes</span>
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="chat-attach-option"
+                              onClick={() => chatFileInputRef.current?.click()}
+                            >
+                              <Paperclip size={18} strokeWidth={1.8} aria-hidden="true" />
+                              <span>Excel / CSV</span>
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                      <input
+                        value={draft}
+                        onChange={(event) => setDraft(event.target.value)}
+                        placeholder={
+                          pendingAttach
+                            ? "Añade un mensaje o envía el archivo…"
+                            : "Pregunta o arrastra un Excel/CSV"
+                        }
+                        aria-label="Mensaje para el asistente"
+                      />
+                      {draft.trim() || pendingAttach ? (
+                        <button
+                          type="submit"
+                          className="chat-composer-send is-icon"
+                          aria-label="Enviar"
+                        >
+                          <ArrowUpRight size={17} aria-hidden="true" />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="chat-composer-icon"
+                          aria-label="Dictar"
+                          title="Dictar"
+                        >
+                          <Mic size={18} strokeWidth={1.8} />
+                        </button>
+                      )}
                     </div>
-                    <input
-                      value={draft}
-                      onChange={(event) => setDraft(event.target.value)}
-                      placeholder="Haz una pregunta"
-                      aria-label="Mensaje para el asistente"
-                    />
-                    {draft.trim() || pendingAttach ? (
-                      <button type="submit" className="chat-composer-send is-icon" aria-label="Enviar">
-                        <ArrowUpRight size={17} aria-hidden="true" />
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="chat-composer-icon"
-                        aria-label="Dictar"
-                        title="Dictar"
-                      >
-                        <Mic size={18} strokeWidth={1.8} />
-                      </button>
-                    )}
                   </form>
                 </div>
               </section>
@@ -4217,6 +6100,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             resultItems={companion.resultItems}
                             qrCards={companion.qrCards}
                             overview={companion.overview}
+                            overviewFocus={companion.overviewFocus}
                             onSelectItem={(item) => {
                               const rawId = item.id;
                               const id =
@@ -4464,6 +6348,65 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         existingPeople={existingPeople}
         existingOrigens={inventarioOptions}
       />
+
+      {pendingChatDeleteRow && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="sidebar-delete-overlay"
+              role="presentation"
+              onClick={() => {
+                if (!chatDeleteBusy) setPendingChatDeleteRow(null);
+              }}
+            >
+              <div
+                className="sidebar-delete-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="chat-delete-record-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <span className="sidebar-delete-icon" aria-hidden="true">
+                  <CircleAlert size={22} strokeWidth={1.7} />
+                </span>
+                <h3 id="chat-delete-record-title">
+                  ¿Quieres eliminar este registro?
+                </h3>
+                <p>
+                  Se borrará{" "}
+                  <strong>
+                    {String(pendingChatDeleteRow.etiqueta ?? "").trim() ||
+                      `ID ${pendingChatDeleteRow.id}`}
+                  </strong>
+                  {pendingChatDeleteRow.articulo
+                    ? ` — ${pendingChatDeleteRow.articulo}`
+                    : ""}
+                  . No podrás deshacerlo desde el chat.
+                </p>
+                <div className="sidebar-delete-actions">
+                  <button
+                    type="button"
+                    className="sidebar-delete-cancel"
+                    disabled={chatDeleteBusy}
+                    onClick={() => setPendingChatDeleteRow(null)}
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    className="sidebar-delete-confirm"
+                    disabled={chatDeleteBusy}
+                    onClick={() => {
+                      void confirmChatDeleteRecord();
+                    }}
+                  >
+                    {chatDeleteBusy ? "Eliminando…" : "Borrar"}
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 }
