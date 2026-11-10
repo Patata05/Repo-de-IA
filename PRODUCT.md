@@ -28,7 +28,7 @@ Se usará con mayor frecuencia en un ordenador y también en dispositivos móvil
 - El esquema actual incluye etiqueta, artículo, marca, modelo, serie, área, persona asignada, cantidad, observaciones y origen.
 - La interfaz existente permite consultar y buscar registros, agruparlos por persona o área y ver un resumen del inventario.
 - La navegación muestra Inventario, Personas, Chat, Avisos, Equipos y Áreas. El alcance y funcionamiento de cada sección, así como las funciones de monitoreo, están por confirmar.
-- La conexión y las tareas concretas de la API de IA están por confirmar. El repositorio incluye código auxiliar para generar imágenes con DALL·E y Midjourney, pero no está confirmado que esa sea la integración prevista para los flujos de inventario.
+- El chat de inventario se conecta al backend Django (LLM + tools). La IA de imágenes (DALL·E / Midjourney) ya no forma parte del repo.
 - La interfaz actual lee registros de Supabase; las operaciones de alta, edición y eliminación desde la aplicación no están confirmadas.
 
 ## Brand Commitments

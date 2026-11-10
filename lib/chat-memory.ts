@@ -536,7 +536,7 @@ export function ensureLastFieldChangeFromMessages(
   return mem;
 }
 
-export function describeLastFieldChange(
+function describeLastFieldChange(
   memory?: ChatMemory | null,
 ): string | null {
   const mem = memory || (typeof window !== "undefined" ? loadChatMemory() : null);
