@@ -27,10 +27,19 @@ Consultas:
 - Etiqueta concreta → obtener_por_etiqueta.
 - "último registro", "los de hoy", "más recientes" → listar_recientes
   (el último: limit=1; hoy: solo_hoy=true).
-- "dame N etiquetas", "muéstrame etiquetas", "listar etiquetas"
-  → listar_recientes (limit=N) o buscar_inventario (limit=N).
-  NUNCA generar_qr: "etiquetas" ≠ "códigos QR". El visor lista etiquetas
-  (sin QR). Resume en el chat y deja el detalle al visor.
+- "dame N etiquetas", "muéstrame etiquetas", "trece etiquetas de [área]"
+  → buscar_inventario o contar_por_campo/listado con limit=N (máx. 50).
+  Devuelve EXACTAMENTE las N pedidas si existen; si hay menos, todas las
+  que haya (sentido común). NUNCA te quedes en 5 por defecto.
+  NUNCA generar_qr: "etiquetas" ≠ "códigos QR". Visor = lista; chat = resumen.
+- Paneles visuales (el front los arma solo si el usuario lo pide):
+  inventario general / resumen → totales+áreas+recientes;
+  "áreas" / "por área" → ranking de áreas;
+  "personas" / "por persona" (sin nombre concreto) → asignaciones;
+  "estado" / "activos" / "inactivos" → salud del inventario;
+  "marcas" / "por marca" → top marcas;
+  "recientes" → últimos movimientos.
+  En el chat: texto breve; no satures con tablas largas.
 - "dame un QR", "código QR de …" → generar_qr (etiqueta, id o ultimo=true).
 - Varios QR / códigos QR de un área/persona
   ("dame 5 QR de Biblioteca", "dame 5 códigos QR de Biblioteca")
@@ -41,23 +50,44 @@ Consultas:
   NUNCA digas que solo puedes uno. Resumen en chat; QR en el visor.
 
 Importación Excel/CSV:
-- El usuario puede adjuntar el archivo en el chat (lo procesa la app).
-- Si preguntan si pueden pasar Excel: dilo claro — que usen el clip 📎
-  "Subir archivos" o el botón CSV/Excel en Nuevo artículo.
+- El usuario puede adjuntar el archivo EN ESTE chat (+ → Excel/CSV o arrastrar).
+  La app lo parsea e importa TODAS las filas; tú NO lo haces.
+- NUNCA llames crear_articulo en bucle / por muestra para un Excel o CSV.
+  NUNCA digas que solo puedes registrar 5 filas o una por una.
+- Si piden importar Excel/CSV sin adjunto: indica + → «Excel / CSV» en este chat
+  (también vale arrastrar el archivo al cuadro de mensaje).
 - En saludos y cierres, ofrece importar Excel/CSV como una opción.
 
-Cambios (actualizar / crear):
+Cambios (actualizar / crear / eliminar):
 - Si piden cambiar datos: primero busca el registro y PROPÓN el cambio.
 - NUNCA llames actualizar_campo ni crear_articulo hasta que el usuario confirme
   con sí / confirma / adelante / ok / dale.
 - Tras confirmar, aplica UNA tool de escritura y explica el resultado con detalle útil.
-- No borres registros.
+- Eliminar registros: la app muestra un aviso modal de confirmación (como borrar chat).
+  Si el usuario pide borrar, NO digas que no puedes: pide la etiqueta si falta y
+  aclara que debe confirmar en el aviso. No inventes borrados.
 
 Estilo de respuesta (importante):
 - NO des respuestas telegráficas de una sola línea. Sé claro, amable y con sustancia.
 - Explica un poco el resultado (qué significa, qué sigue) y cierra con opciones.
 - Preferible una tool útil por ronda (salvo varios QR en una sola generar_qr).
 - Detalle tabular / QR / listados largos → visor derecho. En el chat: texto + opciones.
+
+Visor derecho (regla clara):
+- VER / MOSTRAR (obligatorio panel): "muéstrame", "enséñame", "dame", "créame",
+  "genera", "ver", "abre", "del lado derecho", "en el panel/visor".
+  → SIEMPRE llama la tool adecuada y DEVUELVE items o QR al visor, lo más
+  acertado al pedido (etiqueta, QR, lista, área, persona, resumen…).
+  Chat: 1–2 frases + que ya está a la derecha. NO pegues la ficha completa en chat.
+- INSTRUCCIONES / ACCIONES (tú decides el panel): "sube/importa esta base",
+  "cambia X", "actualiza", "corrige". Tras la acción puedes mostrar inventario
+  general, la etiqueta tocada, o solo texto — según lo más útil.
+- BÚSQUEDA neutra ("busca la etiqueta 310285", "busca en Biblioteca"):
+  puedes decidir si mandas items al visor; si además dicen muéstrame/dame/ver,
+  el panel es obligatorio y debe coincidir con lo encontrado.
+- Elige el tipo de visor más fiel a la intención: QR solo si pidieron QR;
+  etiquetas si pidieron etiquetas/registro; resumen si pidieron inventario/totales.
+
 - Para resumen / inventario general / áreas / registros recientes:
   * En el chat: párrafo con los números clave + 2–4 líneas de contexto.
   * Luego ofrece siguientes pasos en viñetas (qué puede hacer ahora).
@@ -69,19 +99,38 @@ Saludos ("hola", "buenas", etc.) y cuando el usuario no pide un dato concreto:
   * Consultar inventario general, por área o por persona
   * Ver últimos registros o generar códigos QR
   * Dar de alta / registrar un artículo nuevo (botón "+ Nuevo artículo")
-  * Importar un Excel o CSV (clip 📎 o "Subir archivos")
+  * Importar un Excel o CSV (+ → Excel/CSV en este chat)
   * Buscar por etiqueta, artículo o estado
 - Termina invitando a elegir un camino ("Dime qué prefieres y lo hacemos").
 
 Después de una consulta útil, si cabe, añade 1–3 preguntas/opciones de seguimiento
 relacionadas (filtrar, QR, alta, importar), sin sonar repetitivo.
+
+Confirmaciones sin pedido concreto ("ok", "okey", "vale", "gracias", "perfecto",
+"listo", "de acuerdo"): responde breve en texto. NO llames tools ni generes QR
+ni listas para el visor; el usuario aún no eligió una acción.
+
+Saludos o "qué se puede hacer / qué hacemos hoy / opciones":
+responde en texto con caminos claros. NO llames tools ni mandes items/QR
+salvo que pidan un dato concreto (totales, áreas, etiquetas, QR, etc.).
 No hables de temas ajenos al inventario.
+
+Memoria entre chats:
+- Puede llegar un bloque "memory" con totales, imports y el ÚLTIMO CAMBIO DE CAMPO
+  (etiqueta, campo, valor anterior → actual) de otros chats del mismo navegador.
+- "cuántos había / total antes" → totales de inventario (previousTotal/lastTotal).
+- "el nombre de antes / como estaba / vuelve a poner el anterior" → eso es el
+  ÚLTIMO CAMBIO DE CAMPO (valor ANTERIOR), NO el total de registros.
+- Si memory trae last field change y piden restaurar, PROPÓN ese valor anterior
+  y espera confirmación antes de actualizar_campo.
+- No digas que no tienes retención si memory trae el cambio o previousTotal.
 """
 
 MAX_TOOL_ROUNDS = 3
-MAX_SIDE_ITEMS = 12
-MAX_HISTORY_TURNS = 6
-MAX_HISTORY_CHARS = 500
+MAX_SIDE_ITEMS = 50
+MAX_HISTORY_TURNS = 10
+MAX_HISTORY_CHARS = 700
+MAX_MEMORY_CHARS = 1800
 MAX_RETRIES_PER_MODEL = 1
 RETRY_SLEEP_SEC = (0.25,)
 MAX_COMPLETION_TOKENS = 700
@@ -269,9 +318,112 @@ def _collect_qr(bucket: list[dict], result: dict) -> None:
     )
 
 
+def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
+    """Resuelve 'total/cuántos de [área]' sin LLM cuando se puede emparejar el área."""
+    import re
+    import unicodedata
+
+    from inventario.supabase_client import list_por_campo, read_inventario
+
+    raw = (message or "").strip()
+    if not raw:
+        return None
+
+    def norm(s: str) -> str:
+        s = unicodedata.normalize("NFD", s.lower())
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    msg = norm(raw)
+    wants_total = any(
+        k in msg
+        for k in (
+            "cuantos",
+            "cuantas",
+            "cuanto",
+            "cuanta",
+            "total",
+            "totales",
+            "conteo",
+            "hay",
+        )
+    )
+    if not wants_total:
+        return None
+    if ("todas" in msg or "todos" in msg) and ("area" in msg or "areas" in msg):
+        return None
+
+    rows, error, _ = read_inventario()
+    if error or not rows:
+        return None
+
+    areas = sorted(
+        {
+            str(r.get("area") or "").strip()
+            for r in rows
+            if str(r.get("area") or "").strip()
+        },
+        key=len,
+        reverse=True,
+    )
+    best: str | None = None
+    best_score = 0
+    for area in areas:
+        an = norm(area)
+        if not an:
+            continue
+        if an in msg and len(an) >= best_score:
+            best = area
+            best_score = len(an)
+            continue
+        tokens = [t for t in an.split() if len(t) > 2]
+        if tokens and all(t in msg for t in tokens) and len("".join(tokens)) > best_score:
+            best = area
+            best_score = len("".join(tokens))
+
+    if not best:
+        return None
+    if not any(k in msg for k in ("area", "areas", " en ", " del ", " de ")):
+        # Exige pista de área / preposición para no confundir totales globales.
+        if "area" not in msg and "areas" not in msg:
+            # "total de recursos humanos" usa "de "
+            if " de " not in f" {msg} " and " en " not in f" {msg} ":
+                return None
+
+    sample, _ = list_por_campo("area", best, limit=12)
+    total = sum(
+        1
+        for r in rows
+        if str(r.get("area") or "").strip().lower() == best.strip().lower()
+    )
+    personas = {
+        str(r.get("persona") or "").strip()
+        for r in rows
+        if str(r.get("area") or "").strip().lower() == best.strip().lower()
+        and str(r.get("persona") or "").strip()
+    }
+    activos = sum(
+        1
+        for r in rows
+        if str(r.get("area") or "").strip().lower() == best.strip().lower()
+        and str(r.get("estado") or "").strip().lower()
+        not in {"inactivo", "baja", "no", "inactive"}
+    )
+    text = (
+        f"En **{best}** hay **{total}** registro{'s' if total != 1 else ''}: "
+        f"**{len(personas)}** persona{'s' if len(personas) != 1 else ''} y "
+        f"**{activos}** activo{'s' if activos != 1 else ''}.\n\n"
+        "El detalle está en el visor derecho.\n\n"
+        "¿Quieres ver los artículos del área, filtrar por persona o generar QR de un lote?"
+    )
+    return text, sample or []
+
+
 def run_chat_agent(
     message: str,
     history: list[dict] | None = None,
+    memory: str | None = None,
 ) -> tuple[str, str | None, str | None, list[dict], bool, list[dict]]:
     endpoints = get_llm_endpoints()
     if not endpoints:
@@ -284,6 +436,10 @@ def run_chat_agent(
             False,
             [],
         )
+
+    memory_text = (memory or "").strip()
+    if len(memory_text) > MAX_MEMORY_CHARS:
+        memory_text = memory_text[: MAX_MEMORY_CHARS - 1] + "…"
 
     # Saludos / ayuda simple: respuesta local sin round-trip al LLM.
     msg_l = (message or "").strip().lower().rstrip("!?.")
@@ -309,7 +465,52 @@ def run_chat_agent(
         local_text, local_items = local_chat_answer("ayuda")
         return local_text, None, "local:fast", local_items[:MAX_SIDE_ITEMS], False, []
 
+    # Acuses sin pedido concreto: solo texto, sin items/QR.
+    if msg_l in {
+        "ok",
+        "okay",
+        "okey",
+        "oke",
+        "vale",
+        "va",
+        "sale",
+        "bueno",
+        "bien",
+        "gracias",
+        "thanks",
+        "de acuerdo",
+        "perfecto",
+        "listo",
+        "entendido",
+        "claro",
+        "dale",
+        "esta bien",
+        "está bien",
+    }:
+        return (
+            "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
+            "por persona, generar QR, registrar uno nuevo o importar Excel/CSV.",
+            None,
+            "local:ack",
+            [],
+            False,
+            [],
+        )
+
+    # Total de un área concreta → una sola consulta local (sin rondas de tools).
+    area_fast = _try_area_total_fast(message)
+    if area_fast is not None:
+        text, items = area_fast
+        return text, None, "local:area-total", items[:MAX_SIDE_ITEMS], False, []
+
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if memory_text:
+        messages.append(
+            {
+                "role": "system",
+                "content": memory_text,
+            }
+        )
     recent_history = (history or [])[-MAX_HISTORY_TURNS:]
     for item in recent_history:
         role = str(item.get("role") or "").strip().lower()

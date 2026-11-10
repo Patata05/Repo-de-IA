@@ -55,6 +55,13 @@ def chat(request):
     if history is not None and not isinstance(history, list):
         return JsonResponse({"error": "history debe ser una lista."}, status=400)
 
+    memory_raw = payload.get("memory")
+    memory = None
+    if isinstance(memory_raw, str):
+        memory = memory_raw.strip() or None
+    elif memory_raw is not None:
+        return JsonResponse({"error": "memory debe ser texto."}, status=400)
+
     env = get_env()
     if not (env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")):
         return JsonResponse(
@@ -67,7 +74,7 @@ def chat(request):
         )
 
     reply, error, used_model, items, mutated, qr_list = run_chat_agent(
-        message, history or []
+        message, history or [], memory
     )
 
     if error in ("llm_unavailable", "missing_key"):

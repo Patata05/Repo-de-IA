@@ -278,8 +278,8 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             total, error = db.count_por_campo(campo, valor)
             if error:
                 return {"ok": False, "error": error}
-            # Incluye muestra para el visor (tablita de la persona/área).
-            rows, _list_err = db.list_por_campo(campo, valor, limit=12)
+            # Incluye filas para el visor (hasta 50; el front recorta a lo pedido).
+            rows, _list_err = db.list_por_campo(campo, valor, limit=50)
             areas: dict[str, int] = {}
             for row in rows:
                 area = str(row.get("area") or "Sin área").strip() or "Sin área"

@@ -72,7 +72,7 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
             "• ¿Consultamos el inventario general, por área o por persona?\n"
             "• ¿Buscamos por etiqueta/artículo o vemos los últimos registros?\n"
             "• ¿Quieres dar de alta un artículo nuevo (+ Nuevo artículo)?\n"
-            "• ¿Prefieres importar un Excel o CSV con el clip 📎?\n"
+            "• ¿Prefieres importar un Excel o CSV con + → Excel/CSV?\n"
             "• ¿Generamos códigos QR de algún grupo?\n\n"
             "Dime qué camino prefieres y lo hacemos.",
             [],
@@ -148,12 +148,38 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         titulo = "Registros de hoy" if solo_hoy else "Último(s) registro(s)"
         return f"{titulo} (modo local):\n" + "\n".join(lines), items
 
-    # "dame 5 etiquetas" → lista (sin QR)
+    # "dame 5/trece etiquetas" → lista (sin QR)
     if "etiqueta" in msg and "qr" not in msg:
-        m = re.search(r"(\d{1,2})\s*etiqueta", msg) or re.search(
-            r"etiqueta\w*\s*(\d{1,2})", msg
+        words = {
+            "un": 1,
+            "uno": 1,
+            "dos": 2,
+            "tres": 3,
+            "cuatro": 4,
+            "cinco": 5,
+            "seis": 6,
+            "siete": 7,
+            "ocho": 8,
+            "nueve": 9,
+            "diez": 10,
+            "once": 11,
+            "doce": 12,
+            "trece": 13,
+            "catorce": 14,
+            "quince": 15,
+            "veinte": 20,
+        }
+        m = re.search(r"(\d{1,3})\s*etiqueta", msg) or re.search(
+            r"etiqueta\w*\s*(\d{1,3})", msg
         )
-        limit = max(1, min(12, int(m.group(1)) if m else 5))
+        if m:
+            limit = max(1, min(50, int(m.group(1))))
+        else:
+            wm = re.search(
+                r"\b(" + "|".join(words.keys()) + r")\s+etiqueta",
+                msg,
+            )
+            limit = max(1, min(50, words[wm.group(1)])) if wm else 50
         rows, error = listar_recientes(limit=limit, solo_hoy=False)
         if error:
             return f"No pude listar etiquetas: {error}", []
