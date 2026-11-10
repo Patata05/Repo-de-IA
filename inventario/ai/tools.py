@@ -8,9 +8,9 @@ from inventario import supabase_client as db
 
 def format_inventario_qr_text(row: dict[str, Any]) -> str:
     """
-    Payload compacto (pocos módulos QR).
-    Formato: INV:<etiqueta>|<origen>  →  INV:295942|S/O
-    Al escanear queda en portapapeles; la app reconoce la etiqueta.
+    Payload corto para QR del chat (pocos módulos, sin congelar el front).
+    Formato: INV:<etiqueta>|<origen>
+    La ficha completa legible va en el modal de detalle del artículo.
     """
     etiqueta = str(row.get("etiqueta") or "").strip().replace("|", "/")
     origen = str(row.get("origen") or "").strip().replace("|", "/")
@@ -130,10 +130,12 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "generar_qr",
             "description": (
-                "Genera el texto/código QR legible de uno o varios artículos. "
+                "Genera códigos QR. SOLO si el usuario pide QR / código(s) QR. "
+                "NO uses esta tool para 'dame N etiquetas' (eso es listar_recientes "
+                "o buscar_inventario). "
                 "Uno: etiqueta, id, o ultimo=true. "
                 "Varios conocidos: etiquetas=[...] o ids=[...] (máx. 7). "
-                "N QR de un área/persona/texto (ej. '5 de Biblioteca'): "
+                "N QR de un área/persona (ej. '5 QR de Biblioteca'): "
                 "query='Biblioteca' y limit=5 en UNA sola llamada. "
                 "La UI muestra los QR en el visor; resume breve."
             ),
@@ -462,4 +464,32 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def dump_tool_result(result: dict[str, Any]) -> str:
-    return json.dumps(result, ensure_ascii=False, default=str)
+    """Payload compacto para el LLM (menos tokens = respuesta más rápida)."""
+    if not isinstance(result, dict):
+        return json.dumps({"ok": False, "error": "resultado inválido"}, ensure_ascii=False)
+
+    slim: dict[str, Any] = {
+        k: result[k]
+        for k in ("ok", "error", "mutated", "count", "total", "qr", "qr_text")
+        if k in result
+    }
+    if isinstance(result.get("item"), dict):
+        slim["item"] = _compact_row(result["item"])
+    items = result.get("items")
+    if isinstance(items, list):
+        slim["items"] = [
+            _compact_row(row) if isinstance(row, dict) else row for row in items[:8]
+        ]
+        if len(items) > 8:
+            slim["items_truncated"] = len(items) - 8
+    qrs = result.get("qrs")
+    if isinstance(qrs, list):
+        slim["qrs"] = qrs[:7]
+        slim["count"] = slim.get("count", len(qrs))
+    # Resumen / totales: pasar campos numéricos útiles
+    for k, v in result.items():
+        if k in slim or k in ("item", "items", "qrs"):
+            continue
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            slim[k] = v
+    return json.dumps(slim, ensure_ascii=False, default=str)

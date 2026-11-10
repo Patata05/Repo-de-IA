@@ -148,6 +148,33 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         titulo = "Registros de hoy" if solo_hoy else "Último(s) registro(s)"
         return f"{titulo} (modo local):\n" + "\n".join(lines), items
 
+    # "dame 5 etiquetas" → lista (sin QR)
+    if "etiqueta" in msg and "qr" not in msg:
+        m = re.search(r"(\d{1,2})\s*etiqueta", msg) or re.search(
+            r"etiqueta\w*\s*(\d{1,2})", msg
+        )
+        limit = max(1, min(12, int(m.group(1)) if m else 5))
+        rows, error = listar_recientes(limit=limit, solo_hoy=False)
+        if error:
+            return f"No pude listar etiquetas: {error}", []
+        if not rows:
+            return "No hay etiquetas para mostrar en el inventario.", []
+        items = rows
+        lines = []
+        for r in rows[:8]:
+            et = r.get("etiqueta") or "S/E"
+            art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
+            lines.append(
+                f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} "
+                f"({r.get('area') or 'General'})"
+            )
+        more = f"\n… y {len(rows) - 8} más." if len(rows) > 8 else ""
+        return (
+            f"Aquí tienes {len(rows)} etiqueta(s). El detalle está en el visor "
+            f"derecho.\n\n" + "\n".join(lines) + more,
+            items,
+        )
+
     if "biblioteca" in msg and any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto", "hay")):
         total, error = count_por_campo("area", "Biblioteca")
         if error:

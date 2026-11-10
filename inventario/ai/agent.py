@@ -4,6 +4,7 @@ import json
 import time
 
 from inventario.ai.client import get_llm_endpoints
+from inventario.ai.local_fallback import local_chat_answer
 from inventario.ai.tools import OPENAI_TOOLS, dump_tool_result, run_tool
 
 SYSTEM_PROMPT = """Eres el asistente de inventario de oficina (español de México).
@@ -26,16 +27,18 @@ Consultas:
 - Etiqueta concreta → obtener_por_etiqueta.
 - "último registro", "los de hoy", "más recientes" → listar_recientes
   (el último: limit=1; hoy: solo_hoy=true).
+- "dame N etiquetas", "muéstrame etiquetas", "listar etiquetas"
+  → listar_recientes (limit=N) o buscar_inventario (limit=N).
+  NUNCA generar_qr: "etiquetas" ≠ "códigos QR". El visor lista etiquetas
+  (sin QR). Resume en el chat y deja el detalle al visor.
 - "dame un QR", "código QR de …" → generar_qr (etiqueta, id o ultimo=true).
-- Varios QR / códigos de un área/persona
-  ("dame 5 QR de Biblioteca", "dame 5 códigos de Biblioteca", "7 de Sistemas")
+- Varios QR / códigos QR de un área/persona
+  ("dame 5 QR de Biblioteca", "dame 5 códigos QR de Biblioteca")
   → UNA sola generar_qr con query="Biblioteca" (o el texto) y limit=N (máx. 7).
-  NO uses solo buscar_inventario ni inventes tablas: sin generar_qr no hay códigos
-  en el visor derecho.
-- Varios QR ya conocidos ("esos 7", lista de etiquetas/ids) → UNA generar_qr
-  con etiquetas=[...] o ids=[...] (máx. 7). NUNCA digas que solo puedes uno.
-  En el mensaje di inventario/origen y un resumen claro; el detalle y los QR
-  salen en el visor derecho.
+  Solo si dicen QR / código(s) QR. Si dicen solo "etiquetas", NO generar_qr.
+- Varios QR ya conocidos ("esos 7", lista de ids / etiquetas para QR)
+  → UNA generar_qr con etiquetas=[...] o ids=[...] (máx. 7).
+  NUNCA digas que solo puedes uno. Resumen en chat; QR en el visor.
 
 Importación Excel/CSV:
 - El usuario puede adjuntar el archivo en el chat (lo procesa la app).
@@ -75,10 +78,13 @@ relacionadas (filtrar, QR, alta, importar), sin sonar repetitivo.
 No hables de temas ajenos al inventario.
 """
 
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 3
 MAX_SIDE_ITEMS = 12
+MAX_HISTORY_TURNS = 6
+MAX_HISTORY_CHARS = 500
 MAX_RETRIES_PER_MODEL = 1
-RETRY_SLEEP_SEC = (0.4,)
+RETRY_SLEEP_SEC = (0.25,)
+MAX_COMPLETION_TOKENS = 700
 
 
 def _collect_items(bucket: list[dict], result: dict) -> None:
@@ -159,7 +165,8 @@ def _chat_with_failover(messages: list[dict]):
                         messages=messages,
                         tools=OPENAI_TOOLS,
                         tool_choice="auto",
-                        temperature=0.2,
+                        temperature=0.15,
+                        max_tokens=MAX_COMPLETION_TOKENS,
                     )
                     label = f"{endpoint.provider}:{model}"
                     return completion, label
@@ -278,12 +285,39 @@ def run_chat_agent(
             [],
         )
 
+    # Saludos / ayuda simple: respuesta local sin round-trip al LLM.
+    msg_l = (message or "").strip().lower().rstrip("!?.")
+    if msg_l in {
+        "hola",
+        "buenas",
+        "hey",
+        "hi",
+        "hello",
+        "qué tal",
+        "que tal",
+        "saludos",
+        "buen dia",
+        "buen día",
+        "buenos dias",
+        "buenos días",
+        "buenas tardes",
+        "buenas noches",
+    }:
+        local_text, local_items = local_chat_answer("hola")
+        return local_text, None, "local:fast", local_items[:MAX_SIDE_ITEMS], False, []
+    if msg_l in {"ayuda", "qué puedes", "que puedes", "que puedes hacer", "qué puedes hacer"}:
+        local_text, local_items = local_chat_answer("ayuda")
+        return local_text, None, "local:fast", local_items[:MAX_SIDE_ITEMS], False, []
+
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for item in history or []:
+    recent_history = (history or [])[-MAX_HISTORY_TURNS:]
+    for item in recent_history:
         role = str(item.get("role") or "").strip().lower()
         text = str(item.get("content") or item.get("text") or "").strip()
         if not text:
             continue
+        if len(text) > MAX_HISTORY_CHARS:
+            text = text[: MAX_HISTORY_CHARS - 1] + "…"
         if role in ("assistant", "bot", "model"):
             messages.append({"role": "assistant", "content": text})
         elif role in ("user", "human"):

@@ -112,7 +112,7 @@ def build_llm_endpoints() -> tuple[list[LlmEndpoint], list[str]]:
                     client=OpenAI(
                         api_key=key,
                         base_url=base,
-                        timeout=45.0,
+                        timeout=28.0,
                         max_retries=0,
                     ),
                     models=_muse_models(env),
@@ -147,7 +147,7 @@ def build_llm_endpoints() -> tuple[list[LlmEndpoint], list[str]]:
                     client=OpenAI(
                         api_key=key,
                         base_url=base,
-                        timeout=30.0,
+                        timeout=22.0,
                         max_retries=0,
                     ),
                     models=_deepseek_models(env),
