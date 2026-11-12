@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 
 from inventario.supabase_client import (
@@ -12,6 +13,112 @@ from inventario.supabase_client import (
     search_inventario,
     resumen_inventario,
 )
+
+_GREETING_REPLIES = (
+    (
+        "¡Hola! ¿En qué te puedo ayudar con el inventario?\n\n"
+        "Puedo consultar datos reales, ayudarte a registrar artículos "
+        "o importar un archivo. Si quieres empezar, dime por ejemplo:\n"
+        "• ¿Consultamos el inventario general, por área o por persona?\n"
+        "• ¿Buscamos por etiqueta/artículo o vemos los últimos registros?\n"
+        "• ¿Quieres dar de alta un artículo nuevo (+ Nuevo artículo)?\n"
+        "• ¿Prefieres importar un Excel o CSV con + → Excel/CSV?\n"
+        "• ¿Generamos códigos QR de algún grupo?\n\n"
+        "Dime qué camino prefieres y lo hacemos."
+    ),
+    (
+        "¡Qué tal! Estoy listo para el inventario.\n\n"
+        "Puedo ayudarte con:\n"
+        "• Totales, áreas y personas\n"
+        "• Buscar una etiqueta o artículo concreto\n"
+        "• Últimos registros o códigos QR\n"
+        "• Alta de artículos o importar Excel/CSV\n\n"
+        "¿Por dónde empezamos?"
+    ),
+    (
+        "¡Hola! Cuéntame qué necesitas del inventario.\n\n"
+        "Algunas ideas rápidas:\n"
+        "• «cuántas áreas hay» o «dame el inventario general»\n"
+        "• «qué tiene [persona]» o «equipos de [área]»\n"
+        "• «dame los últimos registros» o «genera QR de…»\n"
+        "• Importar un Excel/CSV desde el clip 📎\n\n"
+        "Escribe tu consulta y lo resolvemos."
+    ),
+    (
+        "¡Bienvenido! Soy tu asistente de inventario.\n\n"
+        "Sirvo para consultar, filtrar, generar QR y orientar altas o importaciones.\n"
+        "Prueba con:\n"
+        "• Inventario general / por área / por persona\n"
+        "• Buscar por etiqueta, marca o artículo\n"
+        "• Ver recientes o crear códigos QR\n\n"
+        "¿Qué te gustaría revisar primero?"
+    ),
+)
+
+_HELP_REPLIES = (
+    (
+        "Puedo trabajar contigo el inventario así:\n"
+        "• Consultar totales, áreas, personas y artículos\n"
+        "• Buscar por etiqueta, persona o área\n"
+        "• Ver últimos registros o generar códigos QR\n"
+        "• Orientarte para dar de alta un artículo (+ Nuevo artículo)\n"
+        "• Importar Excel/CSV con el clip 📎\n"
+        "• Resumen general del inventario\n\n"
+        "Dime qué quieres hacer y te guío paso a paso."
+    ),
+    (
+        "Estas son mis funciones principales:\n"
+        "• Conteos exactos (áreas, personas, activos/inactivos)\n"
+        "• Listados y fichas en el visor derecho\n"
+        "• QR de una o varias etiquetas\n"
+        "• Apoyo para altas y carga masiva Excel/CSV\n\n"
+        "Ejemplo: «dame lo que tiene Juan Pérez» o «cuántas tarjas hay»."
+    ),
+    (
+        "Piensa en mí como un atajo al inventario:\n"
+        "pregunto poco, respondo con datos reales y te dejo opciones claras.\n\n"
+        "Puedo: buscar, contar, mostrar en el panel, generar QR e importar archivos.\n"
+        "¿Qué tarea quieres hacer ahora?"
+    ),
+)
+
+_ACK_REPLIES = (
+    (
+        "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
+        "por persona o área, consultar estados/marcas, generar QR, registrar uno nuevo o importar Excel/CSV."
+    ),
+    (
+        "Va. Si quieres seguir, puedo:\n"
+        "• Mostrar un área o persona\n"
+        "• Buscar por etiqueta/artículo\n"
+        "• Traer últimos registros o QR\n"
+        "• Ayudarte a importar Excel/CSV\n\n"
+        "¿Qué te late?"
+    ),
+    (
+        "Listo. Estoy aquí para consultas del inventario.\n"
+        "Prueba con «dame el inventario general», «equipos de [área]» o «cuántas áreas hay»."
+    ),
+    (
+        "De acuerdo. ¿Seguimos con una búsqueda, un total, QR o una importación?"
+    ),
+    (
+        "¡Hecho! Dime la siguiente consulta cuando quieras "
+        "(persona, área, etiqueta, recientes o QR)."
+    ),
+)
+
+
+def pick_greeting_reply() -> str:
+    return random.choice(_GREETING_REPLIES)
+
+
+def pick_help_reply() -> str:
+    return random.choice(_HELP_REPLIES)
+
+
+def pick_ack_reply() -> str:
+    return random.choice(_ACK_REPLIES)
 
 STOPWORDS = {
     "el",
@@ -40,6 +147,14 @@ STOPWORDS = {
     "buscar",
     "busca",
     "ver",
+    "no",
+    "se",
+    "ven",
+    "veo",
+    "aparecen",
+    "aparece",
+    "visor",
+    "panel",
 }
 
 
@@ -65,31 +180,10 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
     )
     # Solo saludo puro (evita "hola dame el último registro…")
     if any(msg == g or msg == f"{g}!" for g in greetings):
-        return (
-            "¡Hola! ¿En qué te puedo ayudar con el inventario?\n\n"
-            "Puedo consultar datos reales, ayudarte a registrar artículos "
-            "o importar un archivo. Si quieres empezar, dime por ejemplo:\n"
-            "• ¿Consultamos el inventario general, por área o por persona?\n"
-            "• ¿Buscamos por etiqueta/artículo o vemos los últimos registros?\n"
-            "• ¿Quieres dar de alta un artículo nuevo (+ Nuevo artículo)?\n"
-            "• ¿Prefieres importar un Excel o CSV con + → Excel/CSV?\n"
-            "• ¿Generamos códigos QR de algún grupo?\n\n"
-            "Dime qué camino prefieres y lo hacemos.",
-            [],
-        )
+        return (pick_greeting_reply(), [])
 
     if any(k in msg for k in ("ayuda", "qué puedes", "que puedes")):
-        return (
-            "Puedo trabajar contigo el inventario así:\n"
-            "• Consultar totales, áreas, personas y artículos\n"
-            "• Buscar por etiqueta, persona o área\n"
-            "• Ver últimos registros o generar códigos QR\n"
-            "• Orientarte para dar de alta un artículo (+ Nuevo artículo)\n"
-            "• Importar Excel/CSV con el clip 📎\n"
-            "• Resumen general del inventario\n\n"
-            "Dime qué quieres hacer y te guío paso a paso.",
-            [],
-        )
+        return (pick_help_reply(), [])
 
     if any(
         k in msg
@@ -207,10 +301,67 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
             return f"No pude contar Biblioteca: {error}", []
         return f"En Biblioteca hay {total} artículos registrados.", []
 
-    # "cuántos registros tiene GARCIA AVILA MARTIN"
-    if any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto")) and (
-        "tiene" in msg or "tienen" in msg
+    # "cuántas áreas hay / en total / tiene este inventario"
+    if (
+        ("area" in msg or "áreas" in msg or "areas" in msg)
+        and any(
+            k in msg
+            for k in (
+                "cuantas",
+                "cuántas",
+                "cuantos",
+                "cuántos",
+                "cuanta",
+                "cuánta",
+                "total",
+                "totales",
+                "hay",
+                "existen",
+                "ranking",
+                "distribucion",
+                "distribución",
+            )
+        )
+        and not re.search(
+            r"\b(biblioteca|edif|edificio|sistemas|coordinacion|coordinación)\b",
+            msg,
+        )
     ):
+        data, error = resumen_inventario()
+        if error and not data:
+            return f"No pude contar las áreas: {error}", []
+        areas_n = data.get("areas")
+        total_n = data.get("total")
+        if areas_n is None:
+            rows, err2, _ = read_inventario()
+            if err2 or not rows:
+                return (
+                    "No pude calcular cuántas áreas hay. "
+                    "¿Quieres que intente el inventario general o un área concreta?",
+                    [],
+                )
+            areas_n = len(
+                {
+                    str(r.get("area") or "").strip()
+                    for r in rows
+                    if str(r.get("area") or "").strip()
+                }
+            )
+            total_n = total_n if total_n is not None else len(rows)
+        return (
+            f"Este inventario tiene **{areas_n}** área"
+            f"{'' if areas_n == 1 else 's'} distintas"
+            + (f" (**{total_n}** registros en total)" if total_n is not None else "")
+            + ".\n\n"
+            "Si quieres el ranking o el detalle de un área, dime "
+            "«dame las áreas» o el nombre del área.",
+            [],
+        )
+
+    # "cuántos registros tiene GARCIA AVILA MARTIN"
+    if any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto", "cuantas", "cuántas")) and (
+        "tiene" in msg or "tienen" in msg
+    ) and not any(k in msg for k in ("area", "áreas", "areas", "inventario")):
         from inventario.supabase_client import list_por_campo
 
         stop = {

@@ -4,7 +4,7 @@ import json
 import time
 
 from inventario.ai.client import get_llm_endpoints
-from inventario.ai.local_fallback import local_chat_answer
+from inventario.ai.local_fallback import local_chat_answer, pick_ack_reply
 from inventario.ai.tools import OPENAI_TOOLS, dump_tool_result, run_tool
 
 SYSTEM_PROMPT = """Eres el asistente de inventario de oficina (español de México).
@@ -17,11 +17,17 @@ Ortografía: el usuario puede escribir mal (ej. "generla", "inventaro", "codigos
 Interpreta la intención más cercana y actúa igual que si estuviera bien escrito.
 
 Consultas:
-- "cuántos" / total del inventario → contar_total (una sola tool).
+- "cuántos" / total del inventario → contar_total o resumen_inventario (una tool).
+- "cuántas áreas hay" / "cuántas áreas en total" / "áreas del inventario"
+  → resumen_inventario (devuelve el número de áreas distintas). NO inventes.
+  NO confundas con el total de un área concreta.
+- Si falta un dato clave (nombre de persona/área/etiqueta), PREGUNTA qué falta
+  en 1 frase concreta en vez de fallar o inventar. Ej.: "¿De qué área
+  exactamente quieres el total?" o "¿Me das el nombre completo de la persona?".
 - "cuántos registros tiene [persona]" / "qué tiene [persona]" → UNA sola
   contar_por_campo campo=persona valor="[nombre]" (devuelve total + items
   para el visor). NO llames resumen_inventario ni varias búsquedas.
-- Área (ej. Biblioteca) → contar_por_campo campo=area.
+- Área concreta (ej. Biblioteca) → contar_por_campo campo=area.
 - Persona (listar) → buscar_inventario o contar_por_campo campo=persona.
 - Listar equipos → buscar_inventario.
 - Etiqueta concreta → obtener_por_etiqueta.
@@ -60,12 +66,16 @@ Importación Excel/CSV:
 
 Cambios (actualizar / crear / eliminar):
 - Si piden cambiar datos: primero busca el registro y PROPÓN el cambio.
+- Formato OBLIGATORIO de la propuesta (una línea por cambio):
+  • **ETIQUETA** · **campo** · “valor actual” → “valor nuevo”
 - NUNCA llames actualizar_campo ni crear_articulo hasta que el usuario confirme
   con sí / confirma / adelante / ok / dale.
 - Tras confirmar, aplica UNA tool de escritura y explica el resultado con detalle útil.
 - Eliminar registros: la app muestra un aviso modal de confirmación (como borrar chat).
   Si el usuario pide borrar, NO digas que no puedes: pide la etiqueta si falta y
   aclara que debe confirmar en el aviso. No inventes borrados.
+- Comparar inventarios (Inventario N vs S/O): resume faltan X / sobran Y / cambiaron Z.
+- Si el mensaje es vago (“no se ven”, “eso”), NO inventes otra búsqueda: pregunta la acción o usa el contexto anterior.
 
 Estilo de respuesta (importante):
 - NO des respuestas telegráficas de una sola línea. Sé claro, amable y con sustancia.
@@ -318,6 +328,77 @@ def _collect_qr(bucket: list[dict], result: dict) -> None:
     )
 
 
+def _try_areas_count_fast(message: str) -> tuple[str, list[dict]] | None:
+    """'cuántas áreas hay / en total / tiene el inventario' → conteo real sin LLM."""
+    import re
+    import unicodedata
+    from collections import Counter
+
+    from inventario.supabase_client import read_inventario
+
+    raw = (message or "").strip()
+    if not raw:
+        return None
+
+    def norm(s: str) -> str:
+        s = unicodedata.normalize("NFD", s.lower())
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    msg = norm(raw)
+    if not msg:
+        return None
+    asks_areas = "area" in msg or "areas" in msg
+    if not asks_areas:
+        return None
+    # Conteo global de áreas (no total de un área concreta).
+    global_ask = bool(
+        re.search(
+            r"\b(cuantas?|cuantos?|cuanto|cuanta)\s+areas?\b",
+            msg,
+        )
+        or re.search(
+            r"\bareas?\s+(hay|existen|tiene|tienen|en\s+total|del\s+inventario|totales?)\b",
+            msg,
+        )
+        or re.search(
+            r"\b(cuantas?|cuantos?)\b.*\bareas?\b.*\b(total|inventario|hay|existen)\b",
+            msg,
+        )
+        or (
+            ("todas" in msg or "todos" in msg or "ranking" in msg or "distribucion" in msg)
+            and ("area" in msg or "areas" in msg)
+        )
+    )
+    if not global_ask:
+        return None
+
+    rows, error, _ = read_inventario()
+    if error or not rows:
+        return None
+    counts = Counter(
+        str(r.get("area") or "Sin área").strip() or "Sin área" for r in rows
+    )
+    total = len(rows)
+    top = counts.most_common(6)
+    lines = [
+        f"• **{area}:** **{cnt:,}** registro{'s' if cnt != 1 else ''}"
+        f" ({round((cnt / max(1, total)) * 100, 1)}%)"
+        for area, cnt in top
+    ]
+    text = (
+        f"Este inventario tiene **{len(counts):,}** área"
+        f"{'' if len(counts) == 1 else 's'} distintas "
+        f"(**{total:,}** registros en total).\n\n"
+        "Las de mayor concentración son:\n\n"
+        + "\n".join(lines)
+        + "\n\nEl ranking completo está en el visor derecho. "
+        "Dime el nombre de un área para ver su detalle, o pide filtrar por persona."
+    )
+    return text, []
+
+
 def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
     """Resuelve 'total/cuántos de [área]' sin LLM cuando se puede emparejar el área."""
     import re
@@ -350,6 +431,12 @@ def _try_area_total_fast(message: str) -> tuple[str, list[dict]] | None:
         )
     )
     if not wants_total:
+        return None
+    # No mezclar con "cuántas áreas hay / en total".
+    if re.search(r"\b(cuantas?|cuantos?)\s+areas?\b", msg) or re.search(
+        r"\bareas?\s+(hay|existen|en\s+total|del\s+inventario)\b",
+        msg,
+    ):
         return None
     if ("todas" in msg or "todos" in msg) and ("area" in msg or "areas" in msg):
         return None
@@ -488,14 +575,19 @@ def run_chat_agent(
         "está bien",
     }:
         return (
-            "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
-            "por persona, generar QR, registrar uno nuevo o importar Excel/CSV.",
+            pick_ack_reply(),
             None,
             "local:ack",
             [],
             False,
             [],
         )
+
+    # Conteo / ranking global de áreas (antes del total de un área concreta).
+    areas_fast = _try_areas_count_fast(message)
+    if areas_fast is not None:
+        text, items = areas_fast
+        return text, None, "local:areas-count", items[:MAX_SIDE_ITEMS], False, []
 
     # Total de un área concreta → una sola consulta local (sin rondas de tools).
     area_fast = _try_area_total_fast(message)
@@ -540,8 +632,32 @@ def run_chat_agent(
                 text = (choice.content or "").strip()
                 side = _side_items_for_reply(collected, qr_payloads)
                 if not text:
+                    # Evita respuesta vacía: intenta atajos locales / fallback.
+                    areas_retry = _try_areas_count_fast(message)
+                    if areas_retry is not None:
+                        t2, items2 = areas_retry
+                        return (
+                            t2,
+                            None,
+                            f"{used_label}+local:areas-count",
+                            (items2 or side)[:MAX_SIDE_ITEMS],
+                            mutated,
+                            qr_payloads,
+                        )
+                    local_text, local_items = local_chat_answer(message)
+                    if local_text and not local_text.startswith("No encontré coincidencias"):
+                        return (
+                            local_text,
+                            None,
+                            f"{used_label}+local_fallback",
+                            (local_items or side)[:MAX_SIDE_ITEMS],
+                            mutated,
+                            qr_payloads,
+                        )
                     return (
-                        "No pude formular una respuesta. Intenta de nuevo.",
+                        "Me faltó un dato para responder con precisión. "
+                        "¿Me confirmas si quieres el **total de áreas del inventario**, "
+                        "el detalle de un **área concreta**, o el inventario de una **persona**?",
                         "empty_text",
                         used_label,
                         side,
