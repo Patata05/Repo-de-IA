@@ -28,6 +28,47 @@ export type ChatQrPayload = {
   origen?: string | null;
 };
 
+export type ChatTokenUsage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  token_budget: number;
+  provider: string;
+  model: string;
+  key_fingerprint: string;
+  rounds?: number;
+};
+
+export type ChatModelOption = {
+  id: string;
+  label: string;
+  badge: string;
+  provider: string;
+  provider_label: string;
+  key_fingerprint: string;
+  token_budget: number;
+  recommended?: boolean;
+};
+
+export type ChatHealthLlmInfo = {
+  configured?: boolean;
+  active_provider?: string;
+  active_provider_label?: string;
+  active_model?: string;
+  default_model?: string;
+  preferred_model?: string;
+  key_fingerprint?: string;
+  token_budget?: number;
+  available_models?: ChatModelOption[];
+  providers?: Array<{
+    name: string;
+    label?: string;
+    models: string[];
+    key_fingerprint?: string;
+    token_budget?: number;
+  }>;
+};
+
 export type ChatApiResponse = {
   reply?: string;
   error?: string | null;
@@ -35,22 +76,44 @@ export type ChatApiResponse = {
   items?: ChatApiItem[];
   mutated?: boolean;
   qr?: ChatQrPayload[];
+  usage?: ChatTokenUsage | null;
 };
 
 /** Vacío = mismo origen (Next proxy → Backend-ia). */
 export function getChatApiBaseUrl() {
   const raw = (process.env.NEXT_PUBLIC_CHAT_API_URL || "").trim();
-  // Si apunta al Django directo, preferimos el proxy de Next para evitar CORS.
-  if (!raw || /^https?:\/\/(127\.0\.0\.1|localhost):8000\/?$/i.test(raw)) {
+  // Si apunta al Django directo o no es URL HTTP válida, preferimos el proxy de Next para evitar CORS.
+  if (
+    !raw ||
+    !/^https?:\/\//i.test(raw) ||
+    /^https?:\/\/(127\.0\.0\.1|localhost):8000\/?$/i.test(raw)
+  ) {
     return "";
   }
   return raw.replace(/\/$/, "");
 }
 
+export async function fetchChatHealth(): Promise<ChatHealthLlmInfo | null> {
+  const base = getChatApiBaseUrl();
+  const url = base ? `${base}/api/health/` : "/api/chat";
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) return null;
+    const data = (await response.json()) as { llm?: ChatHealthLlmInfo };
+    return data?.llm ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function askInventoryChat(
   message: string,
   history: ChatApiHistoryItem[] = [],
-  options?: { signal?: AbortSignal; memory?: string | null },
+  options?: { signal?: AbortSignal; memory?: string | null; model?: string | null },
 ): Promise<ChatApiResponse> {
   const base = getChatApiBaseUrl();
   // Next proxy: /api/chat | Django directo: .../api/chat/
@@ -64,6 +127,7 @@ export async function askInventoryChat(
         message,
         history,
         memory: options?.memory || undefined,
+        model: options?.model || undefined,
       }),
       signal: options?.signal,
     });
@@ -109,6 +173,7 @@ export async function askInventoryChat(
       items: data.items || [],
       mutated: false,
       qr: [],
+      usage: data.usage ?? null,
     };
   }
 
@@ -119,5 +184,6 @@ export async function askInventoryChat(
     items: Array.isArray(data.items) ? data.items : [],
     mutated: Boolean(data.mutated),
     qr: Array.isArray(data.qr) ? data.qr.filter((q) => q?.text) : [],
+    usage: data.usage ?? null,
   };
 }

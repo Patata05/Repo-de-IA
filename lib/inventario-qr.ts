@@ -36,7 +36,7 @@ export function formatInventarioQrText(
     field("Persona", item.persona),
     field(
       "Cantidad",
-      item.cantidad != null && item.cantidad !== ""
+      item.cantidad != null && String(item.cantidad) !== ""
         ? String(item.cantidad)
         : null,
     ),

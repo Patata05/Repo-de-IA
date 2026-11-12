@@ -15,7 +15,9 @@ export type ChatViewerOverview =
   | "stats"
   | "areas"
   | "areaTotal"
+  | "areaMatches"
   | "personTotal"
+  | "personMatches"
   | "recent"
   | "personas"
   | "estado"
@@ -36,6 +38,8 @@ type ChatViewerProps = {
   /** Nombre de área (u otro foco) para incidencias concretas. */
   overviewFocus?: string;
   onSelectItem?: (item: ChatApiItem | InventarioRow) => void;
+  onSelectAreaOption?: (areaName: string) => void;
+  onSelectPersonOption?: (personName: string) => void;
 };
 
 function textOf(value: unknown) {
@@ -78,6 +82,24 @@ function inventoryLabel(items: Array<{ origen?: string | null }>) {
   return "Inventario";
 }
 
+function parseMatchesFocus(rawFocus: string): {
+  label: string;
+  explicitCandidates: string[];
+} {
+  const raw = textOf(rawFocus);
+  const sepIdx = raw.indexOf("::");
+  if (sepIdx === -1) {
+    return { label: raw, explicitCandidates: [] };
+  }
+  const label = raw.slice(0, sepIdx).trim() || raw;
+  const explicitCandidates = raw
+    .slice(sepIdx + 2)
+    .split("||")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { label, explicitCandidates };
+}
+
 function ChatViewer({
   inventory,
   resultItems = [],
@@ -85,19 +107,24 @@ function ChatViewer({
   overview,
   overviewFocus,
   onSelectItem,
+  onSelectAreaOption,
+  onSelectPersonOption,
 }: ChatViewerProps) {
   const hasQr = qrCards.some((card) => card.dataUrl || card.text);
   const showOverview = Boolean(overview) && !hasQr;
   const hasResults = !showOverview && (resultItems.length > 0 || hasQr);
   const showStats = overview === "full" || overview === "stats";
   const showAreaTotal = overview === "areaTotal";
+  const showAreaMatches = overview === "areaMatches";
   const showPersonTotal = overview === "personTotal";
+  const showPersonMatches = overview === "personMatches";
   const showAreas = overview === "full" || overview === "areas";
   const showRecent = overview === "full" || overview === "recent";
   const showPersonas = overview === "personas";
   const showEstado = overview === "estado";
   const showMarcas = overview === "marcas";
   const focusArea = textOf(overviewFocus);
+  const parsedFocus = useMemo(() => parseMatchesFocus(focusArea), [focusArea]);
   const [qrExpanded, setQrExpanded] = useState(false);
   const [overviewExpanded, setOverviewExpanded] = useState(false);
 
@@ -114,6 +141,18 @@ function ChatViewer({
 
   const overviewData = useMemo(() => {
     const emptyPairs: Array<[string, number]> = [];
+    const emptyAreaMatches: Array<{
+      area: string;
+      count: number;
+      personas: number;
+      activos: number;
+    }> = [];
+    const emptyPersonMatches: Array<{
+      persona: string;
+      count: number;
+      areas: number;
+      activos: number;
+    }> = [];
     const base = {
       areasSorted: emptyPairs,
       maxArea: 1,
@@ -127,21 +166,34 @@ function ChatViewer({
       areaRows: [] as InventarioRow[],
       areaPersonas: 0,
       areaActivos: 0,
+      areaMatches: emptyAreaMatches,
+      areaMatchesTotalRows: 0,
+      areaMatchesTotalPersonas: 0,
       personRows: [] as InventarioRow[],
       personAreasSorted: emptyPairs,
       maxPersonArea: 1,
       personActivos: 0,
       personAreaLabel: "—",
+      personMatches: emptyPersonMatches,
+      personMatchesTotalRows: 0,
       recentAll: [] as InventarioRow[],
     };
     if (!overview) return base;
 
-    const focusNorm = foldText(focusArea);
+    const focusNorm = foldText(parsedFocus.label || focusArea);
 
     if (overview === "areaTotal") {
-      const areaRows = focusNorm
-        ? inventory.filter((row) => matchesFocus(foldText(row.area), focusNorm))
+      // Priorizar coincidencia exacta con el nombre canónico del área para evitar
+      // sumar sub-áreas (ej. "BIBLIOTECA NUEVA" no debe sumar "BIBLIOTECA NUEVA SALA DE COMPUTO 2").
+      const exactRows = focusNorm
+        ? inventory.filter((row) => foldText(row.area) === focusNorm)
         : [];
+      const areaRows =
+        exactRows.length > 0
+          ? exactRows
+          : focusNorm
+            ? inventory.filter((row) => matchesFocus(foldText(row.area), focusNorm))
+            : [];
       const people = new Set(
         areaRows.map((row) => textOf(row.persona)).filter(Boolean),
       );
@@ -153,12 +205,66 @@ function ChatViewer({
       };
     }
 
+    if (overview === "areaMatches") {
+      const byArea = new Map<string, InventarioRow[]>();
+      for (const row of inventory) {
+        const area = textOf(row.area);
+        if (!area) continue;
+        const list = byArea.get(area);
+        if (list) list.push(row);
+        else byArea.set(area, [row]);
+      }
+
+      const candidateNames =
+        parsedFocus.explicitCandidates.length > 0
+          ? parsedFocus.explicitCandidates.filter((name) => byArea.has(name))
+          : [...byArea.keys()]
+              .filter((area) => matchesFocus(foldText(area), focusNorm))
+              .sort((a, b) => (byArea.get(b)?.length ?? 0) - (byArea.get(a)?.length ?? 0));
+
+      const allPeople = new Set<string>();
+      let totalRows = 0;
+      const areaMatches = candidateNames.map((area) => {
+        const rows = byArea.get(area) || [];
+        totalRows += rows.length;
+        const people = new Set<string>();
+        let activos = 0;
+        for (const r of rows) {
+          const p = textOf(r.persona);
+          if (p) {
+            people.add(p);
+            allPeople.add(p);
+          }
+          if (!isInactiveEstado(r.estado)) activos += 1;
+        }
+        return {
+          area,
+          count: rows.length,
+          personas: people.size,
+          activos,
+        };
+      });
+
+      return {
+        ...base,
+        areaMatches,
+        areaMatchesTotalRows: totalRows,
+        areaMatchesTotalPersonas: allPeople.size,
+      };
+    }
+
     if (overview === "personTotal") {
-      const personRows = focusNorm
-        ? inventory.filter((row) =>
-            matchesFocus(foldText(row.persona), focusNorm),
-          )
+      const exactRows = focusNorm
+        ? inventory.filter((row) => foldText(row.persona) === focusNorm)
         : [];
+      const personRows =
+        exactRows.length > 0
+          ? exactRows
+          : focusNorm
+            ? inventory.filter((row) =>
+                matchesFocus(foldText(row.persona), focusNorm),
+              )
+            : [];
       const personAreaCounts = new Map<string, number>();
       let personActivos = 0;
       for (const row of personRows) {
@@ -184,6 +290,49 @@ function ChatViewer({
       };
     }
 
+    if (overview === "personMatches") {
+      const byPerson = new Map<string, InventarioRow[]>();
+      for (const row of inventory) {
+        const persona = textOf(row.persona);
+        if (!persona) continue;
+        const list = byPerson.get(persona);
+        if (list) list.push(row);
+        else byPerson.set(persona, [row]);
+      }
+
+      const candidateNames =
+        parsedFocus.explicitCandidates.length > 0
+          ? parsedFocus.explicitCandidates.filter((name) => byPerson.has(name))
+          : [...byPerson.keys()]
+              .filter((p) => matchesFocus(foldText(p), focusNorm))
+              .sort((a, b) => (byPerson.get(b)?.length ?? 0) - (byPerson.get(a)?.length ?? 0));
+
+      let totalRows = 0;
+      const personMatches = candidateNames.map((persona) => {
+        const rows = byPerson.get(persona) || [];
+        totalRows += rows.length;
+        const areas = new Set<string>();
+        let activos = 0;
+        for (const r of rows) {
+          const a = textOf(r.area);
+          if (a) areas.add(a);
+          if (!isInactiveEstado(r.estado)) activos += 1;
+        }
+        return {
+          persona,
+          count: rows.length,
+          areas: areas.size,
+          activos,
+        };
+      });
+
+      return {
+        ...base,
+        personMatches,
+        personMatchesTotalRows: totalRows,
+      };
+    }
+
     if (overview === "recent") {
       return {
         ...base,
@@ -199,7 +348,7 @@ function ChatViewer({
       };
     }
 
-    const needAreas = overview === "full" || overview === "areas";
+    const needAreas = overview === "full" || overview === "areas" || overview === "stats";
     const needPersonas = overview === "personas";
     const needMarcas = overview === "marcas";
     const needEstado = overview === "full" || overview === "stats" || overview === "estado";
@@ -282,11 +431,16 @@ function ChatViewer({
     areaRows,
     areaPersonas,
     areaActivos,
+    areaMatches,
+    areaMatchesTotalRows,
+    areaMatchesTotalPersonas,
     personRows,
     personAreasSorted,
     maxPersonArea,
     personActivos,
     personAreaLabel,
+    personMatches,
+    personMatchesTotalRows,
     recentAll,
   } = overviewData;
 
@@ -335,6 +489,8 @@ function ChatViewer({
   const personLabel =
     personasInResults.length === 1 ? personasInResults[0] : "";
 
+  const displayFocusLabel = parsedFocus.label || focusArea;
+
   const contextLabel = hasResults
     ? hasQr
       ? personLabel ||
@@ -347,20 +503,24 @@ function ChatViewer({
     : overview === "areas"
       ? "Áreas"
       : overview === "areaTotal"
-        ? focusArea || "Área"
-        : overview === "personTotal"
-          ? focusArea || "Persona"
-          : overview === "recent"
-          ? "Recientes"
-          : overview === "stats"
-            ? "Totales"
-            : overview === "personas"
-              ? "Personas"
-              : overview === "estado"
-                ? "Estado"
-                : overview === "marcas"
-                  ? "Marcas"
-                  : "En el inventario";
+        ? displayFocusLabel || "Área"
+        : overview === "areaMatches"
+          ? `Coincidencias: «${displayFocusLabel || "Área"}»`
+          : overview === "personTotal"
+            ? displayFocusLabel || "Persona"
+            : overview === "personMatches"
+              ? `Coincidencias: «${displayFocusLabel || "Persona"}»`
+              : overview === "recent"
+                ? "Recientes"
+                : overview === "stats"
+                  ? "Totales"
+                  : overview === "personas"
+                    ? "Personas"
+                    : overview === "estado"
+                      ? "Estado"
+                      : overview === "marcas"
+                        ? "Marcas"
+                        : "En el inventario";
 
   const contextSub = hasResults
     ? hasQr
@@ -369,20 +529,100 @@ function ChatViewer({
     : overview === "areas"
       ? `${areasSorted.length} áreas · distribución`
       : overview === "areaTotal"
-        ? "Total del área"
-        : overview === "personTotal"
-          ? "Inventario de la persona"
-          : overview === "recent"
-          ? `${recentAll.length} últimos registros`
-          : overview === "stats"
-            ? "Conteo en vivo"
-            : overview === "personas"
-              ? `${personasSorted.length} personas con equipo`
-              : overview === "estado"
-                ? "Activos vs inactivos"
-                : overview === "marcas"
-                  ? `${marcasSorted.length} marcas`
-                  : "Resumen en vivo";
+        ? listItems.length > 0 && listItems.length < areaRows.length
+          ? `Total del área (${formatNumber(areaRows.length)}) · mostrando ${listItems.length} registros`
+          : listItems.length > 0
+            ? `Total del área · ${formatNumber(areaRows.length)} registros`
+            : "Total del área"
+        : overview === "areaMatches"
+          ? `${areaMatches.length} áreas encontradas (${formatNumber(areaMatchesTotalRows)} registros) · elige cuál consultar`
+          : overview === "personTotal"
+            ? listItems.length > 0 && listItems.length < personRows.length
+              ? `Inventario de la persona (${formatNumber(personRows.length)}) · mostrando ${listItems.length}`
+              : "Inventario de la persona"
+            : overview === "personMatches"
+              ? `${personMatches.length} personas encontradas (${formatNumber(personMatchesTotalRows)} registros) · elige cuál consultar`
+              : overview === "recent"
+                ? `${recentAll.length} últimos registros`
+                : overview === "stats"
+                  ? "Conteo en vivo"
+                  : overview === "personas"
+                    ? `${personasSorted.length} personas con equipo`
+                    : overview === "estado"
+                      ? "Activos vs inactivos"
+                      : overview === "marcas"
+                        ? `${marcasSorted.length} marcas`
+                        : "Resumen en vivo";
+
+  const renderEmbeddedResultList = (
+    itemsToRender: ChatApiItem[],
+    totalContextRows: number,
+  ) => {
+    if (!itemsToRender.length) return null;
+    const previewLimit = RESULT_PREVIEW_LIMIT;
+    const canCollapseItems = itemsToRender.length > previewLimit;
+    const visibleEmbedded =
+      canCollapseItems && !qrExpanded
+        ? itemsToRender.slice(0, previewLimit)
+        : itemsToRender;
+    const titleLabel =
+      totalContextRows > 0 && itemsToRender.length < totalContextRows
+        ? `Registros solicitados (${formatNumber(itemsToRender.length)} de ${formatNumber(totalContextRows)})`
+        : `Registros del área (${formatNumber(itemsToRender.length)})`;
+    return (
+      <section
+        className="chat-viewer-card"
+        aria-label="Registros de la consulta"
+      >
+        <h3 className="chat-viewer-section-title">{titleLabel}</h3>
+        <ul className="chat-viewer-list">
+          {visibleEmbedded.map((item, index) => {
+            const etiqueta = textOf(item.etiqueta) || `Item ${index + 1}`;
+            const articulo = textOf(item.articulo) || "Artículo";
+            const marca = textOf(item.marca);
+            const marcaLabel =
+              marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                ? ` · ${marca}`
+                : "";
+            const persona = textOf(item.persona) || "Sin asignar";
+            const area = textOf(item.area);
+            return (
+              <li key={`${item.id ?? etiqueta}-${index}`}>
+                <button
+                  type="button"
+                  className="chat-viewer-list-item"
+                  onClick={() => onSelectItem?.(item)}
+                >
+                  <span className="chat-viewer-badge">{etiqueta}</span>
+                  <span className="chat-viewer-list-copy">
+                    <strong>
+                      {articulo}
+                      {marcaLabel}
+                    </strong>
+                    <span>{[persona, area].filter(Boolean).join(" · ")}</span>
+                  </span>
+                  <span className="chat-viewer-item-arrow" aria-hidden="true">
+                    <ChevronRight size={15} />
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        {canCollapseItems ? (
+          <button
+            type="button"
+            className="chat-viewer-show-more"
+            onClick={() => setQrExpanded((open) => !open)}
+          >
+            {qrExpanded
+              ? "Mostrar menos"
+              : `Mostrar más (${itemsToRender.length - previewLimit})`}
+          </button>
+        ) : null}
+      </section>
+    );
+  };
 
   return (
     <div
@@ -467,35 +707,212 @@ function ChatViewer({
                     overviewExpanded ? " is-expanded" : ""
                   }`}
                 >
-                  {showAreaTotal && focusArea ? (
-                    <section
-                      className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total"
-                      aria-label={`Total de ${focusArea}`}
-                    >
-                      <div className="chat-viewer-stat">
-                        <span className="chat-viewer-stat-label">Registros</span>
-                        <strong>{formatNumber(areaRows.length)}</strong>
-                      </div>
-                      <div className="chat-viewer-stat is-text-value">
-                        <span className="chat-viewer-stat-label">Área</span>
-                        <strong title={focusArea}>{focusArea}</strong>
-                      </div>
-                      <div className="chat-viewer-stat">
-                        <span className="chat-viewer-stat-label">Personas</span>
-                        <strong>{formatNumber(areaPersonas)}</strong>
-                      </div>
-                      <div className="chat-viewer-stat">
-                        <span className="chat-viewer-stat-label">Activos</span>
-                        <strong>{formatNumber(areaActivos)}</strong>
-                      </div>
-                    </section>
+                  {showAreaMatches ? (
+                    <>
+                      <section
+                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total"
+                        aria-label={`Coincidencias de ${displayFocusLabel}`}
+                      >
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Incidencias
+                          </span>
+                          <strong>{formatNumber(areaMatches.length)}</strong>
+                        </div>
+                        <div className="chat-viewer-stat is-text-value">
+                          <span className="chat-viewer-stat-label">
+                            Búsqueda
+                          </span>
+                          <strong title={displayFocusLabel}>
+                            {displayFocusLabel}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Registros (suma)
+                          </span>
+                          <strong>
+                            {formatNumber(areaMatchesTotalRows)}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Personas
+                          </span>
+                          <strong>
+                            {formatNumber(areaMatchesTotalPersonas)}
+                          </strong>
+                        </div>
+                      </section>
+                      {areaMatches.length ? (
+                        <section
+                          className="chat-viewer-card"
+                          aria-label="Áreas encontradas para desambiguar"
+                        >
+                          <h3 className="chat-viewer-section-title">
+                            Selecciona qué área deseas consultar
+                          </h3>
+                          <ul className="chat-viewer-list">
+                            {areaMatches.map((item, idx) => (
+                              <li key={item.area}>
+                                <button
+                                  type="button"
+                                  className="chat-viewer-list-item"
+                                  onClick={() => onSelectAreaOption?.(item.area)}
+                                  title={`Consultar ${item.area}`}
+                                >
+                                  <span className="chat-viewer-badge">
+                                    Opción {idx + 1}
+                                  </span>
+                                  <span className="chat-viewer-list-copy">
+                                    <strong>{item.area}</strong>
+                                    <span>
+                                      {formatNumber(item.count)} registro
+                                      {item.count === 1 ? "" : "s"} ·{" "}
+                                      {formatNumber(item.personas)} persona
+                                      {item.personas === 1 ? "" : "s"} ·{" "}
+                                      {formatNumber(item.activos)} activo
+                                      {item.activos === 1 ? "" : "s"}
+                                    </span>
+                                  </span>
+                                  <span
+                                    className="chat-viewer-item-arrow"
+                                    aria-hidden="true"
+                                  >
+                                    <ChevronRight size={15} />
+                                  </span>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      ) : null}
+                    </>
                   ) : null}
 
-                  {showPersonTotal && focusArea ? (
+                  {showPersonMatches ? (
                     <>
                       <section
                         className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total is-person-total"
-                        aria-label={`Inventario de ${focusArea}`}
+                        aria-label={`Coincidencias de ${displayFocusLabel}`}
+                      >
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Incidencias
+                          </span>
+                          <strong>{formatNumber(personMatches.length)}</strong>
+                        </div>
+                        <div className="chat-viewer-stat is-text-value">
+                          <span className="chat-viewer-stat-label">
+                            Búsqueda
+                          </span>
+                          <strong title={displayFocusLabel}>
+                            {displayFocusLabel}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Registros (suma)
+                          </span>
+                          <strong>
+                            {formatNumber(personMatchesTotalRows)}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Personas
+                          </span>
+                          <strong>{formatNumber(personMatches.length)}</strong>
+                        </div>
+                      </section>
+                      {personMatches.length ? (
+                        <section
+                          className="chat-viewer-card"
+                          aria-label="Personas encontradas para desambiguar"
+                        >
+                          <h3 className="chat-viewer-section-title">
+                            Selecciona qué persona deseas consultar
+                          </h3>
+                          <ul className="chat-viewer-list">
+                            {personMatches.map((item, idx) => (
+                              <li key={item.persona}>
+                                <button
+                                  type="button"
+                                  className="chat-viewer-list-item"
+                                  onClick={() =>
+                                    onSelectPersonOption?.(item.persona)
+                                  }
+                                  title={`Consultar ${item.persona}`}
+                                >
+                                  <span className="chat-viewer-badge">
+                                    Opción {idx + 1}
+                                  </span>
+                                  <span className="chat-viewer-list-copy">
+                                    <strong>{item.persona}</strong>
+                                    <span>
+                                      {formatNumber(item.count)} registro
+                                      {item.count === 1 ? "" : "s"} ·{" "}
+                                      {formatNumber(item.areas)} área
+                                      {item.areas === 1 ? "" : "s"} ·{" "}
+                                      {formatNumber(item.activos)} activo
+                                      {item.activos === 1 ? "" : "s"}
+                                    </span>
+                                  </span>
+                                  <span
+                                    className="chat-viewer-item-arrow"
+                                    aria-hidden="true"
+                                  >
+                                    <ChevronRight size={15} />
+                                  </span>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      ) : null}
+                    </>
+                  ) : null}
+
+                  {showAreaTotal && displayFocusLabel ? (
+                    <>
+                      <section
+                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total"
+                        aria-label={`Total de ${displayFocusLabel}`}
+                      >
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Registros
+                          </span>
+                          <strong>{formatNumber(areaRows.length)}</strong>
+                        </div>
+                        <div className="chat-viewer-stat is-text-value">
+                          <span className="chat-viewer-stat-label">Área</span>
+                          <strong title={displayFocusLabel}>
+                            {displayFocusLabel}
+                          </strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Personas
+                          </span>
+                          <strong>{formatNumber(areaPersonas)}</strong>
+                        </div>
+                        <div className="chat-viewer-stat">
+                          <span className="chat-viewer-stat-label">
+                            Activos
+                          </span>
+                          <strong>{formatNumber(areaActivos)}</strong>
+                        </div>
+                      </section>
+                      {renderEmbeddedResultList(listItems, areaRows.length)}
+                    </>
+                  ) : null}
+
+                  {showPersonTotal && displayFocusLabel ? (
+                    <>
+                      <section
+                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total is-person-total"
+                        aria-label={`Inventario de ${displayFocusLabel}`}
                       >
                         <div className="chat-viewer-stat">
                           <span className="chat-viewer-stat-label">
@@ -505,7 +922,9 @@ function ChatViewer({
                         </div>
                         <div className="chat-viewer-stat is-text-value">
                           <span className="chat-viewer-stat-label">Persona</span>
-                          <strong title={focusArea}>{focusArea}</strong>
+                          <strong title={displayFocusLabel}>
+                            {displayFocusLabel}
+                          </strong>
                         </div>
                         <div
                           className={`chat-viewer-stat${
@@ -552,6 +971,7 @@ function ChatViewer({
                           </ul>
                         </section>
                       ) : null}
+                      {renderEmbeddedResultList(listItems, personRows.length)}
                     </>
                   ) : null}
 
@@ -568,7 +988,7 @@ function ChatViewer({
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Áreas</span>
-                        <strong>{formatNumber(areaCounts.size)}</strong>
+                        <strong>{formatNumber(areasSorted.length)}</strong>
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Personas</span>
@@ -766,7 +1186,13 @@ function ChatViewer({
                           const etiqueta =
                             textOf(row.etiqueta) || `ID-${row.id ?? index}`;
                           const articulo = textOf(row.articulo) || "Artículo";
+                          const marca = textOf(row.marca);
+                          const marcaLabel =
+                            marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                              ? ` · ${marca}`
+                              : "";
                           const persona = textOf(row.persona) || "Sin asignar";
+                          const area = textOf(row.area);
                           return (
                             <li key={`${row.id ?? etiqueta}-${index}`}>
                               <button
@@ -778,8 +1204,19 @@ function ChatViewer({
                                   {etiqueta}
                                 </span>
                                 <span className="chat-viewer-list-copy">
-                                  <strong>{articulo}</strong>
-                                  <span>{persona}</span>
+                                  <strong>
+                                    {articulo}
+                                    {marcaLabel}
+                                  </strong>
+                                  <span>
+                                    {[persona, area].filter(Boolean).join(" · ")}
+                                  </span>
+                                </span>
+                                <span
+                                  className="chat-viewer-item-arrow"
+                                  aria-hidden="true"
+                                >
+                                  <ChevronRight size={15} />
                                 </span>
                               </button>
                             </li>
@@ -834,6 +1271,11 @@ function ChatViewer({
                         const etiqueta =
                           textOf(item.etiqueta) || `Item ${index + 1}`;
                         const articulo = textOf(item.articulo) || "Artículo";
+                        const marca = textOf(item.marca);
+                        const marcaLabel =
+                          marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                            ? ` · ${marca}`
+                            : "";
                         const persona = textOf(item.persona) || "Sin asignar";
                         const area = textOf(item.area);
                         const origen = textOf(item.origen) || contextLabel;
@@ -847,7 +1289,10 @@ function ChatViewer({
                                     {etiqueta}
                                   </span>
                                   <span className="chat-viewer-list-copy">
-                                    <strong>{articulo}</strong>
+                                    <strong>
+                                      {articulo}
+                                      {marcaLabel}
+                                    </strong>
                                     <span>
                                       {[persona, area]
                                         .filter(Boolean)
@@ -882,8 +1327,21 @@ function ChatViewer({
                                   {etiqueta}
                                 </span>
                                 <span className="chat-viewer-list-copy">
-                                  <strong>{articulo}</strong>
-                                  <span>{persona}</span>
+                                  <strong>
+                                    {articulo}
+                                    {marcaLabel}
+                                  </strong>
+                                  <span>
+                                    {[persona, area]
+                                      .filter(Boolean)
+                                      .join(" · ") || origen}
+                                  </span>
+                                </span>
+                                <span
+                                  className="chat-viewer-item-arrow"
+                                  aria-hidden="true"
+                                >
+                                  <ChevronRight size={15} />
                                 </span>
                               </button>
                             )}

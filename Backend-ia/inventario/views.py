@@ -27,7 +27,7 @@ def health(request):
             "llm": {
                 **setup,
                 "preferred_model": get_llm_model(),
-                "order": env.get("LLM_PROVIDERS") or "groq,ollama,gemini",
+                "order": env.get("LLM_PROVIDERS") or "nvidia,muse,deepseek,groq,ollama,gemini",
             },
             "supabase": {
                 "configured": bool(env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")),
@@ -62,6 +62,11 @@ def chat(request):
     elif memory_raw is not None:
         return JsonResponse({"error": "memory debe ser texto."}, status=400)
 
+    model_raw = payload.get("model")
+    preferred_model = None
+    if isinstance(model_raw, str):
+        preferred_model = model_raw.strip() or None
+
     env = get_env()
     if not (env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")):
         return JsonResponse(
@@ -73,8 +78,8 @@ def chat(request):
             }
         )
 
-    reply, error, used_model, items, mutated, qr_list = run_chat_agent(
-        message, history or [], memory
+    reply, error, used_model, items, mutated, qr_list, usage = run_chat_agent(
+        message, history or [], memory, preferred_model=preferred_model
     )
 
     if error in ("llm_unavailable", "missing_key"):
@@ -92,6 +97,7 @@ def chat(request):
                 "items": local_items or items or [],
                 "mutated": False,
                 "qr": [],
+                "usage": usage,
             }
         )
 
@@ -103,5 +109,6 @@ def chat(request):
             "items": items or [],
             "mutated": bool(mutated),
             "qr": qr_list or [],
+            "usage": usage,
         }
     )

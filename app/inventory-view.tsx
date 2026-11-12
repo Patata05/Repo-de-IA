@@ -65,8 +65,11 @@ import ChatViewer from "@/components/chat-viewer";
 import ProductDetailModal from "@/components/product-detail-modal";
 import {
   askInventoryChat,
+  fetchChatHealth,
   type ChatApiItem,
+  type ChatModelOption,
   type ChatQrPayload,
+  type ChatTokenUsage,
 } from "@/lib/chat-api";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import {
@@ -108,7 +111,9 @@ type ViewerOverview =
   | "stats"
   | "areas"
   | "areaTotal"
+  | "areaMatches"
   | "personTotal"
+  | "personMatches"
   | "recent"
   | "personas"
   | "estado"
@@ -145,10 +150,75 @@ type ChatSession = {
 
 const CHAT_SESSIONS_KEY = "inventario-chat-sessions";
 const CHAT_ACTIVE_KEY = "inventario-chat-active";
+const CHAT_TOKEN_METERS_KEY = "inventario-chat-token-meters";
+const CHAT_SELECTED_MODEL_PREFIX = "inventario-selected-model:";
 const MAX_CHAT_SESSIONS = 50;
 const CHAT_USER_COLLAPSE_AT = 160;
 const PERSONA_SIN_ASIGNAR_ID = "__SIN_ASIGNAR__";
 const PERSONA_SIN_ASIGNAR_NAME = "Sin asignar";
+
+function loadSelectedModelForKey(keyFingerprint: string): string | null {
+  try {
+    if (!keyFingerprint) return null;
+    return window.localStorage.getItem(`${CHAT_SELECTED_MODEL_PREFIX}${keyFingerprint}`);
+  } catch {
+    return null;
+  }
+}
+
+function saveSelectedModelForKey(keyFingerprint: string, modelId: string) {
+  try {
+    if (!keyFingerprint || !modelId) return;
+    window.localStorage.setItem(`${CHAT_SELECTED_MODEL_PREFIX}${keyFingerprint}`, modelId);
+  } catch {
+    /* quota */
+  }
+}
+
+type TokenMeterEntry = {
+  used: number;
+  promptUsed: number;
+  completionUsed: number;
+  budget: number;
+  provider: string;
+  model: string;
+  keyFingerprint: string;
+  lastTurnTokens: number;
+  updatedAt: number;
+};
+
+function loadTokenMeters(): Record<string, TokenMeterEntry> {
+  try {
+    const raw = window.localStorage.getItem(CHAT_TOKEN_METERS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, TokenMeterEntry>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTokenMeters(meters: Record<string, TokenMeterEntry>) {
+  try {
+    window.localStorage.setItem(CHAT_TOKEN_METERS_KEY, JSON.stringify(meters));
+  } catch {
+    /* quota */
+  }
+}
+
+function estimateTextTokens(text: string): number {
+  const s = String(text || "").trim();
+  if (!s) return 0;
+  return Math.max(1, Math.ceil(s.length / 3.8));
+}
+
+function formatCompactTokens(value: number): string {
+  const n = Math.max(0, Math.round(value));
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
 
 function loadChatSessions(): ChatSession[] {
   try {
@@ -660,6 +730,879 @@ function buildAreaListReply(area: string, rows: InventarioRow[]) {
   );
 }
 
+type AreaCandidateSummary = {
+  name: string;
+  norm: string;
+  tokens: string[];
+  rows: InventarioRow[];
+  personas: number;
+  activos: number;
+};
+
+type PersonCandidateSummary = {
+  name: string;
+  norm: string;
+  tokens: string[];
+  rows: InventarioRow[];
+  areas: number;
+  activos: number;
+};
+
+type PendingDisambiguationState = {
+  kind: "area" | "person";
+  queryLabel: string;
+  candidates: string[];
+  intent: "list" | "total";
+  limit: number | null;
+};
+
+function encodeMatchesFocus(label: string, candidates: string[]): string {
+  return `${label.trim()}::${candidates.join("||")}`;
+}
+
+function parseMatchesFocusFromMessage(rawFocus?: string): {
+  label: string;
+  candidates: string[];
+} | null {
+  const raw = String(rawFocus ?? "").trim();
+  const sep = raw.indexOf("::");
+  if (sep === -1) return null;
+  const label = raw.slice(0, sep).trim();
+  const candidates = raw
+    .slice(sep + 2)
+    .split("||")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!candidates.length) return null;
+  return { label: label || "Consulta", candidates };
+}
+
+const AREA_QUERY_STOP_WORDS = new Set([
+  ...AREA_STOP_WORDS,
+  "dime",
+  "decirme",
+  "digame",
+  "muestrame",
+  "ensename",
+  "ensenar",
+  "ensena",
+  "traeme",
+  "listame",
+  "buscame",
+  "consulta",
+  "consultar",
+  "consultame",
+  "quiero",
+  "necesito",
+  "deseo",
+  "saber",
+  "conocer",
+  "cual",
+  "cuales",
+  "que",
+  "quien",
+  "quienes",
+  "esta",
+  "estan",
+  "este",
+  "esten",
+  "hay",
+  "tiene",
+  "tienen",
+  "existe",
+  "existen",
+  "ubicado",
+  "ubicados",
+  "ubicada",
+  "ubicadas",
+  "pertenece",
+  "pertenecen",
+  "asignado",
+  "asignados",
+  "asignada",
+  "asignadas",
+  "total",
+  "totales",
+  "conteo",
+  "cantidad",
+  "cuantos",
+  "cuantas",
+  "cuanto",
+  "cuanta",
+  "incidencia",
+  "incidencias",
+  "opcion",
+  "opciones",
+  "favor",
+  "para",
+  "sobre",
+  "acerca",
+  "al",
+  "lo",
+  "me",
+  "te",
+  "se",
+  "nos",
+  "puedes",
+  "podrias",
+  "activo",
+  "activos",
+  "cosa",
+  "cosas",
+  "mobiliario",
+  "bien",
+  "bienes",
+]);
+
+const ORDINAL_INDEX_MAP: Record<string, number> = {
+  primero: 1,
+  primera: 1,
+  primer: 1,
+  uno: 1,
+  una: 1,
+  segundo: 2,
+  segunda: 2,
+  dos: 2,
+  tercero: 3,
+  tercera: 3,
+  tercer: 3,
+  tres: 3,
+  cuarto: 4,
+  cuarta: 4,
+  cuatro: 4,
+  quinto: 5,
+  quinta: 5,
+  cinco: 5,
+  sexto: 6,
+  sexta: 6,
+  seis: 6,
+  septimo: 7,
+  septima: 7,
+  siete: 7,
+  octavo: 8,
+  octava: 8,
+  ocho: 8,
+};
+
+function stripRequestedCountPhrases(plainText: string): string {
+  const countWords = Object.keys(SPANISH_COUNT_WORDS)
+    .sort((a, b) => b.length - a.length)
+    .join("|");
+  return plainText
+    .replace(
+      new RegExp(
+        `\\b(\\d{1,3}|${countWords})\\s*(?:etiquetas?|etiquet\\w*|registros?|articulos?|equipos?|codigos?|qr)\\b`,
+        "g",
+      ),
+      " ",
+    )
+    .replace(
+      /\b(?:etiquetas?|registros?|articulos?|equipos?)\s+\d{1,3}\b/g,
+      " ",
+    )
+    .replace(
+      new RegExp(
+        `\\b(dame|dime|muestra|mostrar|muestrame|ensename|ensenar|ensena|ver|trae|lista|listar)\\s+(?:las?\\s+|los?\\s+)?(\\d{1,3}|${countWords})\\s+(?=de\\b|del\\b|en\\b|area\\b|areas\\b)`,
+        "g",
+      ),
+      "$1 ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getAllAreaCatalog(inventory: InventarioRow[]): AreaCandidateSummary[] {
+  const byArea = new Map<string, InventarioRow[]>();
+  for (const row of inventory) {
+    const area = String(row.area ?? "").trim();
+    if (!area) continue;
+    const list = byArea.get(area);
+    if (list) list.push(row);
+    else byArea.set(area, [row]);
+  }
+  const out: AreaCandidateSummary[] = [];
+  for (const [name, rows] of byArea.entries()) {
+    const norm = normalizePlain(name).replace(/\b(?:edificios?|edifs)\b/g, "edif");
+    const tokens = norm.split(" ").filter(Boolean);
+    const people = new Set(
+      rows.map((r) => String(r.persona ?? "").trim()).filter(Boolean),
+    );
+    const activos = rows.filter(isRowActivo).length;
+    out.push({
+      name,
+      norm,
+      tokens,
+      rows,
+      personas: people.size,
+      activos,
+    });
+  }
+  out.sort((a, b) => b.rows.length - a.rows.length || a.name.localeCompare(b.name));
+  return out;
+}
+
+function getAllPersonCatalog(inventory: InventarioRow[]): PersonCandidateSummary[] {
+  const byPerson = new Map<string, InventarioRow[]>();
+  for (const row of inventory) {
+    const persona = String(row.persona ?? "").trim();
+    if (!persona) continue;
+    const normCheck = normalizePlain(persona);
+    if (
+      !normCheck ||
+      normCheck === "sin asignar" ||
+      normCheck === "no asignado" ||
+      normCheck === "n a" ||
+      normCheck === "na"
+    ) {
+      continue;
+    }
+    const list = byPerson.get(persona);
+    if (list) list.push(row);
+    else byPerson.set(persona, [row]);
+  }
+  const out: PersonCandidateSummary[] = [];
+  for (const [name, rows] of byPerson.entries()) {
+    const norm = normalizePlain(name);
+    const tokens = norm.split(" ").filter(Boolean);
+    const areas = new Set(
+      rows.map((r) => String(r.area ?? "").trim()).filter(Boolean),
+    );
+    const activos = rows.filter(isRowActivo).length;
+    out.push({
+      name,
+      norm,
+      tokens,
+      rows,
+      areas: areas.size,
+      activos,
+    });
+  }
+  out.sort((a, b) => b.rows.length - a.rows.length || a.name.localeCompare(b.name));
+  return out;
+}
+
+function matchSingleAreaVocabularyToken(
+  rawTok: string,
+  allAreaTokens: Set<string>,
+): string | null {
+  if (!rawTok) return null;
+  if (allAreaTokens.has(rawTok)) return rawTok;
+  // Prefijo o singular/plural simple (ej. "cubiculos" -> "cubiculo", "salas" -> "sala")
+  if (rawTok.endsWith("s") && rawTok.length > 3) {
+    const sing = rawTok.slice(0, -1);
+    if (allAreaTokens.has(sing)) return sing;
+  }
+  const budget = typoBudget(rawTok);
+  if (budget <= 0) return null;
+  let best: { tok: string; dist: number } | null = null;
+  for (const vocabTok of allAreaTokens) {
+    if (vocabTok.length <= 2) continue;
+    if (Math.abs(vocabTok.length - rawTok.length) > budget) continue;
+    const dist = levenshtein(rawTok, vocabTok);
+    if (dist <= budget && (!best || dist < best.dist)) {
+      best = { tok: vocabTok, dist };
+      if (dist === 1) break;
+    }
+  }
+  return best?.tok ?? null;
+}
+
+function extractAreaQueryTokens(
+  userText: string,
+  catalog: AreaCandidateSummary[],
+): { rawLabel: string; matchedTokens: string[] } | null {
+  const plain0 = normalizePlain(userText);
+  if (!plain0 || /\b\d{4,}\b/.test(plain0)) return null;
+  const stripped = stripRequestedCountPhrases(plain0).replace(
+    /\b(?:edificios?|edifs)\b/g,
+    "edif",
+  );
+  const rawTokens = stripped
+    .split(" ")
+    .filter((tok, idx, arr) => {
+      if (!tok) return false;
+      if (AREA_QUERY_STOP_WORDS.has(tok)) return false;
+      if (tok === "general" && arr[idx - 1] === "inventario") return false;
+      return true;
+    });
+  if (!rawTokens.length) return null;
+
+  // Alias semántico: "biblioteca vieja" / "biblioteca antigua" -> EDIF. B BIBLIOTECA
+  if (
+    rawTokens.some((t) => t.startsWith("bibliotec") || t === "bblioteca") &&
+    rawTokens.some((t) => t === "vieja" || t === "antigua" || t === "viejo")
+  ) {
+    return {
+      rawLabel: "biblioteca vieja (Edif. B Biblioteca)",
+      matchedTokens: ["edif", "b", "biblioteca"],
+    };
+  }
+
+  const allAreaTokens = new Set<string>();
+  for (const item of catalog) {
+    for (const t of item.tokens) allAreaTokens.add(t);
+  }
+
+  const matchedTokens: string[] = [];
+  for (const rt of rawTokens) {
+    const matched = matchSingleAreaVocabularyToken(rt, allAreaTokens);
+    if (!matched) {
+      // Contiene un término que no pertenece a ningún área (ej. "laptops", "dell")
+      return null;
+    }
+    if (!matchedTokens.includes(matched)) {
+      matchedTokens.push(matched);
+    }
+  }
+
+  if (!matchedTokens.length) return null;
+  return {
+    rawLabel: matchedTokens.join(" "),
+    matchedTokens,
+  };
+}
+
+function areaCandidateMatchesTokens(
+  cand: AreaCandidateSummary,
+  queryTokens: string[],
+): boolean {
+  if (!queryTokens.length) return false;
+  return queryTokens.every(
+    (qt) =>
+      cand.tokens.includes(qt) ||
+      cand.tokens.some((ct) => ct.length >= 4 && qt.length >= 4 && ct.includes(qt)),
+  );
+}
+
+function findMatchingAreasForPrompt(
+  userText: string,
+  inventory: InventarioRow[],
+): {
+  queryLabel: string;
+  queryTokens: string[];
+  candidates: AreaCandidateSummary[];
+  intent: "list" | "total";
+  limit: number | null;
+} | undefined {
+  if (!inventory.length) return undefined;
+  if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
+    return undefined;
+  }
+  if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
+    return undefined;
+  }
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  // Mutaciones / ediciones no son consultas de área
+  if (
+    intentHas(
+      n,
+      "cambia",
+      "cambiar",
+      "actualiza",
+      "actualizar",
+      "agrega",
+      "agregar",
+      "sube",
+      "subir",
+      "importa",
+      "importar",
+    )
+  ) {
+    return undefined;
+  }
+  // Ranking general de todas las áreas ("todas las áreas", "qué áreas hay")
+  if (
+    intentHas(n, "areas", "area") &&
+    (intentHas(n, "todas", "todos", "ranking", "distribucion", "desglose") ||
+      /^(que|cuales|cuantas)\s+areas\s+(hay|existen|tiene)/.test(n) ||
+      /^(areas|por areas)$/.test(n))
+  ) {
+    return undefined;
+  }
+  // Anáfora de persona ("su inventario general")
+  if (
+    !intentHas(n, "area", "areas", "edif", "edificio", "edificios") &&
+    looksLikePersonAnaphora(userText)
+  ) {
+    return undefined;
+  }
+
+  const catalog = getAllAreaCatalog(inventory);
+  const extracted = extractAreaQueryTokens(userText, catalog);
+  if (!extracted) return undefined;
+
+  const candidates = catalog.filter((cand) =>
+    areaCandidateMatchesTokens(cand, extracted.matchedTokens),
+  );
+  if (!candidates.length) return undefined;
+
+  const requestedCount = parseRequestedCount(userText);
+  const onlyTotalVerb =
+    (intentHas(n, "cuantos", "cuantas", "cuanto", "cuanta", "total", "totales", "conteo") &&
+      !intentHas(
+        n,
+        "dame",
+        "muestra",
+        "mostrar",
+        "ver",
+        "lista",
+        "listar",
+        "cuales",
+        "que",
+      )) &&
+    requestedCount == null;
+
+  return {
+    queryLabel: extracted.rawLabel,
+    queryTokens: extracted.matchedTokens,
+    candidates,
+    intent: onlyTotalVerb ? "total" : "list",
+    limit:
+      requestedCount != null
+        ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, requestedCount))
+        : null,
+  };
+}
+
+function findMatchingPeopleForPrompt(
+  userText: string,
+  inventory: InventarioRow[],
+): {
+  queryLabel: string;
+  candidates: PersonCandidateSummary[];
+  intent: "list" | "total";
+  limit: number | null;
+} | undefined {
+  if (!inventory.length) return undefined;
+  if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
+    return undefined;
+  }
+  if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
+    return undefined;
+  }
+  const n = normalizeChatIntent(userText);
+  if (!n || /\b\d{4,}\b/.test(n)) return undefined;
+  if (
+    intentHas(
+      n,
+      "area",
+      "areas",
+      "edif",
+      "edificio",
+      "edificios",
+      "cambia",
+      "cambiar",
+      "actualiza",
+      "actualizar",
+    )
+  ) {
+    return undefined;
+  }
+  // Ranking global de personas
+  if (
+    intentHas(n, "personas", "persona") &&
+    (intentHas(n, "todas", "todos", "ranking", "quien", "mas") ||
+      /^(que|cuales|cuantas)\s+personas/.test(n) ||
+      /^(personas|por personas)$/.test(n))
+  ) {
+    return undefined;
+  }
+
+  const plain0 = stripRequestedCountPhrases(normalizePlain(userText));
+  const rawTokens = plain0
+    .split(" ")
+    .filter(
+      (t) =>
+        t.length > 2 &&
+        !PERSON_STOP_WORDS.has(t) &&
+        !AREA_QUERY_STOP_WORDS.has(t),
+    );
+  if (!rawTokens.length) return undefined;
+
+  const catalog = getAllPersonCatalog(inventory);
+  const allPersonTokens = new Set<string>();
+  for (const p of catalog) {
+    for (const t of p.tokens) allPersonTokens.add(t);
+  }
+
+  const matchedPersonTokens: string[] = [];
+  for (const rt of rawTokens) {
+    const m = matchSingleAreaVocabularyToken(rt, allPersonTokens);
+    if (!m) return undefined;
+    if (!matchedPersonTokens.includes(m)) matchedPersonTokens.push(m);
+  }
+  if (!matchedPersonTokens.length) return undefined;
+
+  const candidates = catalog.filter((cand) =>
+    matchedPersonTokens.every((pt) => cand.tokens.includes(pt)),
+  );
+  if (!candidates.length) return undefined;
+
+  const requestedCount = parseRequestedCount(userText);
+  return {
+    queryLabel: matchedPersonTokens.join(" ").toUpperCase(),
+    candidates,
+    intent: requestedCount != null ? "list" : "total",
+    limit:
+      requestedCount != null
+        ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, requestedCount))
+        : null,
+  };
+}
+
+function buildAreaDisambiguationReply(
+  queryLabel: string,
+  candidates: AreaCandidateSummary[],
+  intent: "list" | "total",
+  limit: number | null,
+): string {
+  const totalRows = candidates.reduce((acc, c) => acc + c.rows.length, 0);
+  const allPeople = new Set<string>();
+  for (const c of candidates) {
+    for (const r of c.rows) {
+      const p = String(r.persona ?? "").trim();
+      if (p) allPeople.add(p);
+    }
+  }
+  const lines = candidates.map(
+    (c, idx) =>
+      `• **${idx + 1}. ${c.name}** — **${c.rows.length.toLocaleString("es-MX")}** registro${c.rows.length === 1 ? "" : "s"} (${c.personas} persona${c.personas === 1 ? "" : "s"} · ${c.activos} activo${c.activos === 1 ? "" : "s"})`,
+  );
+  const askTarget =
+    limit != null
+      ? `los **${limit} registros** solicitados`
+      : intent === "total"
+        ? "el total y detalle"
+        : "los registros";
+
+  return (
+    `Encontré **${candidates.length} áreas** en el inventario que coinciden con **«${queryLabel}»** (**${totalRows.toLocaleString("es-MX")} registros** y **${allPeople.size} persona${allPeople.size === 1 ? "" : "s"}** en conjunto):\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `Para evitar ambigüedad, ¿a cuál de estas **${candidates.length} áreas** deseas consultar ${askTarget}? ` +
+    `Indícame el **número de opción (1 al ${candidates.length})**, el **nombre específico del área**, o selecciónala directamente en el panel derecho.`
+  );
+}
+
+function buildPersonDisambiguationReply(
+  queryLabel: string,
+  candidates: PersonCandidateSummary[],
+  limit: number | null,
+): string {
+  const totalRows = candidates.reduce((acc, c) => acc + c.rows.length, 0);
+  const lines = candidates.map(
+    (c, idx) =>
+      `• **${idx + 1}. ${c.name}** — **${c.rows.length.toLocaleString("es-MX")}** registro${c.rows.length === 1 ? "" : "s"} (${c.areas} área${c.areas === 1 ? "" : "s"} · ${c.activos} activo${c.activos === 1 ? "" : "s"})`,
+  );
+  const askTarget =
+    limit != null ? `los **${limit} registros**` : "el inventario asignado";
+
+  return (
+    `Encontré **${candidates.length} personas** que coinciden con **«${queryLabel}»** (**${totalRows.toLocaleString("es-MX")} registros** en conjunto):\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `¿De cuál de ellas deseas consultar ${askTarget}? ` +
+    `Puedes escribir el **número de opción (1 al ${candidates.length})**, el **nombre completo**, o elegirla en el panel derecho.`
+  );
+}
+
+function buildExactAreaReply(
+  areaSummary: AreaCandidateSummary,
+  limit: number | null,
+): {
+  reply: string;
+  shownRows: InventarioRow[];
+} {
+  const total = areaSummary.rows.length;
+  const effectiveLimit =
+    limit != null
+      ? Math.min(total, Math.max(1, limit))
+      : Math.min(total, MAX_ETIQUETA_LIST);
+  const shownRows = areaSummary.rows.slice(0, effectiveLimit);
+  const sampleLines = shownRows.slice(0, 5).map((row) => {
+    const tag = String(row.etiqueta ?? "").trim() || "S/E";
+    const art = String(row.articulo ?? "").trim() || "Artículo";
+    const per = String(row.persona ?? "").trim() || "Sin asignar";
+    return `• **${tag}** — ${art} (${per})`;
+  });
+
+  const showingNote =
+    limit != null && limit < total
+      ? `Mostrando los **${shownRows.length}** registros solicitados (de **${total}** en total en esta área):\n\n`
+      : shownRows.length < total
+        ? `Mostrando los primeros **${shownRows.length}** de **${total}** registros del área:\n\n`
+        : `Registros de **${areaSummary.name}**:\n\n`;
+
+  const reply =
+    `En el área **${areaSummary.name}** hay **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} en total ` +
+    `(**${areaSummary.personas}** persona${areaSummary.personas === 1 ? "" : "s"} · **${areaSummary.activos}** activo${areaSummary.activos === 1 ? "" : "s"}).\n\n` +
+    (sampleLines.length ? `${showingNote}${sampleLines.join("\n")}\n\n` : "") +
+    `En el panel derecho se muestra tanto el **total exacto de ${areaSummary.name} (${total})** como sus **${shownRows.length} registros**. ` +
+    `¿Quieres filtrar por persona, consultar otra área o generar códigos QR?`;
+
+  return { reply, shownRows };
+}
+
+function buildExactPersonReply(
+  personSummary: PersonCandidateSummary,
+  limit: number | null,
+): {
+  reply: string;
+  shownRows: InventarioRow[];
+} {
+  const total = personSummary.rows.length;
+  const effectiveLimit =
+    limit != null
+      ? Math.min(total, Math.max(1, limit))
+      : Math.min(total, MAX_ETIQUETA_LIST);
+  const shownRows = personSummary.rows.slice(0, effectiveLimit);
+  const areas = [
+    ...new Set(
+      personSummary.rows
+        .map((row) => String(row.area ?? "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  const areaLine =
+    areas.length === 0
+      ? "sin área registrada"
+      : areas.length <= 3
+        ? areas.join(", ")
+        : `${areas.slice(0, 3).join(", ")} y ${areas.length - 3} más`;
+
+  const sampleLines = shownRows.slice(0, 5).map((row) => {
+    const tag = String(row.etiqueta ?? "").trim() || "S/E";
+    const art = String(row.articulo ?? "").trim() || "Artículo";
+    const ar = String(row.area ?? "").trim() || "Sin área";
+    return `• **${tag}** — ${art} (${ar})`;
+  });
+
+  const showingNote =
+    limit != null && limit < total
+      ? `Mostrando **${shownRows.length}** de **${total}** registros solicitados:\n\n`
+      : `Ejemplos de su resguardo:\n\n`;
+
+  const reply =
+    `**${personSummary.name}** tiene **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} ` +
+    `(**${personSummary.activos}** activo${personSummary.activos === 1 ? "" : "s"}) en **${areas.length}** área${areas.length === 1 ? "" : "s"} (${areaLine}).\n\n` +
+    (sampleLines.length ? `${showingNote}${sampleLines.join("\n")}\n\n` : "") +
+    `En el panel derecho puedes revisar sus totales por área y sus registros. ¿Quieres generar QR o filtrar por un área?`;
+
+  return { reply, shownRows };
+}
+
+function resolvePendingDisambiguation(
+  userText: string,
+  pending: PendingDisambiguationState,
+  inventory: InventarioRow[],
+):
+  | {
+      status: "resolved_area";
+      area: AreaCandidateSummary;
+      limit: number | null;
+    }
+  | {
+      status: "resolved_person";
+      person: PersonCandidateSummary;
+      limit: number | null;
+    }
+  | {
+      status: "narrowed_area";
+      queryLabel: string;
+      candidates: AreaCandidateSummary[];
+      intent: "list" | "total";
+      limit: number | null;
+    }
+  | {
+      status: "narrowed_person";
+      queryLabel: string;
+      candidates: PersonCandidateSummary[];
+      limit: number | null;
+    }
+  | { status: "unrelated" } {
+  const plain = normalizePlain(userText);
+  if (!plain) return { status: "unrelated" };
+
+  const newRequestedCount = parseRequestedCount(userText);
+  const effectiveLimit = newRequestedCount ?? pending.limit;
+  const strippedPlain = stripRequestedCountPhrases(plain);
+
+  // 1. Verificar selección por número de opción ("1", "la 2", "opción 3", "la primera")
+  // Evitar confundir números de sala/salón ("sala 2", "computo 1", "salon 5", "cubiculo 2") con opción 1/2
+  const hasRoomNumber =
+    /\b(?:sala|computo|salon|cubiculo|edif|edificio|f|lab|laboratorio)\s*(?:de\s+computo\s*)?\d+\b/.test(
+      strippedPlain,
+    );
+
+  let chosenIndex: number | null = null;
+  const directNumMatch =
+    strippedPlain.match(
+      /^(?:la|el|opcion|incidencia|numero|num|area|persona)?\s*(\d{1,2})$/,
+    ) ||
+    strippedPlain.match(
+      /\b(?:opcion|incidencia|numero|num)\s*(\d{1,2})\b/,
+    ) ||
+    (!hasRoomNumber
+      ? strippedPlain.match(
+          /^(?:quiero|dame|muestra|muestrame|ver|consultar|consulta|elijo|selecciono)\s+(?:la|el|opcion|incidencia)?\s*(\d{1,2})$/,
+        )
+      : null);
+
+  if (directNumMatch) {
+    const nVal = Number(directNumMatch[1]);
+    if (Number.isFinite(nVal) && nVal >= 1 && nVal <= pending.candidates.length) {
+      chosenIndex = nVal - 1;
+    }
+  } else if (!hasRoomNumber) {
+    const words = strippedPlain.split(" ").filter(Boolean);
+    if (words.length <= 4) {
+      for (const w of words) {
+        const ord = ORDINAL_INDEX_MAP[w];
+        if (ord && ord >= 1 && ord <= pending.candidates.length) {
+          chosenIndex = ord - 1;
+          break;
+        }
+      }
+    }
+  }
+
+  if (pending.kind === "area") {
+    const catalog = getAllAreaCatalog(inventory);
+    const pendingCatalog = pending.candidates
+      .map((name) => catalog.find((c) => c.name === name))
+      .filter((c): c is AreaCandidateSummary => Boolean(c));
+
+    if (!pendingCatalog.length) return { status: "unrelated" };
+
+    if (chosenIndex != null && pendingCatalog[chosenIndex]) {
+      return {
+        status: "resolved_area",
+        area: pendingCatalog[chosenIndex],
+        limit: effectiveLimit,
+      };
+    }
+
+    // 2. Coincidencia exacta por nombre de área completo (ej. clic en "BIBLIOTECA NUEVA" o escribir "biblioteca nueva")
+    const fullNorm = plain.replace(/\b(?:edificios?|edifs)\b/g, "edif");
+    const exactFull = pendingCatalog.find((c) => c.norm === fullNorm);
+    if (exactFull) {
+      return {
+        status: "resolved_area",
+        area: exactFull,
+        limit: effectiveLimit,
+      };
+    }
+
+    // 3. Extraer tokens de área del mensaje de seguimiento
+    const extracted = extractAreaQueryTokens(userText, catalog);
+    if (!extracted || !extracted.matchedTokens.length) {
+      return { status: "unrelated" };
+    }
+    const qPhrase = extracted.matchedTokens.join(" ");
+
+    // Si los tokens extraídos coinciden exactamente con el nombre canónico de uno de los candidatos
+    // (ej. el usuario escribió "dame los de biblioteca nueva" -> tokens ["biblioteca", "nueva"] == "BIBLIOTECA NUEVA")
+    const exactByExtracted = pendingCatalog.find((c) => c.norm === qPhrase);
+    if (exactByExtracted) {
+      return {
+        status: "resolved_area",
+        area: exactByExtracted,
+        limit: effectiveLimit,
+      };
+    }
+
+    // 4. Filtrar entre los candidatos pendientes los que cumplan todos los tokens nuevos (ej. "sala 2" -> solo Sala 2)
+    const narrowed = pendingCatalog.filter((c) =>
+      areaCandidateMatchesTokens(c, extracted.matchedTokens),
+    );
+    if (narrowed.length === 1) {
+      return {
+        status: "resolved_area",
+        area: narrowed[0],
+        limit: effectiveLimit,
+      };
+    }
+    if (narrowed.length > 1) {
+      return {
+        status: "narrowed_area",
+        queryLabel: extracted.rawLabel,
+        candidates: narrowed,
+        intent: pending.intent,
+        limit: effectiveLimit,
+      };
+    }
+
+    // 5. ¿Y si el usuario mencionó una combinación de tokens donde los candidatos pendientes no tenían el prefijo
+    // (ej. dijo solo "general" refiriéndose al área base sin sufijo)?
+    if (
+      strippedPlain.includes("general") ||
+      strippedPlain.includes("principal") ||
+      strippedPlain.includes("solo")
+    ) {
+      const shortest = [...pendingCatalog].sort(
+        (a, b) => a.tokens.length - b.tokens.length,
+      )[0];
+      if (shortest) {
+        return {
+          status: "resolved_area",
+          area: shortest,
+          limit: effectiveLimit,
+        };
+      }
+    }
+
+    return { status: "unrelated" };
+  }
+
+  // kind === "person"
+  const personCatalog = getAllPersonCatalog(inventory);
+  const pendingPeople = pending.candidates
+    .map((name) => personCatalog.find((c) => c.name === name))
+    .filter((c): c is PersonCandidateSummary => Boolean(c));
+
+  if (!pendingPeople.length) return { status: "unrelated" };
+
+  if (chosenIndex != null && pendingPeople[chosenIndex]) {
+    return {
+      status: "resolved_person",
+      person: pendingPeople[chosenIndex],
+      limit: effectiveLimit,
+    };
+  }
+
+  const exactPersonFull = pendingPeople.find((c) => c.norm === plain);
+  if (exactPersonFull) {
+    return {
+      status: "resolved_person",
+      person: exactPersonFull,
+      limit: effectiveLimit,
+    };
+  }
+
+  const personMatched = findMatchingPeopleForPrompt(userText, inventory);
+  if (!personMatched) return { status: "unrelated" };
+
+  const inPending = pendingPeople.filter((p) =>
+    personMatched.candidates.some((mc) => mc.name === p.name),
+  );
+  if (inPending.length === 1) {
+    return {
+      status: "resolved_person",
+      person: inPending[0],
+      limit: effectiveLimit,
+    };
+  }
+  if (inPending.length > 1) {
+    return {
+      status: "narrowed_person",
+      queryLabel: personMatched.queryLabel,
+      candidates: inPending,
+      limit: effectiveLimit,
+    };
+  }
+
+  return { status: "unrelated" };
+}
+
 /** Pedido de borrar un registro del inventario (no chats). */
 function looksLikeDeleteRecordAsk(userText: string) {
   const n = normalizeChatIntent(userText);
@@ -1158,8 +2101,14 @@ const INTENT_ALIAS: Record<string, string> = {
   ensename: "muestra",
   ensenarme: "muestra",
   muestrame: "muestra",
+  dime: "dame",
+  decirme: "dame",
+  digame: "dame",
   dimelos: "dame",
   dimelo: "dame",
+  consulta: "busca",
+  consultar: "busca",
+  consultame: "busca",
   gsuatria: "gustaria",
   gustaria: "gustaria",
   resgittos: "registros",
@@ -1614,10 +2563,10 @@ function pickDiscoveryTip(
   return "recent";
 }
 
-/** Pausa mínima para ver “escribiendo…” (corta; lo lento era el LLM). */
+/** Pausa mínima para transición visual suave (muy breve para no frenar la respuesta). */
 function assistantTypingDelayMs(reply: string) {
   const len = String(reply || "").trim().length;
-  return Math.min(700, Math.max(280, 220 + Math.min(len, 160)));
+  return Math.min(180, Math.max(80, 60 + Math.min(len, 80)));
 }
 
 function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
@@ -2129,6 +3078,9 @@ function ChatUserEditBox({
           onChange(next);
         }}
         onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing || event.keyCode === 229) {
+            return;
+          }
           if (event.key === "Escape") {
             event.preventDefault();
             onCancel();
@@ -2208,8 +3160,10 @@ function stripChatMarkdownTables(text: string) {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function renderChatRichText(text: string) {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+function renderChatInlineText(text: string) {
+  const parts = String(text || "")
+    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*)/g)
+    .filter(Boolean);
   return parts.map((part, index) => {
     if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
       return (
@@ -2221,8 +3175,162 @@ function renderChatRichText(text: string) {
     if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
       return <strong key={index}>{part.slice(2, -2)}</strong>;
     }
+    if (
+      part.startsWith("*") &&
+      part.endsWith("*") &&
+      !part.startsWith("**") &&
+      part.length > 2
+    ) {
+      return <em key={index}>{part.slice(1, -1)}</em>;
+    }
     return <span key={index}>{part}</span>;
   });
+}
+
+function renderChatRichText(text: string) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let keyCounter = 0;
+
+  while (i < lines.length) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    // 1. Markdown table block
+    if (/^\|.*\|$/.test(trimmed)) {
+      const tableLines: string[] = [];
+      while (i < lines.length && /^\|.*\|$/.test(lines[i].trim())) {
+        tableLines.push(lines[i].trim());
+        i += 1;
+      }
+      const rows = tableLines
+        .filter((row) => !/^\|[\s:\-\|]+\|$/.test(row))
+        .map((row) =>
+          row
+            .replace(/^\||\|$/g, "")
+            .split("|")
+            .map((cell) => cell.trim()),
+        );
+      if (rows.length > 0) {
+        const [header, ...body] = rows;
+        blocks.push(
+          <div key={`tbl-${keyCounter++}`} className="chat-rich-table-wrap">
+            <table className="chat-rich-table">
+              <thead>
+                <tr>
+                  {header.map((cell, cIdx) => (
+                    <th key={cIdx}>{renderChatInlineText(cell)}</th>
+                  ))}
+                </tr>
+              </thead>
+              {body.length > 0 ? (
+                <tbody>
+                  {body.map((r, rIdx) => (
+                    <tr key={rIdx}>
+                      {r.map((cell, cIdx) => (
+                        <td key={cIdx}>{renderChatInlineText(cell)}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              ) : null}
+            </table>
+          </div>,
+        );
+        continue;
+      }
+    }
+
+    // 2. Heading line (### / ##)
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push(
+        <h4 key={`hd-${keyCounter++}`} className="chat-rich-heading">
+          {renderChatInlineText(headingMatch[2])}
+        </h4>,
+      );
+      i += 1;
+      continue;
+    }
+
+    // 3. Unordered list (•, -, *)
+    if (/^[•\-\*]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length && /^[•\-\*]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^[•\-\*]\s+/, ""));
+        i += 1;
+      }
+      blocks.push(
+        <ul key={`ul-${keyCounter++}`} className="chat-rich-list">
+          {items.map((item, idx) => (
+            <li key={idx} className="chat-rich-list-item">
+              <span className="chat-rich-bullet" aria-hidden="true" />
+              <span className="chat-rich-list-content">
+                {renderChatInlineText(item)}
+              </span>
+            </li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    // 4. Ordered list (1. / 1))
+    if (/^\d+[\.\)]\s+/.test(trimmed)) {
+      const items: Array<{ num: string; content: string }> = [];
+      while (i < lines.length && /^\d+[\.\)]\s+/.test(lines[i].trim())) {
+        const m = lines[i].trim().match(/^(\d+)[\.\)]\s+(.+)$/);
+        if (m) {
+          items.push({ num: m[1], content: m[2] });
+        }
+        i += 1;
+      }
+      blocks.push(
+        <ol key={`ol-${keyCounter++}`} className="chat-rich-list is-ordered">
+          {items.map((item, idx) => (
+            <li key={idx} className="chat-rich-list-item">
+              <span className="chat-rich-order-badge" aria-hidden="true">
+                {item.num}
+              </span>
+              <span className="chat-rich-list-content">
+                {renderChatInlineText(item.content)}
+              </span>
+            </li>
+          ))}
+        </ol>,
+      );
+      continue;
+    }
+
+    // 5. Regular paragraph (group consecutive non-special lines)
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^(\|.*\|$|#{1,4}\s+|[•\-\*]\s+|\d+[\.\)]\s+)/.test(lines[i].trim())
+    ) {
+      paraLines.push(lines[i].trim());
+      i += 1;
+    }
+    blocks.push(
+      <p key={`p-${keyCounter++}`} className="chat-rich-p">
+        {paraLines.map((pLine, pIdx) => (
+          <span key={pIdx}>
+            {pIdx > 0 ? <br /> : null}
+            {renderChatInlineText(pLine)}
+          </span>
+        ))}
+      </p>,
+    );
+  }
+
+  return blocks.length > 0 ? blocks : renderChatInlineText(text);
 }
 
 type FilterSelectOption = {
@@ -2255,10 +3363,10 @@ function FilterSelect({
 
   useEffect(() => {
     if (!open) return;
-    const onPointer = (event: MouseEvent) => {
+    const onPointer = (event: globalThis.MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
-    const onKey = (event: KeyboardEvent) => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
     };
     window.addEventListener("mousedown", onPointer);
@@ -2338,10 +3446,10 @@ function MultiFilterSelect({
 
   useEffect(() => {
     if (!open) return;
-    const onPointer = (event: MouseEvent) => {
+    const onPointer = (event: globalThis.MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
-    const onKey = (event: KeyboardEvent) => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
     };
     window.addEventListener("mousedown", onPointer);
@@ -2774,13 +3882,13 @@ const SideRail = memo(function SideRail({
       setMenuChatId(null);
       setMenuPos(null);
     };
-    const onPointer = (event: MouseEvent) => {
+    const onPointer = (event: globalThis.MouseEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.closest(".sidebar-history-menu")) return;
       if (target?.closest(".sidebar-history-more")) return;
       close();
     };
-    const onKey = (event: KeyboardEvent) => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") close();
     };
     window.addEventListener("mousedown", onPointer);
@@ -3223,6 +4331,23 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [tokenMeters, setTokenMeters] = useState<Record<string, TokenMeterEntry>>({});
+  const [availableModels, setAvailableModels] = useState<ChatModelOption[]>([]);
+  const [activeLlmMeta, setActiveLlmMeta] = useState<{
+    provider: string;
+    providerLabel: string;
+    model: string;
+    keyFingerprint: string;
+    budget: number;
+  }>({
+    provider: "nvidia",
+    providerLabel: "NVIDIA NIM",
+    model: "nvidia/nemotron-3.5-bolt-e4b",
+    keyFingerprint: "default",
+    budget: 128_000,
+  });
+  const [tokenPopoverOpen, setTokenPopoverOpen] = useState(false);
+  const tokenMeterWrapRef = useRef<HTMLDivElement>(null);
   const chatHydratedRef = useRef(false);
   const chatLogRef = useRef<HTMLDivElement>(null);
   const chatStageRef = useRef<HTMLDivElement>(null);
@@ -3238,6 +4363,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const chatRequestGenRef = useRef(0);
   const pendingChatImportRef = useRef<NewInventarioItem[] | null>(null);
   const pendingFieldRevertRef = useRef<ChatFieldChange | null>(null);
+  const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
   const chatStarted = messages.some((message) => message.from === "user");
   const chatComposerBusy = useMemo(
     () =>
@@ -3277,11 +4403,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     for (let i = 0; i < messages.length; i += 1) {
       const message = messages[i];
       const next = messages[i + 1];
-      if (
-        message.from === "user" &&
-        next?.from === "bot" &&
-        messageHasSideData(next)
-      ) {
+      if (message.from === "user" && next?.from === "bot") {
         turns.push({ kind: "pair", user: message, bot: next });
         i += 1;
         continue;
@@ -3322,6 +4444,195 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       window.cancelAnimationFrame(raf2);
     };
   }, []);
+
+  useEffect(() => {
+    setTokenMeters(loadTokenMeters());
+    let alive = true;
+    void fetchChatHealth().then((llm) => {
+      if (!alive || !llm) return;
+      const modelsList = Array.isArray(llm.available_models) ? llm.available_models : [];
+      if (modelsList.length) {
+        setAvailableModels(modelsList);
+      }
+      const keyFingerprint = String(
+        llm.key_fingerprint ||
+          modelsList[0]?.key_fingerprint ||
+          llm.providers?.[0]?.key_fingerprint ||
+          "default",
+      );
+      const savedModelId = loadSelectedModelForKey(keyFingerprint);
+      const matchedSaved = savedModelId
+        ? modelsList.find((m) => m.id === savedModelId)
+        : undefined;
+      const bestDefault =
+        modelsList.find((m) => m.recommended) || modelsList[0];
+      const chosen = matchedSaved || bestDefault;
+
+      const provider = String(
+        chosen?.provider || llm.active_provider || llm.providers?.[0]?.name || "nvidia",
+      );
+      const providerLabel = String(
+        chosen?.provider_label ||
+          llm.active_provider_label ||
+          llm.providers?.[0]?.label ||
+          provider.toUpperCase(),
+      );
+      const model = String(
+        chosen?.id ||
+          llm.default_model ||
+          llm.active_model ||
+          llm.preferred_model ||
+          llm.providers?.[0]?.models?.[0] ||
+          "nvidia/nemotron-3.5-bolt-e4b",
+      );
+      const budget = Number(
+        chosen?.token_budget ||
+          llm.token_budget ||
+          llm.providers?.[0]?.token_budget ||
+          128_000,
+      );
+      setActiveLlmMeta({
+        provider,
+        providerLabel,
+        model,
+        keyFingerprint: String(chosen?.key_fingerprint || keyFingerprint),
+        budget: Number.isFinite(budget) && budget > 0 ? budget : 128_000,
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [rail]);
+
+  const selectLlmModel = useCallback((option: ChatModelOption) => {
+    saveSelectedModelForKey(option.key_fingerprint, option.id);
+    setActiveLlmMeta({
+      provider: option.provider,
+      providerLabel: option.provider_label || option.provider.toUpperCase(),
+      model: option.id,
+      keyFingerprint: option.key_fingerprint,
+      budget:
+        Number.isFinite(option.token_budget) && option.token_budget > 0
+          ? option.token_budget
+          : 128_000,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!tokenPopoverOpen) return;
+    const onPointer = (event: globalThis.MouseEvent) => {
+      if (!tokenMeterWrapRef.current?.contains(event.target as Node)) {
+        setTokenPopoverOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setTokenPopoverOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [tokenPopoverOpen]);
+
+  const recordTokenConsumption = useCallback(
+    (usage?: ChatTokenUsage | null, fallbackPrompt = "", fallbackReply = "") => {
+      const provider = String(usage?.provider || activeLlmMeta.provider || "nvidia");
+      const model = String(usage?.model || activeLlmMeta.model || "nvidia/nemotron-3.5-bolt-e4b");
+      const keyFingerprint = String(
+        usage?.key_fingerprint || activeLlmMeta.keyFingerprint || "default",
+      );
+      const budget =
+        Number(usage?.token_budget) > 0
+          ? Number(usage?.token_budget)
+          : activeLlmMeta.budget || 128_000;
+      const promptTokens =
+        usage && typeof usage.prompt_tokens === "number"
+          ? usage.prompt_tokens
+          : estimateTextTokens(fallbackPrompt);
+      const completionTokens =
+        usage && typeof usage.completion_tokens === "number"
+          ? usage.completion_tokens
+          : estimateTextTokens(fallbackReply);
+      const turnTotal =
+        usage && typeof usage.total_tokens === "number" && usage.total_tokens > 0
+          ? usage.total_tokens
+          : promptTokens + completionTokens;
+
+      const matchedCatalog = availableModels.find((m) => m.id === model);
+      setActiveLlmMeta((prev) => ({
+        provider,
+        providerLabel:
+          matchedCatalog?.provider_label ||
+          prev.providerLabel ||
+          provider.toUpperCase(),
+        model,
+        keyFingerprint,
+        budget,
+      }));
+
+      const meterId = `${provider}:${model}:${keyFingerprint}`;
+      setTokenMeters((prev) => {
+        const current = prev[meterId];
+        const nextEntry: TokenMeterEntry = {
+          used: (current?.used || 0) + turnTotal,
+          promptUsed: (current?.promptUsed || 0) + promptTokens,
+          completionUsed: (current?.completionUsed || 0) + completionTokens,
+          budget,
+          provider,
+          model,
+          keyFingerprint,
+          lastTurnTokens: turnTotal,
+          updatedAt: Date.now(),
+        };
+        const updated = { ...prev, [meterId]: nextEntry };
+        saveTokenMeters(updated);
+        return updated;
+      });
+    },
+    [activeLlmMeta],
+  );
+
+  const activeTokenMeter = useMemo(() => {
+    const meterId = `${activeLlmMeta.provider}:${activeLlmMeta.model}:${activeLlmMeta.keyFingerprint}`;
+    const stored = tokenMeters[meterId];
+    const draftTokens = draft.trim() ? estimateTextTokens(draft) : 0;
+    const baseUsed = stored?.used || 0;
+    const budget = stored?.budget || activeLlmMeta.budget || 128_000;
+    const totalUsed = Math.min(budget, baseUsed + draftTokens);
+    const remaining = Math.max(0, budget - totalUsed);
+    const pctUsed = Math.min(100, Math.max(0, (totalUsed / Math.max(1, budget)) * 100));
+    const pctRemaining = Math.max(0, 100 - pctUsed);
+    const shortModel = activeLlmMeta.model.includes("/")
+      ? activeLlmMeta.model.split("/").pop() || activeLlmMeta.model
+      : activeLlmMeta.model;
+    const matchedOption = availableModels.find(
+      (m) => m.id === activeLlmMeta.model,
+    );
+    return {
+      meterId,
+      provider: activeLlmMeta.provider.toUpperCase(),
+      providerLabel:
+        matchedOption?.provider_label ||
+        activeLlmMeta.providerLabel ||
+        activeLlmMeta.provider.toUpperCase(),
+      model: activeLlmMeta.model,
+      modelLabel: matchedOption?.label || shortModel,
+      shortModel,
+      keyFingerprint: activeLlmMeta.keyFingerprint,
+      used: totalUsed,
+      baseUsed,
+      draftTokens,
+      promptUsed: stored?.promptUsed || 0,
+      completionUsed: stored?.completionUsed || 0,
+      lastTurnTokens: stored?.lastTurnTokens || 0,
+      budget,
+      remaining,
+      pctUsed,
+      pctRemaining,
+    };
+  }, [activeLlmMeta, availableModels, tokenMeters, draft]);
 
   useEffect(() => {
     const loaded = loadChatSessions();
@@ -3987,6 +5298,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     };
 
     const layoutSlots = () => {
+      for (const turnEl of log.querySelectorAll<HTMLElement>(".chat-turn")) {
+        if (!turnEl.hasAttribute("data-side-msg") && turnEl.style.minHeight) {
+          turnEl.style.minHeight = "";
+        }
+      }
       for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
         const id = node.dataset.syncMsg;
         if (!id) continue;
@@ -3995,7 +5311,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         const main =
           anchor.querySelector<HTMLElement>(".chat-turn-main") ?? anchor;
         const contentH = Math.ceil(main.offsetHeight);
-        const next = `${Math.max(contentH, SIDE_SLOT_H) + AFTER_GAP_PX}px`;
+        const panelH = Math.min(
+          SIDE_SLOT_H,
+          Math.max(160, Math.ceil(node.offsetHeight) || SIDE_SLOT_H),
+        );
+        const next = `${Math.max(contentH, panelH) + AFTER_GAP_PX}px`;
         if (anchor.style.minHeight !== next) {
           anchor.style.boxSizing = "border-box";
           anchor.style.minHeight = next;
@@ -4194,38 +5514,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         !botPending &&
         !message.viewerOverview &&
         !(Array.isArray(message.qr) && message.qr.length) &&
+        !(Array.isArray(message.resultItems) && message.resultItems.length) &&
         etiquetaLimit == null &&
         hasConcreteInventoryAsk(userText, items, messages)
       ) {
-        const history = messages.slice(0, index).map((item) => ({
-          from: item.from,
-          text: item.text || "",
-          resultItems: item.resultItems,
-        }));
-        const focusPerson = detectPersonTotalAsk(userText, items, history);
-        const focusArea = focusPerson
-          ? undefined
-          : detectAreaTotalAsk(userText, items);
-        const overview = focusPerson
-          ? ("personTotal" as ViewerOverview)
-          : focusArea
-            ? ("areaTotal" as ViewerOverview)
-            : detectViewerOverview(userText);
-        const viewerFocus = focusPerson || focusArea;
+        const overview = detectViewerOverview(userText);
         if (overview) {
           changed = true;
           lastSide = {
             resultItems: [],
             qr: [],
             viewerOverview: overview,
-            viewerFocus,
+            viewerFocus: undefined,
           };
           return {
             ...message,
             resultItems: [],
             qr: undefined,
             viewerOverview: overview,
-            viewerFocus,
+            viewerFocus: undefined,
           };
         }
       }
@@ -4265,12 +5572,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
   useEffect(() => {
     if (!attachMenuOpen) return;
-    const onPointer = (event: MouseEvent) => {
+    const onPointer = (event: globalThis.MouseEvent) => {
       if (!chatAttachRef.current?.contains(event.target as Node)) {
         setAttachMenuOpen(false);
       }
     };
-    const onKey = (event: KeyboardEvent) => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") setAttachMenuOpen(false);
     };
     window.addEventListener("mousedown", onPointer);
@@ -4921,63 +6228,303 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       resultItems: message.resultItems,
     }));
 
-    // Inventario de una persona: mismos totales que el general, acotados a ella.
+    // 1. Resolver desambiguación pendiente (en memoria o reconstruida del último mensaje del bot)
+    let activePending = pendingDisambiguationRef.current;
+    if (!activePending && cleaned.length) {
+      const lastBotIdx = [...cleaned]
+        .map((m, idx) => ({ m, idx }))
+        .reverse()
+        .find((entry) => entry.m.from === "bot");
+      if (
+        lastBotIdx &&
+        (lastBotIdx.m.viewerOverview === "areaMatches" ||
+          lastBotIdx.m.viewerOverview === "personMatches")
+      ) {
+        const parsed = parseMatchesFocusFromMessage(lastBotIdx.m.viewerFocus);
+        if (parsed) {
+          const prevUserBeforeBot = [...cleaned.slice(0, lastBotIdx.idx)]
+            .reverse()
+            .find((m) => m.from === "user");
+          const prevLimit = prevUserBeforeBot
+            ? parseRequestedCount(prevUserBeforeBot.text)
+            : null;
+          activePending = {
+            kind:
+              lastBotIdx.m.viewerOverview === "areaMatches"
+                ? "area"
+                : "person",
+            queryLabel: parsed.label,
+            candidates: parsed.candidates,
+            intent: "list",
+            limit:
+              prevLimit != null
+                ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, prevLimit))
+                : null,
+          };
+        }
+      }
+    }
+
+    if (activePending) {
+      const resolved = resolvePendingDisambiguation(
+        userText || text,
+        activePending,
+        items,
+      );
+      if (resolved.status === "resolved_area") {
+        pendingDisambiguationRef.current = null;
+        try {
+          const { reply: localReply, shownRows } = buildExactAreaReply(
+            resolved.area,
+            resolved.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "areaTotal",
+            viewerFocus: resolved.area.name,
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      if (resolved.status === "resolved_person") {
+        pendingDisambiguationRef.current = null;
+        try {
+          const { reply: localReply, shownRows } = buildExactPersonReply(
+            resolved.person,
+            resolved.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "personTotal",
+            viewerFocus: resolved.person.name,
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      if (resolved.status === "narrowed_area") {
+        const candidateNames = resolved.candidates.map((c) => c.name);
+        pendingDisambiguationRef.current = {
+          kind: "area",
+          queryLabel: resolved.queryLabel,
+          candidates: candidateNames,
+          intent: resolved.intent,
+          limit: resolved.limit,
+        };
+        try {
+          const localReply = buildAreaDisambiguationReply(
+            resolved.queryLabel,
+            resolved.candidates,
+            resolved.intent,
+            resolved.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "areaMatches",
+            viewerFocus: encodeMatchesFocus(
+              resolved.queryLabel,
+              candidateNames,
+            ),
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      if (resolved.status === "narrowed_person") {
+        const candidateNames = resolved.candidates.map((c) => c.name);
+        pendingDisambiguationRef.current = {
+          kind: "person",
+          queryLabel: resolved.queryLabel,
+          candidates: candidateNames,
+          intent: "list",
+          limit: resolved.limit,
+        };
+        try {
+          const localReply = buildPersonDisambiguationReply(
+            resolved.queryLabel,
+            resolved.candidates,
+            resolved.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "personMatches",
+            viewerFocus: encodeMatchesFocus(
+              resolved.queryLabel,
+              candidateNames,
+            ),
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      // Si el usuario cambió de tema, limpiar la desambiguación pendiente
+      pendingDisambiguationRef.current = null;
+    }
+
+    // 2. Consulta de área (con desambiguación automática si existen 2 o más incidencias de área)
+    const areaQuery = findMatchingAreasForPrompt(userText || text, items);
+    if (areaQuery) {
+      if (areaQuery.candidates.length > 1) {
+        const candidateNames = areaQuery.candidates.map((c) => c.name);
+        pendingDisambiguationRef.current = {
+          kind: "area",
+          queryLabel: areaQuery.queryLabel,
+          candidates: candidateNames,
+          intent: areaQuery.intent,
+          limit: areaQuery.limit,
+        };
+        try {
+          const localReply = buildAreaDisambiguationReply(
+            areaQuery.queryLabel,
+            areaQuery.candidates,
+            areaQuery.intent,
+            areaQuery.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "areaMatches",
+            viewerFocus: encodeMatchesFocus(
+              areaQuery.queryLabel,
+              candidateNames,
+            ),
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      if (areaQuery.candidates.length === 1) {
+        const singleArea = areaQuery.candidates[0];
+        try {
+          const { reply: localReply, shownRows } = buildExactAreaReply(
+            singleArea,
+            areaQuery.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "areaTotal",
+            viewerFocus: singleArea.name,
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+    }
+
+    // 3. Consulta de persona (con desambiguación si existen 2 o más personas que coinciden)
+    const personQuery = findMatchingPeopleForPrompt(userText || text, items);
+    if (personQuery) {
+      if (personQuery.candidates.length > 1) {
+        const candidateNames = personQuery.candidates.map((c) => c.name);
+        pendingDisambiguationRef.current = {
+          kind: "person",
+          queryLabel: personQuery.queryLabel,
+          candidates: candidateNames,
+          intent: personQuery.intent,
+          limit: personQuery.limit,
+        };
+        try {
+          const localReply = buildPersonDisambiguationReply(
+            personQuery.queryLabel,
+            personQuery.candidates,
+            personQuery.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "personMatches",
+            viewerFocus: encodeMatchesFocus(
+              personQuery.queryLabel,
+              candidateNames,
+            ),
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+      if (personQuery.candidates.length === 1) {
+        const singlePerson = personQuery.candidates[0];
+        try {
+          const { reply: localReply, shownRows } = buildExactPersonReply(
+            singlePerson,
+            personQuery.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "personTotal",
+            viewerFocus: singlePerson.name,
+          });
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+        return;
+      }
+    }
+
+    // 4. Anáfora de persona ("su inventario", "de él")
     const earlyPerson = detectPersonTotalAsk(
       userText || text,
       items,
       chatHistory,
     );
     if (earlyPerson) {
+      const personCatalog = getAllPersonCatalog(items);
+      const exactP = personCatalog.find((p) => p.name === earlyPerson);
       try {
-        const localReply = buildPersonTotalReply(earlyPerson, items);
-        await ensureTypingPause(localReply);
-        finishBotReply(sessionId, botId, localReply, {
-          resultItems: [],
-          qr: [],
-          viewerOverview: "personTotal",
-          viewerFocus: earlyPerson,
-        });
-      } catch {
-        /* abort / nuevo mensaje */
-      }
-      return;
-    }
-
-    // Total de un área: respuesta + incidencia locales (exacto, con pausa de tipeo).
-    const earlyArea = detectAreaTotalAsk(userText || text, items);
-    if (earlyArea) {
-      try {
-        const localReply = buildAreaTotalReply(earlyArea, items);
-        await ensureTypingPause(localReply);
-        finishBotReply(sessionId, botId, localReply, {
-          resultItems: [],
-          qr: [],
-          viewerOverview: "areaTotal",
-          viewerFocus: earlyArea,
-        });
-      } catch {
-        /* abort / nuevo mensaje */
-      }
-      return;
-    }
-
-    // Lista de registros/etiquetas de un área → local (tablita, no ranking de áreas).
-    const earlyAreaList = detectAreaListAsk(userText || text, items);
-    if (earlyAreaList) {
-      try {
-        const rows = rowsForAreaNeedle(
-          items,
-          earlyAreaList.area,
-          earlyAreaList.limit,
-        );
-        const localReply = buildAreaListReply(earlyAreaList.area, rows);
-        await ensureTypingPause(localReply);
-        finishBotReply(sessionId, botId, localReply, {
-          resultItems: rows.map((row) => rowToChatApiItem(row)),
-          qr: [],
-          viewerOverview: "areaTotal",
-          viewerFocus: earlyAreaList.area,
-        });
+        if (exactP) {
+          const { reply: localReply, shownRows } = buildExactPersonReply(
+            exactP,
+            parseRequestedCount(userText || text),
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "personTotal",
+            viewerFocus: exactP.name,
+          });
+        } else {
+          const localReply = buildPersonTotalReply(earlyPerson, items);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "personTotal",
+            viewerFocus: earlyPerson,
+          });
+        }
       } catch {
         /* abort / nuevo mensaje */
       }
@@ -4987,6 +6534,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const data = await askInventoryChat(userText || text, history, {
       signal: controller.signal,
       memory: formatChatMemoryForPrompt(),
+      model: activeLlmMeta.model,
     });
     if (
       requestGen !== chatRequestGenRef.current ||
@@ -4996,6 +6544,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
     reply = (data.reply || "").trim() || reply;
+    recordTokenConsumption(data.usage, userText || text, reply);
     sideItems = data.items || [];
     mutated = Boolean(data.mutated);
     qrPayloads = data.qr || [];
@@ -5235,7 +6784,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         : overview === "areaTotal" && focusArea
           ? focusArea
           : undefined;
-    if (overview) {
+    if (
+      overview &&
+      overview !== "areaTotal" &&
+      overview !== "personTotal"
+    ) {
       sideItems = [];
       qrPayloads = [];
     }
@@ -5344,7 +6897,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ];
           for (const field of fields) {
             const oldValue = String(before[field] ?? "").trim();
-            const newValue = String(after[field] ?? "").trim();
+            const afterRec = after as Record<string, unknown>;
+            const newValue = String(afterRec[field] ?? "").trim();
             if (oldValue === newValue) continue;
             rememberFieldChange({
               id,
@@ -6270,9 +7824,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                           const isTyping = /^consultando el inventario/i.test(
                             String(message.text || "").trim(),
                           );
+                          const hasSide = messageHasSideData(message);
                           if (isTyping) {
                             return (
                               <div className="chat-response-block is-typing">
+                                <div className="chat-response-head">
+                                  <span className="chat-response-brand">
+                                    <span
+                                      className="chat-response-brand-dot is-pulse"
+                                      aria-hidden="true"
+                                    />
+                                    <span>Procesando consulta…</span>
+                                  </span>
+                                </div>
                                 <div
                                   className="chat-typing"
                                   role="status"
@@ -6325,69 +7889,86 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             );
                           }
                           return (
-                          <div className="chat-response-block">
-                            <div className="chat-response">
-                              {renderChatRichText(message.text)}
+                            <div className="chat-response-block">
+                              <div className="chat-response-head">
+                                <span className="chat-response-brand">
+                                  <span
+                                    className="chat-response-brand-dot"
+                                    aria-hidden="true"
+                                  />
+                                  <span>Asistente de Inventario</span>
+                                </span>
+                                <span className="chat-response-meta">
+                                  {hasSide ? (
+                                    <span className="chat-response-sync-pill">
+                                      Visor activo
+                                    </span>
+                                  ) : null}
+                                  <time
+                                    className="chat-time"
+                                    dateTime={new Date(
+                                      message.at || Date.now(),
+                                    ).toISOString()}
+                                  >
+                                    {formatChatTime(message.at)}
+                                  </time>
+                                </span>
+                              </div>
+                              <div className="chat-response">
+                                {renderChatRichText(message.text)}
+                              </div>
+                              <div
+                                className="chat-response-actions"
+                                aria-label="Acciones de la respuesta"
+                              >
+                                <button
+                                  type="button"
+                                  className="chat-response-action"
+                                  title="Copiar"
+                                  aria-label="Copiar respuesta"
+                                  onClick={() => {
+                                    void copyChatText(message.text);
+                                  }}
+                                >
+                                  <Copy size={14} strokeWidth={1.8} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="chat-response-action"
+                                  title="Compartir"
+                                  aria-label="Compartir respuesta"
+                                >
+                                  <Share2 size={14} strokeWidth={1.8} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="chat-response-action"
+                                  title="Me gusta"
+                                  aria-label="Me gusta"
+                                >
+                                  <ThumbsUp size={14} strokeWidth={1.8} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="chat-response-action"
+                                  title="No me gusta"
+                                  aria-label="No me gusta"
+                                >
+                                  <ThumbsDown size={14} strokeWidth={1.8} />
+                                </button>
+                              </div>
                             </div>
-                            <div
-                              className="chat-response-actions"
-                              aria-label="Acciones de la respuesta"
-                            >
-                              <button
-                                type="button"
-                                className="chat-response-action"
-                                title="Copiar"
-                                aria-label="Copiar respuesta"
-                                onClick={() => {
-                                  void copyChatText(message.text);
-                                }}
-                              >
-                                <Copy size={15} strokeWidth={1.8} />
-                              </button>
-                              <button
-                                type="button"
-                                className="chat-response-action"
-                                title="Compartir"
-                                aria-label="Compartir respuesta"
-                              >
-                                <Share2 size={15} strokeWidth={1.8} />
-                              </button>
-                              <button
-                                type="button"
-                                className="chat-response-action"
-                                title="Me gusta"
-                                aria-label="Me gusta"
-                              >
-                                <ThumbsUp size={15} strokeWidth={1.8} />
-                              </button>
-                              <button
-                                type="button"
-                                className="chat-response-action"
-                                title="No me gusta"
-                                aria-label="No me gusta"
-                              >
-                                <ThumbsDown size={15} strokeWidth={1.8} />
-                              </button>
-                              <button
-                                type="button"
-                                className="chat-response-action"
-                                title="Más"
-                                aria-label="Más opciones"
-                              >
-                                <MoreVertical size={15} strokeWidth={1.8} />
-                              </button>
-                            </div>
-                          </div>
                           );
                         };
 
                         if (turn.kind === "pair") {
+                          const hasSide = messageHasSideData(turn.bot);
                           return (
                             <section
                               className="chat-turn"
                               key={`pair-${turn.user.id}-${turn.bot.id}`}
                               data-chat-latest={isLatest ? "true" : undefined}
-                              data-side-msg={turn.bot.id}
+                              data-side-msg={hasSide ? turn.bot.id : undefined}
                             >
                               <div className="chat-turn-main">
                                 <div className="chat-turn-query">
@@ -6603,6 +8184,206 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                         }
                         aria-label="Mensaje para el asistente"
                       />
+                      <div
+                        className="chat-token-meter-wrap"
+                        ref={tokenMeterWrapRef}
+                      >
+                        <button
+                          type="button"
+                          className={[
+                            "chat-token-meter-btn",
+                            activeTokenMeter.pctUsed >= 85
+                              ? "is-danger"
+                              : activeTokenMeter.pctUsed >= 60
+                                ? "is-warn"
+                                : "is-ok",
+                            tokenPopoverOpen ? "is-open" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          onClick={() => setTokenPopoverOpen((open) => !open)}
+                          aria-label={`Uso de tokens: ${formatCompactTokens(activeTokenMeter.remaining)} restantes (${activeTokenMeter.shortModel})`}
+                          aria-expanded={tokenPopoverOpen}
+                          title={`${formatCompactTokens(activeTokenMeter.remaining)} tokens restantes · ${activeTokenMeter.provider} (${activeTokenMeter.shortModel})`}
+                        >
+                          <svg
+                            className="chat-token-ring-svg"
+                            width="22"
+                            height="22"
+                            viewBox="0 0 24 24"
+                            aria-hidden="true"
+                          >
+                            <circle
+                              className="chat-token-ring-track"
+                              cx="12"
+                              cy="12"
+                              r="9"
+                              fill="none"
+                              strokeWidth="2.4"
+                            />
+                            <circle
+                              className="chat-token-ring-fill"
+                              cx="12"
+                              cy="12"
+                              r="9"
+                              fill="none"
+                              strokeWidth="2.4"
+                              strokeLinecap="round"
+                              strokeDasharray={56.5487}
+                              strokeDashoffset={
+                                56.5487 *
+                                (1 -
+                                  Math.min(
+                                    1,
+                                    Math.max(
+                                      activeTokenMeter.used > 0 ? 0.04 : 0,
+                                      activeTokenMeter.pctUsed / 100,
+                                    ),
+                                  ))
+                              }
+                            />
+                          </svg>
+                          <span className="chat-token-meter-badge">
+                            {formatCompactTokens(activeTokenMeter.remaining)}
+                          </span>
+                        </button>
+                        {tokenPopoverOpen ? (
+                          <div
+                            className="chat-token-popover"
+                            role="dialog"
+                            aria-label="Detalle de uso de tokens"
+                          >
+                            <div className="chat-token-popover-head">
+                              <span className="chat-token-popover-title">
+                                Contexto y Tokens
+                              </span>
+                              <span className="chat-token-popover-pill">
+                                {activeTokenMeter.providerLabel}
+                              </span>
+                            </div>
+                            <div className="chat-token-popover-model">
+                              <strong>{activeTokenMeter.modelLabel}</strong>
+                              <span>Key #{activeTokenMeter.keyFingerprint.slice(0, 6)}</span>
+                            </div>
+                            <div className="chat-token-popover-bar">
+                              <span
+                                style={{
+                                  width: `${Math.max(
+                                    activeTokenMeter.used > 0 ? 3 : 0,
+                                    Math.min(100, activeTokenMeter.pctUsed),
+                                  )}%`,
+                                }}
+                              />
+                            </div>
+                            <div className="chat-token-popover-grid">
+                              <div>
+                                <span>Restantes</span>
+                                <strong>
+                                  {formatNumber(activeTokenMeter.remaining)} (
+                                  {activeTokenMeter.pctRemaining.toFixed(1)}%)
+                                </strong>
+                              </div>
+                              <div>
+                                <span>Usados</span>
+                                <strong>
+                                  {formatNumber(activeTokenMeter.used)} /{" "}
+                                  {formatCompactTokens(activeTokenMeter.budget)}
+                                </strong>
+                              </div>
+                              <div>
+                                <span>Prompt / Resp.</span>
+                                <strong>
+                                  {formatCompactTokens(activeTokenMeter.promptUsed)} /{" "}
+                                  {formatCompactTokens(activeTokenMeter.completionUsed)}
+                                </strong>
+                              </div>
+                              <div>
+                                <span>En borrador</span>
+                                <strong>
+                                  +{formatNumber(activeTokenMeter.draftTokens)} tok
+                                </strong>
+                              </div>
+                            </div>
+                            {availableModels.length > 0 ? (
+                              <div className="chat-token-models-section">
+                                <div className="chat-token-models-head">
+                                  <span>Modelos disponibles (según tu API Key)</span>
+                                </div>
+                                <div
+                                  className="chat-token-models-list"
+                                  role="listbox"
+                                  aria-label="Seleccionar modelo de IA"
+                                >
+                                  {availableModels.map((opt) => {
+                                    const isSelected = opt.id === activeTokenMeter.model;
+                                    return (
+                                      <button
+                                        key={`${opt.provider}:${opt.id}`}
+                                        type="button"
+                                        role="option"
+                                        aria-selected={isSelected}
+                                        className={
+                                          isSelected
+                                            ? "chat-token-model-item is-selected"
+                                            : "chat-token-model-item"
+                                        }
+                                        onClick={() => selectLlmModel(opt)}
+                                      >
+                                        <div className="chat-token-model-main">
+                                          <span className="chat-token-model-name">
+                                            {opt.label}
+                                          </span>
+                                          <span
+                                            className={
+                                              opt.recommended
+                                                ? "chat-token-model-badge is-best"
+                                                : "chat-token-model-badge"
+                                            }
+                                          >
+                                            {opt.badge}
+                                          </span>
+                                        </div>
+                                        <div className="chat-token-model-right">
+                                          <span className="chat-token-model-cap">
+                                            {formatCompactTokens(opt.token_budget)}
+                                          </span>
+                                          {isSelected ? (
+                                            <Check
+                                              size={13}
+                                              strokeWidth={2.4}
+                                              className="chat-token-model-check"
+                                            />
+                                          ) : null}
+                                        </div>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ) : null}
+                            <div className="chat-token-popover-foot">
+                              <span>
+                                Último turno:{" "}
+                                {formatNumber(activeTokenMeter.lastTurnTokens)} tok
+                              </span>
+                              <button
+                                type="button"
+                                className="chat-token-reset-btn"
+                                onClick={() => {
+                                  setTokenMeters((prev) => {
+                                    const next = { ...prev };
+                                    delete next[activeTokenMeter.meterId];
+                                    saveTokenMeters(next);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                Reiniciar
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
                       {draft.trim() || pendingAttach ? (
                         <button
                           type="submit"
@@ -6645,10 +8426,16 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             qrCards={companion.qrCards}
                             overview={companion.overview}
                             overviewFocus={companion.overviewFocus}
+                            onSelectAreaOption={(areaName) => {
+                              void sendChat(areaName);
+                            }}
+                            onSelectPersonOption={(personName) => {
+                              void sendChat(personName);
+                            }}
                             onSelectItem={(item) => {
                               const rawId = item.id;
                               const id =
-                                rawId == null || rawId === ""
+                                rawId == null || String(rawId) === ""
                                   ? NaN
                                   : Number(rawId);
                               const etq = String(item.etiqueta ?? "")

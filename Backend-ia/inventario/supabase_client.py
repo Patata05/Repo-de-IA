@@ -1,3 +1,4 @@
+import html
 import json
 import re
 import time
@@ -11,17 +12,118 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_ENV_PATH = BASE_DIR.parent / "Database" / ".env.local"
+ROOT_ENV_PATH = BASE_DIR.parent / ".env"
+ROOT_LOCAL_ENV_PATH = BASE_DIR.parent / ".env.local"
 BACKEND_ENV_PATH = BASE_DIR / ".env"
 
 _CACHE: dict[str, object] = {"rows": None, "at": 0.0, "used": None, "error": None}
-_CACHE_TTL_SEC = 60.0
+_CACHE_TTL_SEC = 180.0
 _PAGE_SIZE = 1000
 
+
+def _sanitize_row_strings(row: dict) -> dict:
+    for k, v in list(row.items()):
+        if isinstance(v, str) and "&" in v:
+            row[k] = html.unescape(v)
+    return row
+
+
 def _fold_text(value: object) -> str:
-    text = unicodedata.normalize("NFD", str(value or "").lower())
+    raw_str = html.unescape(str(value or "")) if "&" in str(value or "") else str(value or "")
+    text = unicodedata.normalize("NFD", raw_str.lower())
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_SEARCH_STOPWORDS = frozenset(
+    {
+        "busca",
+        "buscar",
+        "buscame",
+        "si",
+        "hay",
+        "existe",
+        "existen",
+        "dame",
+        "muestra",
+        "mostrar",
+        "muestrame",
+        "ver",
+        "los",
+        "las",
+        "el",
+        "la",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "de",
+        "del",
+        "en",
+        "con",
+        "por",
+        "para",
+        "que",
+        "cual",
+        "cuales",
+        "cuanto",
+        "cuantos",
+        "cuanta",
+        "cuantas",
+        "tiene",
+        "tienen",
+        "tenemos",
+        "articulo",
+        "articulos",
+        "equipo",
+        "equipos",
+        "item",
+        "items",
+        "registro",
+        "registros",
+        "inventario",
+        "lista",
+        "listar",
+        "listado",
+        "todos",
+        "todas",
+        "todo",
+        "son",
+        "estan",
+        "esta",
+    }
+)
+
+
+def _token_variants(token: str) -> list[str]:
+    """Devuelve el token y sus variantes singulares/raíz en español/inglés."""
+    t = token.strip().lower()
+    if not t:
+        return []
+    variants = [t]
+    if len(t) > 4 and t.endswith("es") and t[-3] in "rnldzjsx":
+        variants.append(t[:-2])
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        variants.append(t[:-1])
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def _extract_search_tokens(query: str) -> list[str]:
+    raw_tokens = [t for t in _fold_text(query).split() if t]
+    if not raw_tokens:
+        return []
+    filtered = [t for t in raw_tokens if t not in _SEARCH_STOPWORDS]
+    return filtered or raw_tokens
+
+
+def _token_matches_blob(token: str, blob: str, blob_tokens: set[str] | list[str]) -> bool:
+    for variant in _token_variants(token):
+        if variant in blob_tokens:
+            return True
+        if len(variant) > 2 and variant in blob:
+            return True
+    return False
 
 
 WRITABLE_FIELDS = frozenset(
@@ -42,7 +144,9 @@ WRITABLE_FIELDS = frozenset(
 
 
 def _load_env() -> dict[str, str]:
-    load_dotenv(BACKEND_ENV_PATH, override=False)
+    load_dotenv(BACKEND_ENV_PATH, override=True)
+    load_dotenv(ROOT_LOCAL_ENV_PATH, override=False)
+    load_dotenv(ROOT_ENV_PATH, override=False)
     load_dotenv(DB_ENV_PATH, override=False)
     keys = (
         "NEXT_PUBLIC_SUPABASE_URL",
@@ -70,21 +174,34 @@ def _load_env() -> dict[str, str]:
         "MUSE_MODEL",
         "META_MODEL",
         "META_BASE_URL",
+        "NVIDIA_API_KEY",
+        "NVIDIA_MODEL",
+        "NVIDIA_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MODEL",
+        "API_KEY",
+        "LLM_API_KEY",
+        "AI_API_KEY",
+        "NEXT_PUBLIC_CHAT_API_URL",
     )
     values: dict[str, str] = {}
     for key in keys:
         val = os.getenv(key, "").strip()
         if val:
             values[key] = val
-    if DB_ENV_PATH.exists():
-        for line in DB_ENV_PATH.read_text(encoding="utf-8").splitlines():
-            trimmed = line.strip()
-            if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
-                continue
-            k, v = trimmed.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if k and v and k not in values:
-                values[k] = v
+    for extra_path in (BACKEND_ENV_PATH, ROOT_LOCAL_ENV_PATH, ROOT_ENV_PATH, DB_ENV_PATH):
+        if extra_path.exists():
+            for line in extra_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                trimmed = line.strip()
+                if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
+                    continue
+                k, v = trimmed.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and v and k not in values:
+                    values[k] = v
     if BACKEND_ENV_PATH.exists():
         for line in BACKEND_ENV_PATH.read_text(encoding="utf-8").splitlines():
             trimmed = line.strip()
@@ -215,7 +332,13 @@ def _parse_total_from_content_range(content_range: str | None) -> int | None:
 
 
 def count_inventario(filters_qs: str = "") -> tuple[int | None, str | None]:
-    """Conteo exacto vía PostgREST (sin traer todas las filas)."""
+    """Conteo exacto vía caché en memoria o PostgREST."""
+    if not filters_qs:
+        now = time.monotonic()
+        cached_rows = _CACHE.get("rows")
+        if isinstance(cached_rows, list) and now - float(_CACHE.get("at") or 0) < _CACHE_TTL_SEC:
+            return len(cached_rows), None
+
     env = get_env()
     base, attempts = _supabase_base_and_keys(env)
     if not base or not attempts:
@@ -247,13 +370,25 @@ def count_inventario(filters_qs: str = "") -> tuple[int | None, str | None]:
 
 
 def count_por_campo(campo: str, valor: str) -> tuple[int | None, str | None]:
-    """Cuenta filas donde campo contiene valor (ilike)."""
+    """Cuenta filas donde campo contiene valor (desde caché en memoria o ilike)."""
     campo = campo.strip().lower()
     if campo not in WRITABLE_FIELDS and campo != "id":
         return None, f"Campo no permitido: {campo}"
     valor = valor.strip()
     if not valor:
         return None, "Falta el valor a buscar"
+    rows, error, _ = read_inventario()
+    if not error and isinstance(rows, list):
+        tokens = _extract_search_tokens(valor)
+        count = 0
+        for row in rows:
+            blob = _fold_text(row.get(campo))
+            if not blob:
+                continue
+            blob_tokens = set(blob.split())
+            if all(_token_matches_blob(t, blob, blob_tokens) for t in tokens):
+                count += 1
+        return count, None
     # escape comas/parens mínimos para PostgREST
     safe = valor.replace(",", " ").replace(")", " ").replace("(", " ")
     return count_inventario(f"{campo}=ilike.*{safe}*")
@@ -272,14 +407,14 @@ def list_por_campo(
     rows, error, _ = read_inventario()
     if error:
         return [], error
-    tokens = [t for t in _fold_text(valor).split() if t] or [_fold_text(valor)]
+    tokens = _extract_search_tokens(valor)
     matched: list[dict] = []
     for row in rows:
         blob = _fold_text(row.get(campo))
         if not blob:
             continue
-        blob_tokens = blob.split()
-        if all(t in blob_tokens or (len(t) > 1 and t in blob) for t in tokens):
+        blob_tokens = set(blob.split())
+        if all(_token_matches_blob(t, blob, blob_tokens) for t in tokens):
             matched.append(row)
             if len(matched) >= max(1, min(limit, 50)):
                 break
@@ -324,6 +459,9 @@ def read_inventario(force: bool = False) -> tuple[list[dict], str | None, str | 
                 page_error = error
                 break
             chunk = payload if isinstance(payload, list) else []
+            for r in chunk:
+                if isinstance(r, dict):
+                    _sanitize_row_strings(r)
             rows.extend(chunk)
             if len(chunk) < _PAGE_SIZE:
                 break
@@ -406,55 +544,96 @@ def listar_recientes(
     return [], last_error
 
 
-def search_inventario(query: str, limit: int = 20) -> tuple[list[dict], str | None]:
+def search_inventario_with_total(
+    query: str, limit: int = 20
+) -> tuple[list[dict], int, str | None]:
     rows, error, _ = read_inventario()
     if error:
-        return [], error
-    tokens = [t for t in _fold_text(query).split() if t]
+        return [], 0, error
+    tokens = _extract_search_tokens(query)
+    capped_limit = max(1, min(limit, 50))
     if not tokens:
-        return rows[: max(1, min(limit, 50))], None
+        return rows[:capped_limit], len(rows), None
 
-    scored: list[tuple[int, dict]] = []
+    full_matches: list[tuple[int, dict]] = []
+    partial_matches: list[tuple[int, dict]] = []
     for row in rows:
         etiqueta = _fold_text(row.get("etiqueta"))
         persona = _fold_text(row.get("persona"))
         articulo = _fold_text(row.get("articulo"))
+        marca = _fold_text(row.get("marca"))
+        modelo = _fold_text(row.get("modelo"))
+        serie = _fold_text(row.get("serie"))
         area = _fold_text(row.get("area"))
+        origen = _fold_text(row.get("origen"))
+        estado = _fold_text(row.get("estado"))
+        obs = _fold_text(row.get("observaciones"))
         blob_parts = [
             etiqueta,
             articulo,
-            _fold_text(row.get("marca")),
-            _fold_text(row.get("modelo")),
-            _fold_text(row.get("serie")),
+            marca,
+            modelo,
+            serie,
             area,
             persona,
-            _fold_text(row.get("origen")),
-            _fold_text(row.get("estado")),
-            _fold_text(row.get("observaciones")),
+            origen,
+            estado,
+            obs,
         ]
         blob = " ".join(p for p in blob_parts if p)
+        if not blob:
+            continue
         blob_tokens = set(blob.split())
         area_tokens = set(area.split())
+        articulo_tokens = set(articulo.split())
+        marca_tokens = set(marca.split())
+        persona_tokens = set(persona.split())
+
         score = 0
-        if tokens and all(t in area_tokens for t in tokens):
-            score += 40
+        matched_token_count = 0
         for t in tokens:
-            if t == etiqueta:
-                score += 15
-            elif t in etiqueta:
-                score += 8
-            if t in persona.split() or (len(t) > 1 and t in persona):
-                score += 8
-            if t in articulo.split() or (len(t) > 1 and t in articulo):
-                score += 6
-            if t in area_tokens or (len(t) > 1 and t in area):
-                score += 12
-            if t in blob_tokens or (len(t) > 1 and t in blob):
-                score += 2
-        if score > 0:
-            scored.append((score, row))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in scored[: max(1, min(limit, 50))]], None
+            t_matched = False
+            for v in _token_variants(t):
+                if v == etiqueta:
+                    score += 30
+                    t_matched = True
+                elif v in etiqueta and len(v) > 2:
+                    score += 12
+                    t_matched = True
+                if v in articulo_tokens or (len(v) > 2 and v in articulo):
+                    score += 16
+                    t_matched = True
+                if v in marca_tokens or (len(v) > 2 and v in marca):
+                    score += 14
+                    t_matched = True
+                if v in area_tokens or (len(v) > 2 and v in area):
+                    score += 14
+                    t_matched = True
+                if v in persona_tokens or (len(v) > 2 and v in persona):
+                    score += 12
+                    t_matched = True
+                if v in blob_tokens or (len(v) > 2 and v in blob):
+                    score += 4
+                    t_matched = True
+            if t_matched:
+                matched_token_count += 1
+
+        if matched_token_count == len(tokens):
+            if len(tokens) > 1:
+                score += 50
+            full_matches.append((score, row))
+        elif matched_token_count > 0:
+            partial_matches.append((score + matched_token_count * 10, row))
+
+    chosen = full_matches if full_matches else partial_matches
+    chosen.sort(key=lambda x: x[0], reverse=True)
+    total_found = len(chosen)
+    return [r for _, r in chosen[:capped_limit]], total_found, None
+
+
+def search_inventario(query: str, limit: int = 20) -> tuple[list[dict], str | None]:
+    items, _total, error = search_inventario_with_total(query, limit=limit)
+    return items, error
 
 
 def resumen_inventario() -> tuple[dict, str | None]:

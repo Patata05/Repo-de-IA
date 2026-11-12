@@ -252,12 +252,18 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "buscar_inventario":
             query = str(args.get("query") or "").strip()
             limit = int(args.get("limit") or 15)
-            rows, error = db.search_inventario(query, limit=limit)
+            rows, total_matches, error = db.search_inventario_with_total(query, limit=limit)
             if error:
                 return {"ok": False, "error": error}
+            areas: dict[str, int] = {}
+            for row in rows:
+                area = str(row.get("area") or "Sin área").strip() or "Sin área"
+                areas[area] = areas.get(area, 0) + 1
             return {
                 "ok": True,
+                "total": total_matches,
                 "count": len(rows),
+                "areas": areas,
                 "items": [_compact_row(r) for r in rows],
             }
 
@@ -465,9 +471,13 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def dump_tool_result(result: dict[str, Any]) -> str:
-    """Payload compacto para el LLM (menos tokens = respuesta más rápida)."""
+    """Payload compacto para el LLM (menos tokens = respuesta más rápida y económica)."""
     if not isinstance(result, dict):
         return json.dumps({"ok": False, "error": "resultado inválido"}, ensure_ascii=False)
+
+    def _slim_item(row: dict[str, Any]) -> dict[str, Any]:
+        keep = ("id", "etiqueta", "articulo", "marca", "modelo", "area", "persona", "estado", "origen")
+        return {k: row[k] for k in keep if row.get(k) not in (None, "")}
 
     slim: dict[str, Any] = {
         k: result[k]
@@ -475,17 +485,26 @@ def dump_tool_result(result: dict[str, Any]) -> str:
         if k in result
     }
     if isinstance(result.get("item"), dict):
-        slim["item"] = _compact_row(result["item"])
+        slim["item"] = _slim_item(result["item"])
     items = result.get("items")
     if isinstance(items, list):
         slim["items"] = [
-            _compact_row(row) if isinstance(row, dict) else row for row in items[:8]
+            _slim_item(row) if isinstance(row, dict) else row for row in items[:5]
         ]
-        if len(items) > 8:
-            slim["items_truncated"] = len(items) - 8
+        if len(items) > 5:
+            slim["items_truncated"] = len(items) - 5
     qrs = result.get("qrs")
     if isinstance(qrs, list):
-        slim["qrs"] = qrs[:7]
+        slim["qrs"] = [
+            {
+                "etiqueta": q.get("etiqueta"),
+                "articulo": q.get("articulo"),
+                "area": (q.get("item") or {}).get("area"),
+                "persona": (q.get("item") or {}).get("persona"),
+            }
+            for q in qrs[:7]
+            if isinstance(q, dict)
+        ]
         slim["count"] = slim.get("count", len(qrs))
     # Resumen / totales: pasar campos numéricos útiles
     for k, v in result.items():
