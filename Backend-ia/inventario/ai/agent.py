@@ -10,7 +10,7 @@ from inventario.ai.client import (
     get_llm_endpoints,
     get_token_budget,
 )
-from inventario.ai.local_fallback import local_chat_answer
+from inventario.ai.local_fallback import local_chat_answer, pick_ack_reply
 from inventario.ai.tools import OPENAI_TOOLS, dump_tool_result, run_tool
 
 SYSTEM_PROMPT = """Eres el asistente experto de inventario de oficina (español de México).
@@ -47,8 +47,12 @@ Importación Excel/CSV:
 
 Cambios (actualizar / crear / eliminar):
 - Si piden cambiar datos: primero busca el registro y PROPÓN el cambio.
+- Formato OBLIGATORIO de la propuesta (una línea por cambio):
+  • **ETIQUETA** · **campo** · “valor actual” → “valor nuevo”
 - NUNCA llames actualizar_campo ni crear_articulo hasta que el usuario confirme (sí / confirma / adelante / ok / dale).
 - Eliminar registros: pide la etiqueta si falta y aclara que debe confirmar en el aviso modal.
+- Comparar inventarios (Inventario N vs S/O): resume faltan X / sobran Y / cambiaron Z; no digas solo “hay duplicados”.
+- Si el mensaje es vago o ambiguo (“no se ven”, “eso”, “y eso”), NO inventes una búsqueda distinta: pregunta qué acción quiere o reutiliza el contexto del mensaje anterior.
 
 ESTRUCTURA VISUAL UNIFORME (OBLIGATORIA EN CADA RESPUESTA):
 1. **Resumen ejecutivo inicial (1 párrafo breve):** Empieza directamente con la cifra exacta y el hallazgo principal usando **negritas** para cifras, áreas, personas, marcas y etiquetas.
@@ -785,10 +789,27 @@ def _try_fast_inventory_query(message: str) -> tuple[str, list[dict], list[dict]
         return text, items, []
 
     # 11. Búsqueda estructurada rápida (artículo, marca, persona o combinación como "laptops dell")
-    search_fast = _try_structured_search_fast(message)
-    if search_fast is not None:
-        text, items = search_fast
-        return text, items, []
+    # No interceptar anáforas ("esas etiquetas", "las de arriba") ni reparaciones de visor
+    # ("no se ven"): el front reusa el resultado previo.
+    msg_anaphora = _norm_text(message or "")
+    if re.search(
+        r"\b(esas|esos|estas|estos|esa|ese|este|esta|arriba|anteriores?|previas?|mismas?|mismos)\b",
+        msg_anaphora,
+    ) or re.search(
+        r"\bno\s+se\s+(ve|ven|veen|nota|notan|muestra|muestran)\b"
+        r"|\bno\s+(aparecen|aparece|salen|sale)\b"
+        r"|\bno\s+(los|las)\s+(veo|ve|aparecen|estan)\b"
+        r"|\bno\s+me\s+(los|las)?\s*(veo|aparecen)\b"
+        r"|\b(donde|dónde)\s+(estan|están|esta|está|quedo|quedó|queda)\b"
+        r"|\b(abre|abrir|muestra|mostrar|pon|poner)\s+(el\s+)?(visor|panel|listado)\b",
+        msg_anaphora,
+    ):
+        pass
+    else:
+        search_fast = _try_structured_search_fast(message)
+        if search_fast is not None:
+            text, items = search_fast
+            return text, items, []
 
     return None
 
@@ -1032,6 +1053,7 @@ def _try_structured_search_fast(message: str) -> tuple[str, list[dict]] | None:
             "busca",
             "buscar",
             "buscame",
+            "busques",
             "hay",
             "existe",
             "existen",
@@ -1040,6 +1062,9 @@ def _try_structured_search_fast(message: str) -> tuple[str, list[dict]] | None:
             "cuanto",
             "cuanta",
             "dame",
+            "dime",
+            "diga",
+            "digas",
             "muestra",
             "mostrar",
             "muestrame",
@@ -1051,6 +1076,10 @@ def _try_structured_search_fast(message: str) -> tuple[str, list[dict]] | None:
             "equipos",
             "articulos",
             "registros",
+            "quiero",
+            "gustaria",
+            "quisiera",
+            "necesito",
         )
     )
     tokens = _extract_search_tokens(raw)
@@ -1059,11 +1088,15 @@ def _try_structured_search_fast(message: str) -> tuple[str, list[dict]] | None:
     if not has_query_intent and len(tokens) > 3:
         return None
 
-    rows, total_found, err = search_inventario_with_total(raw, limit=50)
+    # Buscar solo con la(s) palabra(s) clave, no con toda la frase.
+    keyword_query = " ".join(tokens)
+    rows, total_found, err = search_inventario_with_total(keyword_query, limit=50)
     if err:
         return None
 
-    # Verificar si el primer resultado cumple TODOS los tokens (full match)
+    subject = " / ".join(t.upper() for t in tokens)
+
+    # Verificar si el primer resultado cumple TODOS los tokens clave
     if rows:
         top = rows[0]
         top_blob = " ".join(
@@ -1082,27 +1115,48 @@ def _try_structured_search_fast(message: str) -> tuple[str, list[dict]] | None:
             )
         )
         top_blob_tokens = set(top_blob.split())
-        all_matched = all(
-            _token_matches_blob(t, top_blob, top_blob_tokens) for t in tokens
-        )
+        matched = [
+            t for t in tokens if _token_matches_blob(t, top_blob, top_blob_tokens)
+        ]
+        all_matched = len(matched) == len(tokens)
+        if not all_matched and len(tokens) > 1:
+            # Si falla el AND, reintenta con la palabra clave más larga (ej. tarjas).
+            primary = max(tokens, key=len)
+            rows2, total2, err2 = search_inventario_with_total(primary, limit=50)
+            if not err2 and rows2:
+                rows, total_found = rows2, total2
+                tokens = [primary]
+                subject = primary.upper()
+                all_matched = True
         if not all_matched:
-            # Si fue coincidencia parcial y el usuario preguntó explícitamente si hay / cuántos hay,
-            # informamos con precisión que no hay coincidencia exacta con todos los términos.
-            if any(w in msg.split() for w in ("hay", "cuantos", "cuantas", "busca", "buscar", "existe", "existen")):
-                subject = " ".join(tokens).upper()
+            if any(
+                w in msg.split()
+                for w in (
+                    "hay",
+                    "cuantos",
+                    "cuantas",
+                    "busca",
+                    "buscar",
+                    "existe",
+                    "existen",
+                    "digas",
+                    "dime",
+                    "quiero",
+                    "gustaria",
+                )
+            ):
                 return (
-                    f"No encontré registros que coincidan simultáneamente con **{subject}** en el inventario.\n\n"
-                    f"• Se encontraron **{len(rows)}** registros con coincidencia parcial que puedes revisar en el visor derecho.\n\n"
-                    "¿Quieres buscar únicamente por tipo de artículo, por marca o consultar otra área?",
+                    f"No encontré coincidencia exacta para **{subject}**.\n\n"
+                    f"• Había **{len(rows)}** resultado(s) parciales en el visor derecho.\n\n"
+                    "¿Quieres que busque solo por esa palabra clave, por marca o por área?",
                     [_compact_row(r) for r in rows[:20]],
                 )
             return None
     else:
         if has_query_intent:
-            subject = " ".join(tokens).upper()
             return (
                 f"No se encontraron registros para **{subject}** en el inventario actual.\n\n"
-                "Verifica la etiqueta, marca o nombre de la persona, o dime si deseas dar de alta un nuevo artículo.",
+                "Verifica la etiqueta, marca o nombre, o dime si deseas dar de alta un artículo.",
                 [],
             )
         return None
@@ -1263,10 +1317,7 @@ def run_chat_agent(
         "esta bien",
         "está bien",
     }:
-        ack_text = (
-            "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
-            "por persona o área, consultar estados/marcas, generar QR, registrar uno nuevo o importar Excel/CSV."
-        )
+        ack_text = pick_ack_reply()
         return (
             ack_text,
             None,

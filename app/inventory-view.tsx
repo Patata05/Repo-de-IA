@@ -73,6 +73,10 @@ import {
 } from "@/lib/chat-api";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import {
+  detectCompareInventariosAsk,
+  diffInventarios,
+  formatInventarioDiffReply,
+  listExistingOrigens,
   matchOrigenFromPrompt,
   ORIGEN_SIN_ORIGEN,
 } from "@/lib/inventario-origen";
@@ -93,17 +97,51 @@ import {
 } from "@/lib/chat-memory";
 import {
   buildSearchIndex,
+  formatDidYouMeanReply,
   indexMatchesPrepared,
   prepareSearch,
   rowMatchesPrepared,
+  suggestDidYouMean,
 } from "@/lib/inventario-search";
+import {
+  buildInventarioExcelFile,
+  buildInventarioExcelFiles,
+  detectExcelExportAsk,
+  type ChatExportFile,
+} from "@/lib/export-inventario-excel";
 const ReportsView = lazy(() => import("@/components/reports-view"));
 
 const CHAT_QUICK_ACTIONS = [
-  { label: "Buscar por persona", prompt: "¿Qué tiene Juan Pérez?", icon: Users },
-  { label: "Equipos por área", prompt: "Equipos de Sistemas", icon: MapPin },
-  { label: "Últimos registros", prompt: "Últimos registros", icon: ListChecks },
-  { label: "Ideas de consulta", prompt: "¿Qué puedo preguntarte del inventario?", icon: Lightbulb },
+  {
+    label: "Buscar por persona",
+    hint: "Consulta qué artículos tiene asignados alguien.",
+    prompt: "Dame lo que tiene Juan Pérez",
+    icon: Users,
+  },
+  {
+    label: "Equipos por área",
+    hint: "Lista el equipo registrado en un área concreta.",
+    prompt: "Dame los equipos de Sistemas",
+    icon: MapPin,
+  },
+  {
+    label: "Últimos registros",
+    hint: "Revisa las altas más recientes del inventario.",
+    prompt: "Dame los últimos registros",
+    icon: ListChecks,
+  },
+  {
+    label: "Comparar inventarios",
+    hint: "Diff real: faltan / sobran / cambiaron vs S/O.",
+    prompt: "Compara el último inventario vs S/O",
+    icon: Layers,
+  },
+  {
+    label: "Ideas de consulta",
+    hint: "Descubre qué puedes preguntarle al asistente.",
+    prompt: "¿Qué puedo preguntarte del inventario?",
+    icon: Lightbulb,
+  },
 ] as const;
 
 type ViewerOverview =
@@ -126,6 +164,8 @@ type ChatMessage = {
   at?: number;
   resultItems?: ChatApiItem[];
   qr?: ChatQrPayload[];
+  /** Excel/CSV generados en el chat (tarjetas descargables). */
+  exportFiles?: ChatExportFile[];
   /** Resumen del visor (solo si el usuario lo pide en el chat). */
   viewerOverview?: ViewerOverview;
   /** Foco de la incidencia (ej. nombre de área en areaTotal). */
@@ -408,11 +448,15 @@ function parseRequestedCount(userText: string): number | null {
 /**
  * "dame N etiquetas" / "trece etiquetas de [área]" (sin QR).
  * null = no forzar recorte; número = tope pedido (o todas si dijo "todas").
+ * No aplica a anáfora ("esas etiquetas" → contexto previo).
  */
 function parseEtiquetaListAsk(userText: string): number | null {
   const n = normalizeChatIntent(userText);
   if (!n || !/\betiquet/.test(n)) return null;
   if (/\bqr\b/.test(n)) return null;
+  if (looksLikeResultAnaphora(userText)) return null;
+  // "sus etiquetas" / "de esa persona" → contexto de persona, no lote genérico de 50.
+  if (looksLikePersonAnaphora(userText)) return null;
   const count = parseRequestedCount(userText);
   if (count != null) {
     return Math.max(1, Math.min(MAX_ETIQUETA_LIST, count));
@@ -438,6 +482,324 @@ function parseEtiquetaListAsk(userText: string): number | null {
     return MAX_ETIQUETA_LIST;
   }
   return null;
+}
+
+/** "esas / esos / las de arriba / las anteriores" → resultados del mensaje previo. */
+function looksLikeResultAnaphora(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /\b(esas|esos|estas|estos|esa|ese|este|esta)\b/.test(n) ||
+    /\b(las|los)\s+(de\s+arriba|anteriores?|previas?|mismas?|mismos|anteriores)\b/.test(
+      n,
+    ) ||
+    /\b(arriba|anteriores?|previas?)\b/.test(n)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** "dame sus etiquetas/registros" de la persona del mensaje anterior. */
+function looksLikePersonEtiquetasAsk(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (!looksLikePersonAnaphora(userText)) return false;
+  return (
+    /\betiquet/.test(n) ||
+    intentHas(
+      n,
+      "registro",
+      "registros",
+      "articulo",
+      "articulos",
+      "equipo",
+      "equipos",
+      "lista",
+      "listar",
+      "ficha",
+      "fichas",
+    )
+  );
+}
+
+/**
+ * Seguimiento vago / queja sin verbo claro.
+ * No dispara búsquedas “casi acertadas” (p. ej. “ven” → VEN).
+ */
+function looksLikeVagueFollowUp(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (n.split(/\s+/).length > 8) return false;
+  if (
+    /\bno\s+se\s+(ve|ven|veen|nota|notan|muestra|muestran)\b/.test(n) ||
+    /\bno\s+(aparecen|aparece|salen|sale)\b/.test(n) ||
+    /\bno\s+(los|las)\s+(veo|ve|aparecen|estan|están)\b/.test(n) ||
+    /\bno\s+me\s+(los|las)?\s*(veo|aparecen)\b/.test(n) ||
+    /^(eso|esa|ese|asi|así|y\s+eso|no|nada|mal|error)$/.test(n) ||
+    /\b(donde|dónde)\s+(estan|están|esta|está|quedo|quedó|queda)\b/.test(n)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function lastBotResultItems(messages: ChatMessage[]): ChatApiItem[] {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.from !== "bot") continue;
+    if (Array.isArray(message.resultItems) && message.resultItems.length) {
+      return message.resultItems;
+    }
+  }
+  return [];
+}
+
+/** Marcas acotadas a un área ("cuántas marcas en biblioteca"). */
+function detectMarcasAreaAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n || !intentHas(n, "marca", "marcas")) return undefined;
+  const asks =
+    intentHas(
+      n,
+      "cuantas",
+      "cuantos",
+      "cuanta",
+      "cuanto",
+      "que",
+      "cuales",
+      "cual",
+      "hay",
+      "tenemos",
+      "tienen",
+      "dame",
+      "muestra",
+      "mostrar",
+      "ver",
+      "lista",
+      "listar",
+    ) || /\bproductos?\b/.test(n);
+  if (!asks) return undefined;
+  return matchAreaFromPrompt(userText, inventory) || undefined;
+}
+
+function buildMarcasAreaReply(area: string, rows: InventarioRow[]) {
+  const marcaCounts = new Map<string, number>();
+  let activos = 0;
+  for (const row of rows) {
+    const marca = String(row.marca ?? "").trim();
+    if (marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)) {
+      marcaCounts.set(marca, (marcaCounts.get(marca) || 0) + 1);
+    }
+    if (isRowActivo(row)) activos += 1;
+  }
+  const top = [...marcaCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(
+      ([marca, count]) =>
+        `• **${marca}:** **${count.toLocaleString("es-MX")}**`,
+    );
+  const shown = Math.min(50, rows.length);
+  return (
+    `En **${area}** hay **${marcaCounts.size.toLocaleString("es-MX")}** marca` +
+    `${marcaCounts.size === 1 ? "" : "s"} distintas entre ` +
+    `**${rows.length.toLocaleString("es-MX")}** registro` +
+    `${rows.length === 1 ? "" : "s"} (${activos.toLocaleString("es-MX")} activos)` +
+    (rows.length > shown
+      ? ` (mostrando los primeros ${shown} en el visor)`
+      : "") +
+    `.\n\n` +
+    (top.length ? `Principales marcas:\n\n${top.join("\n")}\n\n` : "") +
+    `El listado interactivo está en el visor derecho. ` +
+    `¿Quieres filtrar por marca, abrir una ficha o generar códigos QR?`
+  );
+}
+
+function buildVagueFollowUpReply(prevCount: number) {
+  if (prevCount > 0) {
+    return (
+      `Del mensaje anterior tengo **${prevCount.toLocaleString("es-MX")}** registro` +
+      `${prevCount === 1 ? "" : "s"}, pero no capté bien la acción.\n\n` +
+      `¿Qué quieres hacer?\n` +
+      `• Abrir ese listado en el visor\n` +
+      `• Filtrar por área / marca / persona\n` +
+      `• Comparar inventarios (faltan / sobran / cambiaron)\n` +
+      `• Cambiar un campo (te pediré confirmación)`
+    );
+  }
+  return (
+    `No capté bien la acción y prefiero no inventar una búsqueda.\n\n` +
+    `Dime qué necesitas: buscar, comparar inventarios, cambiar un dato o ver un listado.`
+  );
+}
+
+function chatApiItemsToRows(
+  items: ChatApiItem[],
+  inventory: InventarioRow[],
+): InventarioRow[] {
+  const out: InventarioRow[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const id = item.id != null ? Number(item.id) : NaN;
+    const etq = String(item.etiqueta ?? "")
+      .trim()
+      .toLowerCase();
+    const hit =
+      (Number.isFinite(id)
+        ? inventory.find((row) => Number(row.id) === id)
+        : undefined) ||
+      (etq
+        ? inventory.find(
+            (row) =>
+              String(row.etiqueta ?? "")
+                .trim()
+                .toLowerCase() === etq,
+          )
+        : undefined) ||
+      (item as unknown as InventarioRow);
+    if (!hit) continue;
+    const key =
+      hit.id != null
+        ? `id:${hit.id}`
+        : `etq:${String(hit.etiqueta ?? "").toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(hit);
+  }
+  return out;
+}
+
+function lastBotViewerFocus(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.from !== "bot") continue;
+    if (message.viewerFocus) return String(message.viewerFocus);
+  }
+  return null;
+}
+
+function buildExcelExportReply(files: ChatExportFile[]): string {
+  if (!files.length) {
+    return "No pude armar el Excel: no hay registros para esa consulta.";
+  }
+  const cols =
+    "ETIQUETA, ARTÍCULO, MARCA, MODELO, SERIE, ÁREA, PERSONA, CANTIDAD, ESTADO y ORIGEN";
+  if (files.length === 1) {
+    const f = files[0];
+    return (
+      `Aquí tienes tu archivo:\n\n` +
+      `**${f.label}** con **${f.rowCount.toLocaleString("es-MX")}** registro` +
+      `${f.rowCount === 1 ? "" : "s"} ` +
+      `(columnas: ${cols}).\n\n` +
+      `Pulsa la tarjeta para descargarlo.`
+    );
+  }
+  const lines = files.map(
+    (f) =>
+      `• **${f.label}** — ${f.rowCount.toLocaleString("es-MX")} registro` +
+      `${f.rowCount === 1 ? "" : "s"}`,
+  );
+  return (
+    `Aquí tienes tus archivos:\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `Cada libro usa las columnas: ${cols}.`
+  );
+}
+
+/** Parte filas en N grupos (p. ej. 3 inventarios de oficina). */
+function splitRowsForExcelGroups(
+  rows: InventarioRow[],
+  count: number,
+  theme: string | null,
+): Array<{ rows: InventarioRow[]; focus?: string; kind?: string; index?: number }> {
+  const n = Math.max(1, Math.min(12, count));
+  if (n === 1) {
+    return [
+      {
+        rows,
+        focus: theme ? `Inventario ${theme}` : undefined,
+        kind: theme || undefined,
+      },
+    ];
+  }
+
+  // Preferir áreas que coincidan con el tema (oficina, biblioteca…).
+  const themeNeedle = theme
+    ? theme
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{M}/gu, "")
+    : "";
+  const byArea = new Map<string, InventarioRow[]>();
+  for (const row of rows) {
+    const area = String(row.area ?? "").trim() || "Sin área";
+    const list = byArea.get(area) || [];
+    list.push(row);
+    byArea.set(area, list);
+  }
+  let areaEntries = [...byArea.entries()].sort((a, b) => b[1].length - a[1].length);
+  if (themeNeedle) {
+    const themed = areaEntries.filter(([area]) =>
+      area
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{M}/gu, "")
+        .includes(themeNeedle),
+    );
+    if (themed.length) areaEntries = themed;
+  }
+
+  if (areaEntries.length >= n) {
+    return areaEntries.slice(0, n).map(([area, areaRows], idx) => ({
+      rows: areaRows,
+      focus: theme ? `Inventario ${theme} ${idx + 1}` : area,
+      index: theme ? idx + 1 : undefined,
+      kind: theme || undefined,
+    }));
+  }
+
+  // Si no hay suficientes áreas: repartir en N bloques con nombre temático.
+  const groups: Array<{
+    rows: InventarioRow[];
+    focus?: string;
+    kind?: string;
+    index?: number;
+  }> = [];
+  const size = Math.ceil(rows.length / n) || 1;
+  for (let i = 0; i < n; i += 1) {
+    const slice = rows.slice(i * size, (i + 1) * size);
+    if (!slice.length) continue;
+    groups.push({
+      rows: slice,
+      focus: theme ? `Inventario ${theme} ${i + 1}` : `Inventario ${i + 1}`,
+      kind: theme || undefined,
+      index: i + 1,
+    });
+  }
+  return groups;
+}
+
+function buildAnaphoraEtiquetasReply(items: ChatApiItem[]) {
+  const n = items.length;
+  const lines = items.slice(0, 8).map((item) => {
+    const tag = String(item.etiqueta ?? "").trim() || "S/E";
+    const art = String(item.articulo ?? "").trim() || "Artículo";
+    const area = String(item.area ?? "").trim() || "Sin área";
+    return `• **${tag}** — ${art} (${area})`;
+  });
+  const more =
+    n > lines.length ? `\n… y ${n - lines.length} más en el visor.` : "";
+  return (
+    `Aquí tienes **${n.toLocaleString("es-MX")}** etiqueta` +
+    `${n === 1 ? "" : "s"} del resultado anterior` +
+    (lines.length ? `:\n\n${lines.join("\n")}${more}` : ".") +
+    `\n\nEl listado está en el visor derecho. ` +
+    `¿Quieres generar QR de estas etiquetas o filtrar por área?`
+  );
 }
 
 const AREA_STOP_WORDS = new Set([
@@ -1208,6 +1570,10 @@ function findMatchingPeopleForPrompt(
   ) {
     return undefined;
   }
+  // "dame sus etiquetas" → anáfora (paso 4), no buscar persona por tokens sueltos.
+  if (looksLikePersonAnaphora(userText) || looksLikePersonEtiquetasAsk(userText)) {
+    return undefined;
+  }
 
   const plain0 = stripRequestedCountPhrases(normalizePlain(userText));
   const rawTokens = plain0
@@ -1858,7 +2224,13 @@ function looksLikePersonAnaphora(userText: string) {
 function resolvePersonFocus(
   userText: string,
   inventory: InventarioRow[],
-  recentMessages?: Array<{ from: string; text: string; resultItems?: ChatApiItem[] }>,
+  recentMessages?: Array<{
+    from: string;
+    text: string;
+    resultItems?: ChatApiItem[];
+    viewerFocus?: string;
+    viewerOverview?: ViewerOverview;
+  }>,
 ): string | undefined {
   const named = findPersonInText(userText, inventory);
   if (named) return named;
@@ -1866,6 +2238,28 @@ function resolvePersonFocus(
     return undefined;
   }
   const current = normalizeChatIntent(userText);
+  // 1) Foco del último bot con persona (panel) — evita mezclar otra persona.
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const message = recentMessages[i];
+    if (message.from !== "bot") continue;
+    const focus = String(message.viewerFocus || "").trim();
+    if (!focus) continue;
+    if (
+      message.viewerOverview === "areaTotal" ||
+      message.viewerOverview === "areaMatches"
+    ) {
+      continue;
+    }
+    const catalog = getAllPersonCatalog(inventory);
+    const hit =
+      catalog.find((p) => p.name === focus) ||
+      catalog.find((p) =>
+        normalizeChatIntent(p.name).includes(normalizeChatIntent(focus)),
+      );
+    if (hit) return hit.name;
+    if (rowsForPersonName(inventory, focus).length) return focus;
+  }
+  // 2) Nombre en el texto del mensaje previo / única persona en resultItems.
   for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
     const message = recentMessages[i];
     if (normalizeChatIntent(message.text || "") === current) continue;
@@ -2547,20 +2941,46 @@ function resolveContextualRecordRows(
 }
 
 /**
- * Tip interactivo opcional (no siempre): elige la incidencia más útil
- * o nada, para no saturar.
+ * Tip interactivo opcional (desactivado: el visor solo abre si el usuario lo pide).
  */
 function pickDiscoveryTip(
-  userText: string,
+  _userText: string,
 ): ViewerOverview | undefined {
-  const n = normalizeChatIntent(userText);
-  // Mayoría solo texto; a veces un tip útil a la derecha.
-  if (Math.random() > 0.34) return undefined;
-  if (/\b(hoy|dia|nuev|recient)\b/.test(n)) return "recent";
-  const roll = Math.random();
-  if (roll < 0.4) return "stats";
-  if (roll < 0.7) return "areas";
-  return "recent";
+  return undefined;
+}
+
+/** Visor derecho solo con pedido explícito (dame/muestra/QR/persona/área/etiquetas). */
+function shouldAttachSidePanel(
+  userText: string,
+  inventory: InventarioRow[],
+  recentMessages?: Array<{ from: string; text: string; resultItems?: ChatApiItem[] }>,
+) {
+  if (wantsSidePanelShow(userText)) return true;
+  if (detectCompareInventariosAsk(userText, listExistingOrigens(inventory))) {
+    return true;
+  }
+  if (userAskedQr(userText)) return true;
+  if (parseEtiquetaListAsk(userText) != null) return true;
+  if (detectMarcasAreaAsk(userText, inventory)) return true;
+  if (
+    looksLikeResultAnaphora(userText) &&
+    (/\betiquet/.test(normalizeChatIntent(userText)) ||
+      intentHas(
+        normalizeChatIntent(userText),
+        "dame",
+        "muestra",
+        "mostrar",
+        "ver",
+        "trae",
+        "lista",
+      ))
+  ) {
+    return true;
+  }
+  if (detectPersonTotalAsk(userText, inventory, recentMessages)) return true;
+  if (detectAreaTotalAsk(userText, inventory)) return true;
+  if (detectAreaListAsk(userText, inventory)) return true;
+  return false;
 }
 
 /** Pausa mínima para transición visual suave (muy breve para no frenar la respuesta). */
@@ -2585,6 +3005,105 @@ function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
     `El detalle está en el visor derecho.\n\n` +
     `¿Quieres ver los artículos del área, filtrar por persona o generar QR de un lote?`
   );
+}
+
+/** Respuestas locales exactas para overview (áreas, totales, etc.). */
+function buildLocalOverviewReply(
+  overview: ViewerOverview,
+  inventory: InventarioRow[],
+): string | null {
+  if (!inventory.length) return null;
+  const total = inventory.length;
+  const areaCounts = new Map<string, number>();
+  const personCounts = new Map<string, number>();
+  const marcaCounts = new Map<string, number>();
+  let activos = 0;
+  for (const row of inventory) {
+    const area = String(row.area ?? "").trim() || "Sin área";
+    areaCounts.set(area, (areaCounts.get(area) || 0) + 1);
+    const persona = String(row.persona ?? "").trim();
+    if (persona) personCounts.set(persona, (personCounts.get(persona) || 0) + 1);
+    const marca = String(row.marca ?? "").trim();
+    if (marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)) {
+      marcaCounts.set(marca, (marcaCounts.get(marca) || 0) + 1);
+    }
+    if (isRowActivo(row)) activos += 1;
+  }
+  const inactivos = Math.max(0, total - activos);
+  const topAreas = [...areaCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+  const fmt = (n: number) => n.toLocaleString("es-MX");
+
+  if (overview === "areas") {
+    const lines = topAreas.map(
+      ([area, count]) =>
+        `• **${area}:** **${fmt(count)}** registro${count === 1 ? "" : "s"}`,
+    );
+    return (
+      `Este inventario tiene **${fmt(areaCounts.size)}** área` +
+      `${areaCounts.size === 1 ? "" : "s"} distintas ` +
+      `(**${fmt(total)}** registros en total).\n\n` +
+      (lines.length
+        ? `Las de mayor concentración son:\n\n${lines.join("\n")}\n\n`
+        : "") +
+      `Si quieres el detalle de un área, dime su nombre. ` +
+      `También puedo filtrar por persona o generar QR.`
+    );
+  }
+
+  if (overview === "stats" || overview === "full") {
+    return (
+      `Inventario general: **${fmt(total)}** registros, ` +
+      `**${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} y ` +
+      `**${fmt(areaCounts.size)}** área${areaCounts.size === 1 ? "" : "s"}.\n\n` +
+      `• Activos: **${fmt(activos)}**\n` +
+      `• Inactivos: **${fmt(inactivos)}**\n\n` +
+      (overview === "full" && topAreas.length
+        ? `Áreas con más equipo:\n${topAreas
+            .slice(0, 3)
+            .map(([a, c]) => `• **${a}** (${fmt(c)})`)
+            .join("\n")}\n\n`
+        : "") +
+      `¿Seguimos con un área, una persona, últimos registros o códigos QR?`
+    );
+  }
+
+  if (overview === "personas") {
+    return (
+      `Hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
+      `con equipo asignado (**${fmt(total)}** registros).\n\n` +
+      `Dime un nombre para ver su inventario, o pide «dame las personas» para el ranking.`
+    );
+  }
+
+  if (overview === "estado") {
+    const pct = total ? Math.round((activos / total) * 100) : 0;
+    return (
+      `Salud del inventario (**${fmt(total)}** registros):\n\n` +
+      `• **Activos:** **${fmt(activos)}** (${pct}%)\n` +
+      `• **Inactivos:** **${fmt(inactivos)}** (${100 - pct}%)\n\n` +
+      `¿Quieres listar los inactivos o revisar un área?`
+    );
+  }
+
+  if (overview === "marcas") {
+    return (
+      `Hay **${fmt(marcaCounts.size)}** marca${marcaCounts.size === 1 ? "" : "s"} ` +
+      `registradas en el inventario.\n\n` +
+      `Puedo mostrarte el top de marcas o filtrar por una concreta.`
+    );
+  }
+
+  if (overview === "recent") {
+    return (
+      `Puedo mostrarte los **últimos registros** del inventario.\n\n` +
+      `Di «dame los últimos registros» para verlos en el visor, ` +
+      `o indica un área/persona si quieres acotar.`
+    );
+  }
+
+  return null;
 }
 
 function detectViewerOverview(userText: string): ViewerOverview | undefined {
@@ -4364,6 +4883,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const pendingChatImportRef = useRef<NewInventarioItem[] | null>(null);
   const pendingFieldRevertRef = useRef<ChatFieldChange | null>(null);
   const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
+  /** Último listado concreto (aunque el visor no se haya abierto) para follow-ups tipo "no se ven". */
+  const lastConcreteSideRef = useRef<{
+    resultItems: ChatApiItem[];
+    qr: ChatQrPayload[];
+    viewerOverview?: ViewerOverview;
+    viewerFocus?: string;
+  } | null>(null);
   const chatStarted = messages.some((message) => message.from === "user");
   const chatComposerBusy = useMemo(
     () =>
@@ -4374,26 +4900,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }),
     [messages],
   );
-  const hasAnySidePanel = useMemo(
-    () => messages.some((message) => messageHasSideData(message)),
-    [messages],
-  );
+  /** Solo el último bot abre el visor; si el nuevo no lo pidió, desaparece. */
+  const activeSideCompanion = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message.from !== "bot") continue;
+      if (!messageHasSideData(message)) return null;
+      return {
+        messageId: message.id,
+        resultItems: Array.isArray(message.resultItems)
+          ? message.resultItems
+          : [],
+        qrCards: chatQrByMsg[message.id] || [],
+        overview: message.viewerOverview,
+        overviewFocus: message.viewerFocus,
+      };
+    }
+    return null;
+  }, [messages, chatQrByMsg]);
 
-  const sideCompanions = useMemo(
-    () =>
-      messages
-        .filter((message) => messageHasSideData(message))
-        .map((message) => ({
-          messageId: message.id,
-          resultItems: Array.isArray(message.resultItems)
-            ? message.resultItems
-            : [],
-          qrCards: chatQrByMsg[message.id] || [],
-          overview: message.viewerOverview,
-          overviewFocus: message.viewerFocus,
-        })),
-    [messages, chatQrByMsg],
-  );
+  const showSideViewer = Boolean(activeSideCompanion);
 
   const chatTurns = useMemo(() => {
     const turns: Array<
@@ -5201,182 +5727,89 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     };
   }, [rail, folders.length]);
 
-  useEffect(() => {
-    if (rail !== "archivos") return;
-    const frame = window.requestAnimationFrame(() => {
-      const anchor = chatLogRef.current?.querySelector<HTMLElement>(
-        "[data-chat-latest='true']",
-      );
-      if (!anchor) return;
-      // auto: smooth + sync de layout pelean y traban el scroll
-      anchor.scrollIntoView({ block: "start", behavior: "auto", inline: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [messages.length, rail, hasAnySidePanel]);
-
-  // Columna derecha: cada cuadro sigue el Y de su mensaje.
-  // El scroll general es el del stage (barra a la derecha).
+  // Pin del último mensaje arriba; sin scroll vacío hacia abajo.
   useLayoutEffect(() => {
-    if (rail !== "archivos" || !hasAnySidePanel) return;
+    if (rail !== "archivos") return;
     const log = chatLogRef.current;
-    const railEl = viewerRailRef.current;
-    const stageEl = chatStageRef.current;
-    if (!log || !railEl) return;
-
-    const SYNC_NUDGE_PX = -10;
-    const STICKY_TOP_PX = 12;
-    const AFTER_GAP_PX = 28;
-    // Misma reserva que --chat-viewer-slot-h (QR / etiquetas / inventario).
-    const slotRaw = getComputedStyle(stageEl ?? railEl)
-      .getPropertyValue("--chat-viewer-slot-h")
-      .trim();
-    const SIDE_SLOT_H = Math.max(300, parseInt(slotRaw, 10) || 480);
-    let posRaf = 0;
-    let layoutRaf = 0;
-    const scrollRoot = stageEl ?? log;
-
-    const clearSlots = () => {
+    if (log) {
       log.querySelectorAll<HTMLElement>("[data-side-msg]").forEach((el) => {
         el.style.minHeight = "";
       });
-    };
-
-    // Texto sube al scrollear; tope inicio (sticky) y tope final (arriba de acciones).
-    const positionOnly = () => {
-      const railTop = railEl.getBoundingClientRect().top;
-      const stageTop = (stageEl ?? scrollRoot).getBoundingClientRect().top;
-      const GAP = 12;
-      const placed: Array<{ y: number; h: number; lo: number; hi: number }> = [];
-
-      for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
-        const id = node.dataset.syncMsg;
-        if (!id) continue;
-        const anchor = log.querySelector<HTMLElement>(`[data-side-msg="${id}"]`);
-        if (!anchor) {
-          node.style.visibility = "hidden";
-          continue;
-        }
-        node.style.visibility = "visible";
-        const msg = anchor.getBoundingClientRect();
-        const actionsEl = anchor.querySelector<HTMLElement>(
-          ".chat-response-actions",
-        );
-        const textEl = anchor.querySelector<HTMLElement>(".chat-response");
-        const panelH = Math.ceil(node.offsetHeight) || SIDE_SLOT_H;
-        const yStart = msg.top - railTop + SYNC_NUDGE_PX;
-        // Tope final = arriba de los botones (o fin del texto).
-        const endBottom = actionsEl
-          ? actionsEl.getBoundingClientRect().top - 8
-          : textEl
-            ? textEl.getBoundingClientRect().bottom
-            : msg.bottom;
-        const yEnd = endBottom - railTop - panelH;
-        const ySticky = stageTop + STICKY_TOP_PX - railTop;
-        const lo = yStart;
-        const hi = yEnd >= yStart ? yEnd : yStart;
-
-        let y = ySticky;
-        if (y < lo) y = lo;
-        if (y > hi) y = hi;
-
-        // Si se traslapa con otro cuadro, mover dentro del mismo tope inicio/final.
-        for (const prev of placed) {
-          const overlaps =
-            y < prev.y + prev.h + GAP && y + panelH > prev.y - GAP;
-          if (!overlaps) continue;
-          const down = prev.y + prev.h + GAP;
-          const up = prev.y - panelH - GAP;
-          if (down <= hi) y = Math.min(Math.max(down, lo), hi);
-          else if (up >= lo) y = Math.min(Math.max(up, lo), hi);
-        }
-
-        y = Math.round(y);
-        placed.push({ y, h: panelH, lo, hi });
-        const next = `translate3d(0, ${y}px, 0)`;
-        if (node.style.transform !== next) node.style.transform = next;
-      }
-    };
-
-    const layoutSlots = () => {
-      for (const turnEl of log.querySelectorAll<HTMLElement>(".chat-turn")) {
-        if (!turnEl.hasAttribute("data-side-msg") && turnEl.style.minHeight) {
-          turnEl.style.minHeight = "";
-        }
-      }
-      for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
-        const id = node.dataset.syncMsg;
-        if (!id) continue;
-        const anchor = log.querySelector<HTMLElement>(`[data-side-msg="${id}"]`);
-        if (!anchor) continue;
-        const main =
-          anchor.querySelector<HTMLElement>(".chat-turn-main") ?? anchor;
-        const contentH = Math.ceil(main.offsetHeight);
-        const panelH = Math.min(
-          SIDE_SLOT_H,
-          Math.max(160, Math.ceil(node.offsetHeight) || SIDE_SLOT_H),
-        );
-        const next = `${Math.max(contentH, panelH) + AFTER_GAP_PX}px`;
-        if (anchor.style.minHeight !== next) {
-          anchor.style.boxSizing = "border-box";
-          anchor.style.minHeight = next;
-        }
-      }
-      positionOnly();
-    };
-
-    const schedulePos = () => {
-      if (posRaf) return;
-      posRaf = window.requestAnimationFrame(() => {
-        posRaf = 0;
-        positionOnly();
-      });
-    };
-
-    // Sync (antes del paint): Mostrar más / ResizeObserver del panel.
-    const positionNow = () => {
-      if (posRaf) {
-        window.cancelAnimationFrame(posRaf);
-        posRaf = 0;
-      }
-      positionOnly();
-    };
-
-    const scheduleLayout = () => {
-      if (layoutRaf) return;
-      layoutRaf = window.requestAnimationFrame(() => {
-        layoutRaf = 0;
-        layoutSlots();
-      });
-    };
-
-    layoutSlots();
-    scrollRoot.addEventListener("scroll", schedulePos, { passive: true });
-    window.addEventListener("resize", scheduleLayout);
-    window.addEventListener("chat-viewer-layout", positionNow);
-    // Anclas del chat → layout. Paneles (Mostrar más) → reposicionar sync (sin parpadeo).
-    const roAnchors = new ResizeObserver(scheduleLayout);
-    for (const anchor of log.querySelectorAll<HTMLElement>("[data-side-msg]")) {
-      roAnchors.observe(anchor.querySelector(".chat-turn-main") ?? anchor);
     }
-    const roPanels = new ResizeObserver(positionNow);
-    for (const node of railEl.querySelectorAll<HTMLElement>("[data-sync-msg]")) {
-      roPanels.observe(node);
-      const body = node.querySelector<HTMLElement>(".chat-viewer-sync-body");
-      if (body) roPanels.observe(body);
-      const scroll = node.querySelector<HTMLElement>(".chat-viewer-scroll");
-      if (scroll) roPanels.observe(scroll);
-    }
+
+    const getScrollRoot = () => {
+      const stage = chatStageRef.current;
+      const logEl = chatLogRef.current;
+      if (stage && stage.scrollHeight > stage.clientHeight + 2) return stage;
+      if (logEl && logEl.scrollHeight > logEl.clientHeight + 2) return logEl;
+      return stage || logEl;
+    };
+
+    const fitSpacerAndPin = () => {
+      const logEl = chatLogRef.current;
+      const scrollRoot = getScrollRoot();
+      const anchor = logEl?.querySelector<HTMLElement>(
+        "[data-chat-latest='true']",
+      );
+      const spacer = logEl?.querySelector<HTMLElement>(".chat-log-spacer");
+      if (!anchor || !scrollRoot) return;
+
+      // Spacer = lo justo para subir el último msg al tope, sin hueco extra.
+      if (spacer) {
+        const rootH = scrollRoot.clientHeight;
+        const anchorH = Math.ceil(anchor.getBoundingClientRect().height);
+        const needed = Math.max(24, rootH - anchorH - 28);
+        spacer.style.height = `${needed}px`;
+        spacer.style.minHeight = `${needed}px`;
+      }
+
+      const rootRect = scrollRoot.getBoundingClientRect();
+      const anchorRect = anchor.getBoundingClientRect();
+      const delta = anchorRect.top - rootRect.top - 12;
+      const next = Math.max(0, scrollRoot.scrollTop + delta);
+      scrollRoot.scrollTop = next;
+      // Tope: no bajar más allá del pin (evita scroll en vacío).
+      (scrollRoot as HTMLElement).dataset.chatScrollMax = String(next);
+    };
+
+    const clampScroll = () => {
+      const scrollRoot = getScrollRoot();
+      if (!scrollRoot) return;
+      const maxRaw = Number(scrollRoot.dataset.chatScrollMax || "");
+      if (!Number.isFinite(maxRaw)) return;
+      if (scrollRoot.scrollTop > maxRaw + 1) {
+        scrollRoot.scrollTop = maxRaw;
+      }
+    };
+
+    fitSpacerAndPin();
+    const raf1 = window.requestAnimationFrame(fitSpacerAndPin);
+    const raf2 = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(fitSpacerAndPin);
+    });
+    const timer = window.setTimeout(fitSpacerAndPin, 80);
+
+    const stage = chatStageRef.current;
+    const logEl = chatLogRef.current;
+    stage?.addEventListener("scroll", clampScroll, { passive: true });
+    logEl?.addEventListener("scroll", clampScroll, { passive: true });
+    window.addEventListener("resize", fitSpacerAndPin);
+
     return () => {
-      if (posRaf) window.cancelAnimationFrame(posRaf);
-      if (layoutRaf) window.cancelAnimationFrame(layoutRaf);
-      scrollRoot.removeEventListener("scroll", schedulePos);
-      window.removeEventListener("resize", scheduleLayout);
-      window.removeEventListener("chat-viewer-layout", positionNow);
-      roAnchors.disconnect();
-      roPanels.disconnect();
-      clearSlots();
+      window.cancelAnimationFrame(raf1);
+      window.cancelAnimationFrame(raf2);
+      window.clearTimeout(timer);
+      stage?.removeEventListener("scroll", clampScroll);
+      logEl?.removeEventListener("scroll", clampScroll);
+      window.removeEventListener("resize", fitSpacerAndPin);
     };
-  }, [rail, hasAnySidePanel, sideCompanions, messages]);
+  }, [
+    messages,
+    rail,
+    showSideViewer,
+    activeSideCompanion?.messageId,
+    chatComposerBusy,
+  ]);
 
   const toggleDark = () => {
     setDark((current) => {
@@ -5516,7 +5949,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         !(Array.isArray(message.qr) && message.qr.length) &&
         !(Array.isArray(message.resultItems) && message.resultItems.length) &&
         etiquetaLimit == null &&
-        hasConcreteInventoryAsk(userText, items, messages)
+        shouldAttachSidePanel(userText, items, messages)
       ) {
         const overview = detectViewerOverview(userText);
         if (overview) {
@@ -5696,6 +6129,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       qr?: ChatQrPayload[];
       viewerOverview?: ViewerOverview;
       viewerFocus?: string;
+      exportFiles?: ChatExportFile[];
     },
   ) => {
     const finalMessages = messagesRef.current.map((m) =>
@@ -5711,6 +6145,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   qr: side.qr || [],
                   viewerOverview: side.viewerOverview,
                   viewerFocus: side.viewerFocus,
+                  exportFiles: side.exportFiles || [],
                 }
               : null),
           }
@@ -5718,6 +6153,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     );
     messagesRef.current = finalMessages;
     setMessages(finalMessages);
+    if (
+      side &&
+      ((side.resultItems && side.resultItems.length) ||
+        (side.qr && side.qr.length) ||
+        side.viewerOverview)
+    ) {
+      lastConcreteSideRef.current = {
+        resultItems: side.resultItems || [],
+        qr: side.qr || [],
+        viewerOverview: side.viewerOverview,
+        viewerFocus: side.viewerFocus,
+      };
+    }
     upsertChatSession(sessionId, finalMessages, side);
   };
 
@@ -5940,8 +6388,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const destNote = dest ? ` en **${dest}**` : "";
       const finalReply =
         `Listo: importé **${formatNumber(saved.length)}** artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”${destNote}.\n` +
-        `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}\n\n` +
-        `Te dejé el inventario general en el panel derecho (totales, áreas y recientes).`;
+        `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}`;
 
       // Efecto “escribiendo…” al cerrar (el import largo ya gastó la pausa inicial).
       const wrapping = messagesRef.current.map((m) =>
@@ -5971,11 +6418,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         throw new DOMException("Aborted", "AbortError");
       }
 
-      finishBotReply(sessionId, botId, finalReply, {
-        resultItems: [],
-        qr: [],
-        viewerOverview: "full",
-      });
+      finishBotReply(sessionId, botId, finalReply);
     };
 
     // Confirmar restauración del valor anterior de un campo
@@ -6226,6 +6669,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       from: message.from,
       text: message.text || "",
       resultItems: message.resultItems,
+      viewerFocus: message.viewerFocus,
+      viewerOverview: message.viewerOverview,
     }));
 
     // 1. Resolver desambiguación pendiente (en memoria o reconstruida del último mensaje del bot)
@@ -6491,17 +6936,49 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 4. Anáfora de persona ("su inventario", "de él")
-    const earlyPerson = detectPersonTotalAsk(
-      userText || text,
-      items,
-      chatHistory,
-    );
+    // 4. Anáfora de persona ("su inventario", "dame sus etiquetas")
+    const wantsPersonEtiquetas = looksLikePersonEtiquetasAsk(userText || text);
+    const earlyPerson = wantsPersonEtiquetas
+      ? resolvePersonFocus(userText || text, items, chatHistory)
+      : detectPersonTotalAsk(userText || text, items, chatHistory);
     if (earlyPerson) {
       const personCatalog = getAllPersonCatalog(items);
-      const exactP = personCatalog.find((p) => p.name === earlyPerson);
+      const exactP =
+        personCatalog.find((p) => p.name === earlyPerson) ||
+        personCatalog.find((p) =>
+          normalizeChatIntent(p.name).includes(
+            normalizeChatIntent(earlyPerson),
+          ),
+        );
       try {
         if (exactP) {
+          // Etiquetas de ESA persona: todas sus filas, sin mezclar otras.
+          if (wantsPersonEtiquetas) {
+            const allRows = exactP.rows;
+            const localReply =
+              `**${exactP.name}** tiene **${allRows.length.toLocaleString("es-MX")}** etiqueta` +
+              `${allRows.length === 1 ? "" : "s"} en total.\n\n` +
+              allRows
+                .slice(0, 5)
+                .map((row) => {
+                  const tag = String(row.etiqueta ?? "").trim() || "S/E";
+                  const art = String(row.articulo ?? "").trim() || "Artículo";
+                  const ar = String(row.area ?? "").trim() || "Sin área";
+                  return `• **${tag}** — ${art} (${ar})`;
+                })
+                .join("\n") +
+              (allRows.length > 5
+                ? `\n\nEl listado completo de **${allRows.length}** etiquetas está en el visor derecho.`
+                : `\n\nEl detalle está en el visor derecho.`);
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: allRows.map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerFocus: exactP.name,
+            });
+            return;
+          }
           const { reply: localReply, shownRows } = buildExactPersonReply(
             exactP,
             parseRequestedCount(userText || text),
@@ -6531,6 +7008,325 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
+    // 5a0. Excel/CSV descargable con nombre referente a la consulta.
+    {
+      const excelAsk = detectExcelExportAsk(userText || text);
+      if (excelAsk) {
+        try {
+          const prevItems =
+            lastBotResultItems(messagesRef.current).length > 0
+              ? lastBotResultItems(messagesRef.current)
+              : lastConcreteSideRef.current?.resultItems || [];
+          const prevFocus =
+            lastBotViewerFocus(messagesRef.current) ||
+            lastConcreteSideRef.current?.viewerFocus ||
+            null;
+          let sourceRows = chatApiItemsToRows(prevItems, items);
+          let focusName = prevFocus;
+
+          // Persona explícita o “esta persona” (usa foco del mensaje anterior).
+          {
+            const catalog = getAllPersonCatalog(items);
+            const named =
+              detectPersonTotalAsk(userText || text, items, chatHistory) ||
+              findPersonInText(userText || text, items);
+            const focusCandidate = named || (excelAsk.fromContext ? prevFocus : null);
+            if (focusCandidate) {
+              const exact =
+                catalog.find((p) => p.name === focusCandidate) ||
+                catalog.find((p) =>
+                  normalizeChatIntent(p.name).includes(
+                    normalizeChatIntent(focusCandidate),
+                  ),
+                ) ||
+                catalog.find((p) =>
+                  normalizeChatIntent(focusCandidate).includes(
+                    normalizeChatIntent(p.name),
+                  ),
+                );
+              if (exact?.rows?.length) {
+                sourceRows = exact.rows;
+                focusName = exact.name;
+              }
+            }
+          }
+
+          // Área si aplica.
+          if (!sourceRows.length) {
+            const areaHit = matchAreaFromPrompt(userText || text, items);
+            if (areaHit) {
+              sourceRows = items.filter((row) =>
+                areaMatchesNeedle(String(row.area ?? ""), areaHit),
+              );
+              focusName = areaHit;
+            }
+          }
+
+          // Sin contexto previo: usar inventario filtrado por tema o general.
+          if (!sourceRows.length) {
+            if (excelAsk.theme) {
+              const needle = normalizeChatIntent(excelAsk.theme);
+              sourceRows = items.filter((row) =>
+                normalizeChatIntent(String(row.area ?? "")).includes(needle),
+              );
+            }
+            if (!sourceRows.length) sourceRows = items.slice(0, 500);
+          }
+
+          if (!sourceRows.length) {
+            const ask =
+              "No hay registros para armar el Excel. Primero consulta una persona/área o dime qué inventario quieres exportar.";
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          let files: ChatExportFile[] = [];
+          if (excelAsk.count <= 1) {
+            files = [
+              await buildInventarioExcelFile(sourceRows, {
+                focus: focusName || excelAsk.theme || "consulta",
+              }),
+            ];
+          } else {
+            const groups = splitRowsForExcelGroups(
+              sourceRows,
+              excelAsk.count,
+              excelAsk.theme,
+            );
+            // Si el tema es Oficina y no hay focus por persona, forzar nombres Oficina N.
+            files = await buildInventarioExcelFiles(
+              groups.map((g, idx) => ({
+                rows: g.rows,
+                focus:
+                  g.focus ||
+                  (excelAsk.theme
+                    ? `Inventario ${excelAsk.theme} ${idx + 1}`
+                    : focusName
+                      ? `${focusName} ${idx + 1}`
+                      : `Inventario ${idx + 1}`),
+                index: idx + 1,
+              })),
+            );
+          }
+
+          const localReply = buildExcelExportReply(files);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: sourceRows.slice(0, 50).map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerFocus: focusName || undefined,
+            exportFiles: files,
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 5a. Seguimiento vago → preguntar acción (no buscar “casi acertado”).
+    if (looksLikeVagueFollowUp(userText || text)) {
+      const prevItems =
+        lastBotResultItems(messagesRef.current).length > 0
+          ? lastBotResultItems(messagesRef.current)
+          : lastConcreteSideRef.current?.resultItems || [];
+      try {
+        const ask = buildVagueFollowUpReply(prevItems.length);
+        recordTokenConsumption(null, userText || text, ask);
+        await ensureTypingPause(ask);
+        finishBotReply(sessionId, botId, ask);
+        return;
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+    }
+
+    // 5a2. Diff real entre inventarios (faltan / sobran / cambiaron).
+    {
+      const compare = detectCompareInventariosAsk(
+        userText || text,
+        listExistingOrigens(items),
+      );
+      if (compare && items.length) {
+        try {
+          const diff = diffInventarios(items, compare.left, compare.right);
+          const localReply = formatInventarioDiffReply(diff);
+          const sideRows = [
+            ...diff.onlyLeft,
+            ...diff.onlyRight,
+            ...diff.changed
+              .map((c) =>
+                items.find(
+                  (row) =>
+                    Number(row.id) === Number(c.rightId) ||
+                    Number(row.id) === Number(c.leftId),
+                ),
+              )
+              .filter(Boolean),
+          ] as InventarioRow[];
+          const seen = new Set<number | string>();
+          const uniqueSide: InventarioRow[] = [];
+          for (const row of sideRows) {
+            const key = row.id != null ? Number(row.id) : String(row.etiqueta);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniqueSide.push(row);
+            if (uniqueSide.length >= 50) break;
+          }
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: uniqueSide.map((row) => rowToChatApiItem(row)),
+            qr: [],
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 5b. Marcas acotadas a un área → listado en visor (no overview global).
+    {
+      const marcasArea = detectMarcasAreaAsk(userText || text, items);
+      if (marcasArea && items.length) {
+        const areaRows = items.filter((row) =>
+          areaMatchesNeedle(String(row.area ?? ""), marcasArea),
+        );
+        try {
+          if (!areaRows.length) {
+            const ask =
+              `No encontré registros en **${marcasArea}**. ` +
+              `¿Quieres probar con otro nombre de área o el inventario general?`;
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const shownRows = areaRows.slice(0, 50);
+          const localReply = buildMarcasAreaReply(marcasArea, areaRows);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 5. Anáfora: "dame esas etiquetas" / "las de arriba" → resultado anterior.
+    if (looksLikeResultAnaphora(userText || text)) {
+      const prevItems =
+        lastBotResultItems(messagesRef.current).length > 0
+          ? lastBotResultItems(messagesRef.current)
+          : lastConcreteSideRef.current?.resultItems || [];
+      const n = normalizeChatIntent(userText || text);
+      const wantsThose =
+        /\betiquet/.test(n) ||
+        intentHas(n, "dame", "muestra", "mostrar", "ver", "trae", "lista", "qr") ||
+        intentHas(n, "esas", "esos", "estas", "estos");
+      if (wantsThose && prevItems.length) {
+        try {
+          const localReply = userAskedQr(userText || text)
+            ? `Tomo las **${prevItems.length}** etiqueta${prevItems.length === 1 ? "" : "s"} del resultado anterior para QR. El detalle está en el visor.`
+            : buildAnaphoraEtiquetasReply(prevItems);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          if (userAskedQr(userText || text)) {
+            const recovered = buildQrSideFromRows(
+              prevItems
+                .map((item) => {
+                  const id = item.id != null ? Number(item.id) : NaN;
+                  const etq = String(item.etiqueta ?? "")
+                    .trim()
+                    .toLowerCase();
+                  return (
+                    (Number.isFinite(id)
+                      ? items.find((row) => Number(row.id) === id)
+                      : undefined) ||
+                    items.find(
+                      (row) =>
+                        String(row.etiqueta ?? "")
+                          .trim()
+                          .toLowerCase() === etq,
+                    ) ||
+                    (item as unknown as InventarioRow)
+                  );
+                })
+                .filter(Boolean) as InventarioRow[],
+            );
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: recovered.resultItems,
+              qr: recovered.qr,
+            });
+          } else {
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: prevItems,
+              qr: [],
+            });
+          }
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+      if (wantsThose && !prevItems.length) {
+        try {
+          const ask =
+            "No tengo un listado previo en este chat para “esas etiquetas”. " +
+            "Primero busca algo (por ejemplo «cuántas tarjas tenemos») y luego dime «dame esas etiquetas».";
+          recordTokenConsumption(null, userText || text, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 6. Overview local (áreas / totales / personas…) sin depender del LLM.
+    // Si ya acotó marcas a un área, no caer al ranking global de marcas.
+    const earlyOverview = detectMarcasAreaAsk(userText || text, items)
+      ? undefined
+      : detectViewerOverview(userText || text);
+    if (earlyOverview && items.length) {
+      try {
+        const localReply = buildLocalOverviewReply(earlyOverview, items);
+        if (localReply) {
+          const openPanel = shouldAttachSidePanel(
+            userText || text,
+            items,
+            chatHistory,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(
+            sessionId,
+            botId,
+            localReply,
+            openPanel
+              ? {
+                  resultItems: [],
+                  qr: [],
+                  viewerOverview: earlyOverview,
+                }
+              : undefined,
+          );
+          return;
+        }
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+    }
+
     const data = await askInventoryChat(userText || text, history, {
       signal: controller.signal,
       memory: formatChatMemoryForPrompt(),
@@ -6549,14 +7345,47 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     mutated = Boolean(data.mutated);
     qrPayloads = data.qr || [];
 
-    // Solo incidencia si el pedido es concreto o hubo escritura; saludos → texto (± tip).
+    // Conservar listado para follow-ups aunque el panel no abra aún.
+    if (sideItems.length || qrPayloads.length) {
+      lastConcreteSideRef.current = {
+        resultItems: sideItems,
+        qr: qrPayloads,
+      };
+    }
+
+    // Visor solo si el usuario lo pidió (dame/muestra/QR/persona/área) o hubo escritura.
     const forceSidePanel = wantsSidePanelShow(userText || text);
+    let openSidePanel =
+      shouldAttachSidePanel(userText || text, items, chatHistory) || mutated;
+    // Si el backend ya dice que el listado está en el visor, abrirlo de verdad.
+    if (
+      !openSidePanel &&
+      sideItems.length > 0 &&
+      /\b(visor|panel derecho|lado derecho|listado interactivo)\b/i.test(reply)
+    ) {
+      openSidePanel = true;
+    }
     const concreteAsk =
       hasConcreteInventoryAsk(userText || text, items, chatHistory) ||
       forceSidePanel;
+
+    // Sin resultados en una búsqueda concreta → “¿quisiste decir…?”
+    if (
+      !sideItems.length &&
+      !qrPayloads.length &&
+      !mutated &&
+      concreteAsk &&
+      items.length &&
+      !/quisiste decir/i.test(reply)
+    ) {
+      const suggestions = suggestDidYouMean(userText || text, items);
+      if (suggestions.length) {
+        reply = formatDidYouMeanReply(userText || text, suggestions);
+      }
+    }
     const exploratoryAsk =
       !concreteAsk && !mutated && isExploratoryChatAsk(userText || text);
-    if (!concreteAsk && !mutated) {
+    if (!openSidePanel) {
       sideItems = [];
       qrPayloads = [];
     } else if (
@@ -6757,27 +7586,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const focusArea = concreteAsk && !focusPerson
       ? detectAreaTotalAsk(userText || text, items)
       : undefined;
-    let askedOverview: ViewerOverview | undefined = mutated || areaListAsk
-      ? undefined
-      : concreteAsk
-        ? focusPerson
+    let askedOverview: ViewerOverview | undefined =
+      !openSidePanel || mutated || areaListAsk
+        ? undefined
+        : focusPerson
           ? "personTotal"
           : focusArea
             ? "areaTotal"
-            : detectViewerOverview(userText || text) || forcedOverview
-        : exploratoryAsk
-          ? pickDiscoveryTip(userText || text)
-          : forcedOverview;
-    // Si hay etiqueta/QR / lista de área, no tapar con ranking de Áreas.
+            : detectViewerOverview(userText || text) || forcedOverview;
+    // Si ya hay listado concreto (API / área / QR), no taparlo con ranking overview.
     const overview =
-      qrPayloads.length ||
-      (mutated && sideItems.length) ||
-      Boolean(areaListAsk && sideItems.length) ||
-      (sideItems.length &&
-        (forceSidePanel || looksLikeRecordLookup(userText || text)) &&
-        !forcedOverview)
+      !openSidePanel
         ? undefined
-        : askedOverview || forcedOverview;
+        : sideItems.length > 0 ||
+            qrPayloads.length ||
+            Boolean(areaListAsk && sideItems.length) ||
+            (sideItems.length &&
+              (forceSidePanel || looksLikeRecordLookup(userText || text)) &&
+              !forcedOverview)
+          ? undefined
+          : askedOverview || forcedOverview;
     const viewerFocus =
       overview === "personTotal" && focusPerson
         ? focusPerson
@@ -6792,15 +7620,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       sideItems = [];
       qrPayloads = [];
     }
-    if (
-      overview &&
-      exploratoryAsk &&
-      !/\bvisor|panel derecho|derecha\b/i.test(reply)
-    ) {
-      reply =
-        `${reply}\n\nTe dejé un vistazo rápido en el panel derecho por si quieres explorar.`.trim();
-    }
-    if (mutated) {
+    if (mutated || exploratoryAsk) {
       reply = reply
         .replace(
           /\n*\s*Te dejé un vistazo rápido en el panel derecho por si quieres explorar\.?\s*/gi,
@@ -6809,7 +7629,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         .trim();
     }
     const hasNewSide =
-      sideItems.length > 0 || qrPayloads.length > 0 || Boolean(overview);
+      openSidePanel &&
+      (sideItems.length > 0 || qrPayloads.length > 0 || Boolean(overview));
 
     if (hasNewSide) {
       if (qrPayloads.length) {
@@ -7693,15 +8514,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                         Hola. ¿Qué quieres consultar del inventario?
                       </h2>
                       <div className="chat-quick-actions">
-                        {CHAT_QUICK_ACTIONS.map(({ label, prompt, icon: Icon }) => (
+                        {CHAT_QUICK_ACTIONS.map(({ label, hint, prompt, icon: Icon }) => (
                           <button
                             key={label}
                             type="button"
                             className="chat-quick-action"
                             onClick={() => sendChat(prompt)}
                           >
-                            <Icon size={15} strokeWidth={1.8} aria-hidden="true" />
-                            <span>{label}</span>
+                            <span className="chat-quick-action-head">
+                              <span className="chat-quick-action-icon" aria-hidden="true">
+                                <Icon size={15} strokeWidth={1.9} />
+                              </span>
+                              <strong>{label}</strong>
+                            </span>
+                            <span className="chat-quick-action-hint">{hint}</span>
                           </button>
                         ))}
                       </div>
@@ -7898,25 +8724,51 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                   />
                                   <span>Asistente de Inventario</span>
                                 </span>
-                                <span className="chat-response-meta">
-                                  {hasSide ? (
+                                {hasSide ? (
+                                  <span className="chat-response-meta">
                                     <span className="chat-response-sync-pill">
                                       Visor activo
                                     </span>
-                                  ) : null}
-                                  <time
-                                    className="chat-time"
-                                    dateTime={new Date(
-                                      message.at || Date.now(),
-                                    ).toISOString()}
-                                  >
-                                    {formatChatTime(message.at)}
-                                  </time>
-                                </span>
+                                  </span>
+                                ) : null}
                               </div>
                               <div className="chat-response">
                                 {renderChatRichText(message.text)}
                               </div>
+                              {Array.isArray(message.exportFiles) &&
+                              message.exportFiles.length > 0 ? (
+                                <div
+                                  className="chat-export-files"
+                                  aria-label="Archivos generados"
+                                >
+                                  {message.exportFiles.map((file) => (
+                                    <a
+                                      key={`${message.id}-${file.name}`}
+                                      className="chat-export-card"
+                                      href={file.dataUrl}
+                                      download={file.name}
+                                      title={`Descargar ${file.name}`}
+                                    >
+                                      <span className="chat-export-card-title">
+                                        {file.label}
+                                      </span>
+                                      <span className="chat-export-card-meta">
+                                        <span
+                                          className="chat-export-card-badge"
+                                          aria-hidden="true"
+                                        >
+                                          X
+                                        </span>
+                                        <span>XLSX</span>
+                                        <span className="chat-export-card-count">
+                                          {file.rowCount.toLocaleString("es-MX")}{" "}
+                                          reg.
+                                        </span>
+                                      </span>
+                                    </a>
+                                  ))}
+                                </div>
+                              ) : null}
                               <div
                                 className="chat-response-actions"
                                 aria-label="Acciones de la respuesta"
@@ -7957,6 +8809,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                   <ThumbsDown size={14} strokeWidth={1.8} />
                                 </button>
                               </div>
+                              <time
+                                className="chat-time is-bot-foot"
+                                dateTime={new Date(
+                                  message.at || Date.now(),
+                                ).toISOString()}
+                              >
+                                {formatChatTime(message.at)}
+                              </time>
                             </div>
                           );
                         };
@@ -8408,76 +9268,75 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               </section>
               {chatStarted ? (
                 <aside
-                  className={`chat-viewer${hasAnySidePanel ? " is-filled is-sync" : " is-slot"}`}
+                  className={`chat-viewer${
+                    showSideViewer && activeSideCompanion
+                      ? " is-filled is-docked"
+                      : " is-slot is-docked"
+                  }`}
                   ref={viewerRailRef}
                   aria-label="Visor del chatbot"
-                  aria-hidden={!hasAnySidePanel}
+                  aria-hidden={!showSideViewer}
                 >
-                  {hasAnySidePanel
-                    ? sideCompanions.map((companion) => (
-                        <div
-                          key={companion.messageId}
-                          className="chat-viewer-sync-item"
-                          data-sync-msg={companion.messageId}
-                        >
-                          <ChatViewer
-                            inventory={items}
-                            resultItems={companion.resultItems}
-                            qrCards={companion.qrCards}
-                            overview={companion.overview}
-                            overviewFocus={companion.overviewFocus}
-                            onSelectAreaOption={(areaName) => {
-                              void sendChat(areaName);
-                            }}
-                            onSelectPersonOption={(personName) => {
-                              void sendChat(personName);
-                            }}
-                            onSelectItem={(item) => {
-                              const rawId = item.id;
-                              const id =
-                                rawId == null || String(rawId) === ""
-                                  ? NaN
-                                  : Number(rawId);
-                              const etq = String(item.etiqueta ?? "")
-                                .trim()
-                                .toLowerCase();
-                              const origen = String(item.origen ?? "").trim();
-                              const match =
-                                (Number.isFinite(id) && id > 0
-                                  ? items.find((row) => Number(row.id) === id)
-                                  : undefined) ||
-                                (etq
-                                  ? items.find((row) => {
-                                      const sameEtq =
-                                        String(row.etiqueta ?? "")
-                                          .trim()
-                                          .toLowerCase() === etq;
-                                      if (!sameEtq) return false;
-                                      if (!origen) return true;
-                                      return (
-                                        String(row.origen ?? "").trim() ===
-                                        origen
-                                      );
-                                    })
-                                  : undefined) ||
-                                (etq
-                                  ? items.find(
-                                      (row) =>
-                                        String(row.etiqueta ?? "")
-                                          .trim()
-                                          .toLowerCase() === etq,
-                                    )
-                                  : undefined);
+                  {showSideViewer && activeSideCompanion ? (
+                    <div
+                      key={activeSideCompanion.messageId}
+                      className="chat-viewer-dock-item"
+                    >
+                      <ChatViewer
+                        inventory={items}
+                        resultItems={activeSideCompanion.resultItems}
+                        qrCards={activeSideCompanion.qrCards}
+                        overview={activeSideCompanion.overview}
+                        overviewFocus={activeSideCompanion.overviewFocus}
+                        onSelectAreaOption={(areaName) => {
+                          void sendChat(areaName);
+                        }}
+                        onSelectPersonOption={(personName) => {
+                          void sendChat(personName);
+                        }}
+                        onSelectItem={(item) => {
+                          const rawId = item.id;
+                          const id =
+                            rawId == null || String(rawId) === ""
+                              ? NaN
+                              : Number(rawId);
+                          const etq = String(item.etiqueta ?? "")
+                            .trim()
+                            .toLowerCase();
+                          const origen = String(item.origen ?? "").trim();
+                          const match =
+                            (Number.isFinite(id) && id > 0
+                              ? items.find((row) => Number(row.id) === id)
+                              : undefined) ||
+                            (etq
+                              ? items.find((row) => {
+                                  const sameEtq =
+                                    String(row.etiqueta ?? "")
+                                      .trim()
+                                      .toLowerCase() === etq;
+                                  if (!sameEtq) return false;
+                                  if (!origen) return true;
+                                  return (
+                                    String(row.origen ?? "").trim() === origen
+                                  );
+                                })
+                              : undefined) ||
+                            (etq
+                              ? items.find(
+                                  (row) =>
+                                    String(row.etiqueta ?? "")
+                                      .trim()
+                                      .toLowerCase() === etq,
+                                )
+                              : undefined);
 
-                              // Sin startTransition: debe abrir la ficha al toque
-                              setSelectedProduct(
-                                match || (item as InventarioRow),
-                              );
-                            }}
-                          />
-                        </div>
-                      ))
-                    : null}
+                          setSelectedProduct(
+                            match || (item as InventarioRow),
+                          );
+                        }}
+                      />
+                    </div>
+                  ) : null}
                 </aside>
               ) : null}
             </div>

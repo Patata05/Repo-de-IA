@@ -41,19 +41,30 @@ _SEARCH_STOPWORDS = frozenset(
         "busca",
         "buscar",
         "buscame",
+        "busques",
         "si",
         "hay",
         "existe",
         "existen",
         "dame",
+        "dime",
+        "diga",
+        "digas",
+        "decir",
+        "di",
         "muestra",
         "mostrar",
         "muestrame",
+        "ensena",
+        "ensenar",
+        "ensename",
         "ver",
         "los",
         "las",
         "el",
         "la",
+        "lo",
+        "al",
         "un",
         "una",
         "unos",
@@ -82,6 +93,8 @@ _SEARCH_STOPWORDS = frozenset(
         "items",
         "registro",
         "registros",
+        "etiqueta",
+        "etiquetas",
         "inventario",
         "lista",
         "listar",
@@ -92,6 +105,86 @@ _SEARCH_STOPWORDS = frozenset(
         "son",
         "estan",
         "esta",
+        "este",
+        "estos",
+        "estas",
+        "ese",
+        "esa",
+        "esos",
+        "esas",
+        "me",
+        "te",
+        "se",
+        "nos",
+        "les",
+        "mi",
+        "tu",
+        "su",
+        "gustaria",
+        "quisiera",
+        "queria",
+        "quiero",
+        "necesito",
+        "puedes",
+        "puede",
+        "podrias",
+        "favor",
+        "porfavor",
+        "hola",
+        "gracias",
+        "ok",
+        "okay",
+        "vale",
+        "sobre",
+        "acerca",
+        "informacion",
+        "info",
+        "datos",
+        "tipo",
+        "clase",
+        "solo",
+        "unica",
+        "unicamente",
+        "tambien",
+        "ahora",
+        "aqui",
+        "alli",
+        "es",
+        "como",
+        "mas",
+        "menos",
+        "total",
+        "totales",
+        "numero",
+        "cantidad",
+        "arriba",
+        "anteriores",
+        "anterior",
+        "previas",
+        "previa",
+        "mismas",
+        "mismos",
+        "no",
+        "ven",
+        "veo",
+        "veen",
+        "aparecen",
+        "aparece",
+        "salen",
+        "sale",
+        "visor",
+        "panel",
+        "derecho",
+        "derecha",
+        "lado",
+        "otra",
+        "vez",
+        "nuevo",
+        "nuevamente",
+        "marca",
+        "marcas",
+        "producto",
+        "productos",
     }
 )
 
@@ -109,12 +202,55 @@ def _token_variants(token: str) -> list[str]:
     return list(dict.fromkeys(v for v in variants if v))
 
 
+_ARTICULO_SYNONYMS = {
+    "pc": ["laptop", "computadora", "ordenador", "aio", "desktop"],
+    "laptop": ["pc", "computadora", "portatil", "notebook"],
+    "portatil": ["laptop", "pc", "notebook", "computadora"],
+    "computadora": ["pc", "laptop", "ordenador", "aio", "desktop"],
+    "impresora": ["printer", "multifuncional"],
+    "printer": ["impresora", "multifuncional"],
+    "monitor": ["pantalla", "display"],
+    "pantalla": ["monitor", "display"],
+    "silla": ["asiento", "sillon"],
+    "mesa": ["escritorio"],
+    "escritorio": ["mesa", "desktop"],
+    "pintarron": ["pizarron", "pizarra", "whiteboard"],
+    "pizarron": ["pintarron", "pizarra"],
+    "ups": ["nobreak", "no break"],
+    "nobreak": ["ups"],
+}
+
+
 def _extract_search_tokens(query: str) -> list[str]:
+    """Extrae solo palabras clave (ej. 'tarjas'), no relleno conversacional."""
     raw_tokens = [t for t in _fold_text(query).split() if t]
     if not raw_tokens:
         return []
-    filtered = [t for t in raw_tokens if t not in _SEARCH_STOPWORDS]
-    return filtered or raw_tokens
+    filtered = [
+        t
+        for t in raw_tokens
+        if t not in _SEARCH_STOPWORDS and len(t) > 1 and not t.isdigit()
+    ]
+    # Deduplicar preservando orden
+    filtered = list(dict.fromkeys(filtered))
+    if not filtered:
+        fallback = [t for t in raw_tokens if len(t) > 2 and t not in _SEARCH_STOPWORDS]
+        filtered = list(dict.fromkeys(fallback)) or raw_tokens[-1:]
+    # Expandir sinónimos (pc ↔ laptop) sin perder el token original.
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for token in filtered:
+        if token not in seen:
+            seen.add(token)
+            expanded.append(token)
+        for syn in _ARTICULO_SYNONYMS.get(token, ()):
+            # Mantener sinónimos de una sola “palabra” en el token list.
+            syn_token = syn if " " not in syn else syn.split()[0]
+            if syn_token in seen:
+                continue
+            seen.add(syn_token)
+            expanded.append(syn_token)
+    return expanded[:6]
 
 
 def _token_matches_blob(token: str, blob: str, blob_tokens: set[str] | list[str]) -> bool:
@@ -672,6 +808,40 @@ def resumen_inventario() -> tuple[dict, str | None]:
     }, None
 
 
+def _log_inventario_auditoria(
+    env: dict[str, str],
+    *,
+    inventario_id: int | None,
+    etiqueta: str | None,
+    accion: str,
+    campo: str | None,
+    valor_antes: str | None,
+    valor_despues: str | None,
+    origen: str | None,
+    actor: str = "chatbot",
+) -> None:
+    """Best-effort: no bloquea la mutación si la tabla aún no existe."""
+    base, attempts = _supabase_base_and_keys(env)
+    if not base or not attempts:
+        return
+    body = {
+        "inventario_id": inventario_id,
+        "etiqueta": etiqueta,
+        "accion": accion,
+        "campo": campo,
+        "valor_antes": valor_antes,
+        "valor_despues": valor_despues,
+        "origen": origen,
+        "actor": actor,
+    }
+    for name, key, send_bearer in attempts:
+        url, headers, _ = _with_key(base, "inventario_auditoria", name, key, send_bearer)
+        headers["Prefer"] = "return=minimal"
+        _payload, error, _resp = _request_json("POST", url, headers=headers, body=body)
+        if not error:
+            return
+
+
 def update_inventario_row(row_id: int, fields: dict) -> tuple[dict | None, str | None]:
     clean = {k: v for k, v in fields.items() if k in WRITABLE_FIELDS}
     if not clean:
@@ -687,6 +857,21 @@ def update_inventario_row(row_id: int, fields: dict) -> tuple[dict | None, str |
     if not base or not attempts:
         return None, "Supabase no configurado."
 
+    before: dict | None = None
+    for name, key, send_bearer in attempts:
+        url, headers, _ = _with_key(
+            base, f"{inventario_table()}?id=eq.{int(row_id)}&select=*", name, key, send_bearer
+        )
+        payload, error, _resp = _request_json("GET", url, headers=headers)
+        if error:
+            continue
+        if isinstance(payload, list) and payload:
+            before = payload[0] if isinstance(payload[0], dict) else None
+            break
+        if isinstance(payload, dict):
+            before = payload
+            break
+
     last_error = "No se pudo actualizar"
     for name, key, send_bearer in attempts:
         url, headers, _ = _with_key(
@@ -698,11 +883,27 @@ def update_inventario_row(row_id: int, fields: dict) -> tuple[dict | None, str |
             last_error = error
             continue
         invalidate_inventario_cache()
+        after: dict | None = None
         if isinstance(payload, list) and payload:
-            return payload[0], None
-        if isinstance(payload, dict):
-            return payload, None
-        return clean, None
+            after = payload[0] if isinstance(payload[0], dict) else None
+        elif isinstance(payload, dict):
+            after = payload
+        if after is None:
+            after = {**(before or {}), **clean}
+        for campo, nuevo in clean.items():
+            _log_inventario_auditoria(
+                env,
+                inventario_id=int(row_id),
+                etiqueta=str((after or {}).get("etiqueta") or (before or {}).get("etiqueta") or "")
+                or None,
+                accion="update",
+                campo=campo,
+                valor_antes=str((before or {}).get(campo) or "") or "(vacío)",
+                valor_despues=str(nuevo or "") or "(vacío)",
+                origen=str((after or {}).get("origen") or (before or {}).get("origen") or "")
+                or None,
+            )
+        return after, None
     return None, last_error
 
 

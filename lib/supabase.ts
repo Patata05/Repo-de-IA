@@ -170,7 +170,20 @@ export async function createInventario(
       return { data: null, error: error.message };
     }
 
-    return { data: data as InventarioRow, error: null };
+    const created = data as InventarioRow;
+    void insertAuditoriaRows([
+      {
+        inventario_id: created.id ?? null,
+        etiqueta: created.etiqueta ?? null,
+        accion: "create",
+        campo: null,
+        valor_antes: null,
+        valor_despues: created.articulo ?? null,
+        origen: created.origen ?? null,
+        actor: "sistema",
+      },
+    ]);
+    return { data: created, error: null };
   } catch (err: unknown) {
     console.error("Error en createInventario:", err);
     return {
@@ -356,6 +369,65 @@ export async function createInventarioMany(
   }
 }
 
+export type InventarioAuditoriaRow = {
+  id?: number;
+  inventario_id?: number | null;
+  etiqueta?: string | null;
+  accion: "create" | "update" | "delete";
+  campo?: string | null;
+  valor_antes?: string | null;
+  valor_despues?: string | null;
+  origen?: string | null;
+  actor?: string | null;
+  chat_id?: string | null;
+  created_at?: string | null;
+};
+
+async function insertAuditoriaRows(
+  rows: Array<Omit<InventarioAuditoriaRow, "id" | "created_at">>,
+): Promise<void> {
+  if (!supabase || !rows.length) return;
+  try {
+    const { error } = await supabase.from("inventario_auditoria").insert(rows);
+    if (error) {
+      // Tabla aún no creada o RLS: no bloquear la mutación principal.
+      console.warn("inventario_auditoria:", error.message);
+    }
+  } catch (err) {
+    console.warn("inventario_auditoria:", err);
+  }
+}
+
+export async function logInventarioAuditoria(
+  entries: Array<Omit<InventarioAuditoriaRow, "id" | "created_at">>,
+): Promise<void> {
+  await insertAuditoriaRows(entries);
+}
+
+function auditText(val: unknown): string {
+  if (val == null || val === "") return "(vacío)";
+  return String(val);
+}
+
+async function logInventarioAuditoriaFromUpdate(
+  before: InventarioRow | null,
+  after: InventarioRow,
+  changedKeys: string[],
+  actor = "sistema",
+) {
+  const entries = changedKeys.map((campo) => ({
+    inventario_id: after.id ?? before?.id ?? null,
+    etiqueta: after.etiqueta ?? before?.etiqueta ?? null,
+    accion: "update" as const,
+    campo,
+    valor_antes: auditText(before?.[campo as keyof InventarioRow]),
+    valor_despues: auditText(after[campo as keyof InventarioRow]),
+    origen: after.origen ?? before?.origen ?? null,
+    actor,
+  }));
+  await insertAuditoriaRows(entries);
+}
+
 export async function updateInventario(
   id: number,
   item: Partial<NewInventarioItem>
@@ -380,7 +452,11 @@ export async function updateInventario(
     if (item.estado !== undefined) payload.estado = normalizeEstado(item.estado);
     if (item.origen !== undefined) payload.origen = item.origen || "S/O";
 
-    const { data, error } = await (await inventarioTable())
+    const table = await inventarioTable();
+    const { data: beforeRow } = await table.select("*").eq("id", id).maybeSingle();
+    const before = (beforeRow as InventarioRow | null) || null;
+
+    const { data, error } = await table
       .update(payload)
       .eq("id", id)
       .select()
@@ -402,7 +478,9 @@ export async function updateInventario(
       };
     }
 
-    return { data: data as InventarioRow, error: null };
+    const after = data as InventarioRow;
+    void logInventarioAuditoriaFromUpdate(before, after, Object.keys(payload));
+    return { data: after, error: null };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Error inesperado al actualizar.";
     console.error("Error en updateInventario:", err);
@@ -423,7 +501,17 @@ export async function deleteInventario(
   }
 
   try {
-    const { data, error } = await (await inventarioTable())
+    const table = await inventarioTable();
+    const { data: beforeRow } = await table
+      .select("id,etiqueta,articulo,origen")
+      .eq("id", numericId)
+      .maybeSingle();
+    const before = beforeRow as Pick<
+      InventarioRow,
+      "id" | "etiqueta" | "articulo" | "origen"
+    > | null;
+
+    const { data, error } = await table
       .delete()
       .eq("id", numericId)
       .select("id");
@@ -442,7 +530,7 @@ export async function deleteInventario(
     }
 
     // Confirmación extra: el registro ya no debe existir
-    const { data: stillThere } = await (await inventarioTable())
+    const { data: stillThere } = await table
       .select("id")
       .eq("id", numericId)
       .maybeSingle();
@@ -454,6 +542,18 @@ export async function deleteInventario(
       };
     }
 
+    void insertAuditoriaRows([
+      {
+        inventario_id: numericId,
+        etiqueta: before?.etiqueta ?? null,
+        accion: "delete",
+        campo: null,
+        valor_antes: before?.articulo ?? null,
+        valor_despues: null,
+        origen: before?.origen ?? null,
+        actor: "sistema",
+      },
+    ]);
     return { success: true, error: null };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Error inesperado al eliminar.";

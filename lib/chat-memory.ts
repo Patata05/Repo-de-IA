@@ -550,6 +550,41 @@ function describeLastFieldChange(
   );
 }
 
+/** Resumen claro antes de mutar: etiqueta · campo · de → a */
+export function formatMutationConfirmLines(
+  changes: Array<{
+    etiqueta?: string | null;
+    field: string;
+    oldValue: string;
+    newValue: string;
+  }>,
+): string {
+  return changes
+    .map((c) => {
+      const etq = String(c.etiqueta || "S/E").trim() || "S/E";
+      return `• **${etq}** · **${c.field}** · “${c.oldValue}” → “${c.newValue}”`;
+    })
+    .join("\n");
+}
+
+export function buildMutationConfirmReply(
+  changes: Array<{
+    etiqueta?: string | null;
+    field: string;
+    oldValue: string;
+    newValue: string;
+  }>,
+): string {
+  if (!changes.length) {
+    return "No hay cambios pendientes. Indica etiqueta, campo y el valor nuevo.";
+  }
+  return (
+    `Voy a aplicar estos cambios:\n\n` +
+    `${formatMutationConfirmLines(changes)}\n\n` +
+    `¿Confirmas? Responde **sí** para aplicarlos o **no** para cancelar.`
+  );
+}
+
 export function buildRevertProposalReply(
   memory?: ChatMemory | null,
 ): string | null {
@@ -558,10 +593,17 @@ export function buildRevertProposalReply(
   if (!c) {
     return "No tengo en memoria un cambio de campo reciente para restaurar. Indícame la etiqueta y el valor que quieres volver a poner.";
   }
-  const label = c.etiqueta || (c.id != null ? `id ${c.id}` : "el registro");
   return (
     `${describeLastFieldChange(mem)}\n\n` +
-    `Puedo dejar **${c.field}** otra vez en “**${c.oldValue}**” en ${label}.\n\n` +
+    `Propuesta de restauración:\n\n` +
+    `${formatMutationConfirmLines([
+      {
+        etiqueta: c.etiqueta,
+        field: c.field,
+        oldValue: c.newValue,
+        newValue: c.oldValue,
+      },
+    ])}\n\n` +
     `¿Confirmas? Responde **sí** para aplicarlo.`
   );
 }

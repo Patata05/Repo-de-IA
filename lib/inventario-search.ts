@@ -1,4 +1,5 @@
 import type { InventarioRow } from "@/lib/supabase";
+import { expandSearchTokens } from "@/lib/inventario-synonyms";
 
 function textOf(val: unknown) {
   return String(val ?? "").trim();
@@ -73,7 +74,104 @@ function fieldMatches(field: string, prepared: PreparedSearch): boolean {
   if (queryTokens.length > 1 && queryTokens.every((tok) => fieldTokens.includes(tok))) {
     return true;
   }
+  // Sinónimos: "pc" también encuentra "laptop" / "computadora".
+  if (queryTokens.length) {
+    const expanded = expandSearchTokens(queryTokens);
+    if (expanded.some((tok) => tok !== prepared.q && field.includes(tok))) {
+      return true;
+    }
+    if (
+      expanded.length > 1 &&
+      queryTokens.every((tok) => {
+        const alts = expandSearchTokens([tok]);
+        return alts.some((alt) => fieldTokens.includes(alt) || field.includes(alt));
+      })
+    ) {
+      return true;
+    }
+  }
   return false;
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = i - 1;
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cur = row[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + cost);
+      prev = cur;
+    }
+  }
+  return row[b.length];
+}
+
+/**
+ * Si la búsqueda no dio hits, sugiere área/persona/artículo cercano.
+ * "¿quisiste decir…?"
+ */
+export function suggestDidYouMean(
+  rawQuery: string,
+  catalog: InventarioRow[],
+  limit = 3,
+): string[] {
+  const prepared = prepareSearch(rawQuery);
+  if (!prepared) return [];
+  const q = prepared.q;
+  if (q.length < 3) return [];
+
+  const candidates = new Set<string>();
+  for (const row of catalog) {
+    for (const key of ["area", "persona", "articulo", "marca"] as const) {
+      const val = textOf(row[key]);
+      if (!val) continue;
+      const n = normalizeSearch(val);
+      if (!n || n.length < 3) continue;
+      candidates.add(val.trim());
+      for (const part of n.split(" ")) {
+        if (part.length >= 3) candidates.add(part);
+      }
+    }
+  }
+
+  const scored: Array<{ label: string; score: number }> = [];
+  for (const label of candidates) {
+    const n = normalizeSearch(label);
+    if (!n) continue;
+    if (n === q) continue;
+    let score = levenshtein(q, n);
+    if (n.includes(q) || q.includes(n)) score = Math.min(score, 1);
+    const maxLen = Math.max(q.length, n.length);
+    if (score > 3 || score / maxLen > 0.45) continue;
+    scored.push({ label, score });
+  }
+  scored.sort((a, b) => a.score - b.score || a.label.localeCompare(b.label, "es"));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of scored) {
+    const key = normalizeSearch(item.label);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item.label);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+export function formatDidYouMeanReply(query: string, suggestions: string[]): string {
+  if (!suggestions.length) {
+    return `No encontré coincidencias para “${query.trim()}”. Prueba con otra palabra o un área/persona concreta.`;
+  }
+  const list = suggestions.map((s) => `• **${s}**`).join("\n");
+  return (
+    `No encontré “${query.trim()}”. ¿Quisiste decir…?\n\n${list}\n\n` +
+    `Responde con una de esas opciones o reformula la búsqueda.`
+  );
 }
 
 export function indexMatchesPrepared(entry: RowSearchIndex, prepared: PreparedSearch): boolean {

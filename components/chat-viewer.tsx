@@ -8,7 +8,8 @@ import type { InventarioRow } from "@/lib/supabase";
 export type ChatViewerQr = ChatQrPayload & { dataUrl?: string };
 
 const QR_PREVIEW_LIMIT = 7;
-const RESULT_PREVIEW_LIMIT = 20;
+/** Preview en el recuadro: llena el alto colapsado; Ver más muestra el resto. */
+const RESULT_PREVIEW_LIMIT = 8;
 
 export type ChatViewerOverview =
   | "full"
@@ -499,7 +500,7 @@ function ChatViewer({
             ? resultItems
             : qrCards.map((card) => ({ origen: null, ...card })),
         )
-      : personLabel || "Etiquetas"
+      : personLabel || displayFocusLabel || "Etiquetas"
     : overview === "areas"
       ? "Áreas"
       : overview === "areaTotal"
@@ -565,50 +566,66 @@ function ChatViewer({
       canCollapseItems && !qrExpanded
         ? itemsToRender.slice(0, previewLimit)
         : itemsToRender;
+    const countLabel = formatNumber(
+      totalContextRows > 0 ? totalContextRows : itemsToRender.length,
+    );
     const titleLabel =
       totalContextRows > 0 && itemsToRender.length < totalContextRows
-        ? `Registros solicitados (${formatNumber(itemsToRender.length)} de ${formatNumber(totalContextRows)})`
-        : `Registros del área (${formatNumber(itemsToRender.length)})`;
+        ? `Registros solicitados (${formatNumber(itemsToRender.length)} de ${countLabel})`
+        : overview === "personTotal"
+          ? `Registros (${countLabel})`
+          : `Registros del área (${countLabel})`;
+    const cardState = canCollapseItems
+      ? qrExpanded
+        ? " is-expanded"
+        : " is-collapsed"
+      : " is-expanded";
     return (
       <section
-        className="chat-viewer-card"
+        className={`chat-viewer-card chat-viewer-records-card${cardState}`}
         aria-label="Registros de la consulta"
       >
         <h3 className="chat-viewer-section-title">{titleLabel}</h3>
-        <ul className="chat-viewer-list">
-          {visibleEmbedded.map((item, index) => {
-            const etiqueta = textOf(item.etiqueta) || `Item ${index + 1}`;
-            const articulo = textOf(item.articulo) || "Artículo";
-            const marca = textOf(item.marca);
-            const marcaLabel =
-              marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
-                ? ` · ${marca}`
-                : "";
-            const persona = textOf(item.persona) || "Sin asignar";
-            const area = textOf(item.area);
-            return (
-              <li key={`${item.id ?? etiqueta}-${index}`}>
-                <button
-                  type="button"
-                  className="chat-viewer-list-item"
-                  onClick={() => onSelectItem?.(item)}
-                >
-                  <span className="chat-viewer-badge">{etiqueta}</span>
-                  <span className="chat-viewer-list-copy">
-                    <strong>
-                      {articulo}
-                      {marcaLabel}
-                    </strong>
-                    <span>{[persona, area].filter(Boolean).join(" · ")}</span>
-                  </span>
-                  <span className="chat-viewer-item-arrow" aria-hidden="true">
-                    <ChevronRight size={15} />
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+        <div
+          className={`chat-viewer-expandable${
+            qrExpanded ? " is-expanded" : ""
+          }`}
+        >
+          <ul className="chat-viewer-list">
+            {visibleEmbedded.map((item, index) => {
+              const etiqueta = textOf(item.etiqueta) || `Item ${index + 1}`;
+              const articulo = textOf(item.articulo) || "Artículo";
+              const marca = textOf(item.marca);
+              const marcaLabel =
+                marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                  ? ` · ${marca}`
+                  : "";
+              const persona = textOf(item.persona) || "Sin asignar";
+              const area = textOf(item.area);
+              return (
+                <li key={`${item.id ?? etiqueta}-${index}`}>
+                  <button
+                    type="button"
+                    className="chat-viewer-list-item"
+                    onClick={() => onSelectItem?.(item)}
+                  >
+                    <span className="chat-viewer-badge">{etiqueta}</span>
+                    <span className="chat-viewer-list-copy">
+                      <strong>
+                        {articulo}
+                        {marcaLabel}
+                      </strong>
+                      <span>{[persona, area].filter(Boolean).join(" · ")}</span>
+                    </span>
+                    <span className="chat-viewer-item-arrow" aria-hidden="true">
+                      <ChevronRight size={15} />
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
         {canCollapseItems ? (
           <button
             type="button"
@@ -616,8 +633,8 @@ function ChatViewer({
             onClick={() => setQrExpanded((open) => !open)}
           >
             {qrExpanded
-              ? "Mostrar menos"
-              : `Mostrar más (${itemsToRender.length - previewLimit})`}
+              ? "Ver menos"
+              : `Ver más (${itemsToRender.length - previewLimit})`}
           </button>
         ) : null}
       </section>
@@ -699,13 +716,23 @@ function ChatViewer({
                   : canCollapseMarcas
                     ? marcasSorted.length - marcaPreviewLimit
                     : 0;
+          const isPersonOrAreaShell =
+            overview === "personTotal" || overview === "areaTotal";
           return (
             <>
-              <div className="chat-viewer-scroll">
+              <div
+                className={`chat-viewer-scroll${
+                  isPersonOrAreaShell
+                    ? qrExpanded
+                      ? " is-expanded is-records-shell"
+                      : " is-collapsed is-records-shell"
+                    : ""
+                }`}
+              >
                 <div
                   className={`chat-viewer-expandable${
                     overviewExpanded ? " is-expanded" : ""
-                  }`}
+                  }${isPersonOrAreaShell ? " is-records-shell" : ""}`}
                 >
                   {showAreaMatches ? (
                     <>
@@ -1225,21 +1252,21 @@ function ChatViewer({
                       </ul>
                     </section>
                   ) : null}
+                  {canCollapseOverview ? (
+                    <button
+                      type="button"
+                      className="chat-viewer-show-more"
+                      onClick={() => setOverviewExpanded((open) => !open)}
+                    >
+                      {overviewExpanded
+                        ? "Ver menos"
+                        : moreCount > 0
+                          ? `Ver más (${moreCount})`
+                          : "Ver más"}
+                    </button>
+                  ) : null}
                 </div>
               </div>
-              {canCollapseOverview ? (
-                <button
-                  type="button"
-                  className="chat-viewer-show-more"
-                  onClick={() => setOverviewExpanded((open) => !open)}
-                >
-                  {overviewExpanded
-                    ? "Mostrar menos"
-                    : moreCount > 0
-                      ? `Mostrar más (${moreCount})`
-                      : "Mostrar más"}
-                </button>
-              ) : null}
             </>
           );
         })()
@@ -1253,9 +1280,23 @@ function ChatViewer({
               : listItems;
           return (
             <>
-              <div className="chat-viewer-scroll">
+              <div
+                className={`chat-viewer-scroll${
+                  canCollapse
+                    ? qrExpanded
+                      ? " is-expanded"
+                      : " is-collapsed"
+                    : " is-expanded"
+                }`}
+              >
                 <section
-                  className="chat-viewer-card"
+                  className={`chat-viewer-card${
+                    canCollapse
+                      ? qrExpanded
+                        ? " is-expanded"
+                        : " is-collapsed"
+                      : " is-expanded"
+                  }`}
                   aria-label="Resultados de la consulta"
                 >
                   {hasQr ? null : (
@@ -1350,19 +1391,19 @@ function ChatViewer({
                       })}
                     </ul>
                   </div>
+                  {canCollapse ? (
+                    <button
+                      type="button"
+                      className="chat-viewer-show-more"
+                      onClick={() => setQrExpanded((open) => !open)}
+                    >
+                      {qrExpanded
+                        ? "Ver menos"
+                        : `Ver más (${listItems.length - previewLimit})`}
+                    </button>
+                  ) : null}
                 </section>
               </div>
-              {canCollapse ? (
-                <button
-                  type="button"
-                  className="chat-viewer-show-more"
-                  onClick={() => setQrExpanded((open) => !open)}
-                >
-                  {qrExpanded
-                    ? "Mostrar menos"
-                    : `Mostrar más (${listItems.length - previewLimit})`}
-                </button>
-              ) : null}
             </>
           );
         })()
