@@ -192,10 +192,16 @@ export type ExcelExportAsk = {
   theme: string | null;
   /** Quiere el listado de la consulta / persona / área previa. */
   fromContext: boolean;
+  /**
+   * Origen concreto: “excel del inventario 3” → Inventario 3.
+   * Si viene, NO usar el visor/ficha previa (evita exportar 1 registro).
+   */
+  origen: string | null;
 };
 
 /**
- * Detecta pedidos tipo “dame un excel…”, “3 excel de oficinas…”.
+ * Detecta pedidos tipo “dame un excel…”, “3 excel de oficinas…”,
+ * “excel del inventario 3”.
  */
 export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
   const raw = String(userText || "").trim();
@@ -213,41 +219,69 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
   // Importar/subir no es exportar.
   if (
     /\b(importar|subir|cargar|adjuntar|pasa(?:rme)?)\b/.test(n) &&
-    !/\b(exportar|descargar|genera|generar|dame|muestra|crear|crea|haz|armar)\b/.test(
+    !/\b(exportar|descargar|genera|generar|dame|muestra|crear|crea|haz|armar|ayud|darme|pasar)\b/.test(
       n,
     )
   ) {
     return null;
   }
 
+  // “inventario 3” / “inventari 3” / “inevtario tres”
+  const wordNum: Record<string, number> = {
+    uno: 1,
+    una: 1,
+    dos: 2,
+    tres: 3,
+    cuatro: 4,
+    cinco: 5,
+    seis: 6,
+    siete: 7,
+    ocho: 8,
+    nueve: 9,
+    diez: 10,
+  };
+  let origen: string | null = null;
+  const origenMatch = n.match(
+    /\b(?:al)?(?:inventari[oa]?s?|invenatrio|invetario|inevtario|inventar[ioa]*)\s*(\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b/,
+  );
+  if (origenMatch) {
+    const rawNum = origenMatch[1];
+    const num = /^\d+$/.test(rawNum) ? Number(rawNum) : wordNum[rawNum];
+    if (num && Number.isFinite(num)) origen = `Inventario ${num}`;
+  }
+
   let count = 1;
-  const countMatch =
-    n.match(
-      /\b(\d{1,2})\s*(excel|xlsx|xls|csv|archivos?|inventarios?)\b/,
-    ) ||
-    n.match(
-      /\b(excel|xlsx|xls|csv|archivos?|inventarios?)\s*(\d{1,2})\b/,
-    );
-  if (countMatch) {
-    const num = Number(countMatch[1] || countMatch[2]);
-    if (Number.isFinite(num) && num >= 1) count = Math.min(12, num);
-  } else if (
-    /\b(tres)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
-    /\b(excel|xlsx|archivos|inventarios)\s+(tres)\b/.test(n)
-  ) {
-    count = 3;
-  } else if (
-    /\b(dos)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
-    /\b(excel|xlsx|archivos|inventarios)\s+(dos)\b/.test(n)
-  ) {
-    count = 2;
+  // Si ya hay “inventario 3”, ese 3 NO es “3 archivos excel”.
+  if (!origen) {
+    const countMatch =
+      n.match(
+        /\b(\d{1,2})\s*(excel|xlsx|xls|csv|archivos?|inventarios?)\b/,
+      ) ||
+      n.match(
+        /\b(excel|xlsx|xls|csv|archivos?|inventarios?)\s*(\d{1,2})\b/,
+      );
+    if (countMatch) {
+      const num = Number(countMatch[1] || countMatch[2]);
+      if (Number.isFinite(num) && num >= 1) count = Math.min(12, num);
+    } else if (
+      /\b(tres)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
+      /\b(excel|xlsx|archivos|inventarios)\s+(tres)\b/.test(n)
+    ) {
+      count = 3;
+    } else if (
+      /\b(dos)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
+      /\b(excel|xlsx|archivos|inventarios)\s+(dos)\b/.test(n)
+    ) {
+      count = 2;
+    }
   }
 
   const fromContext =
-    /\b(esta|este|esa|ese|estos|estas|esa persona|esta persona|esos|esas|anteriores?|de arriba|consulta|resultado)\b/.test(
+    !origen &&
+    (/\b(esta|este|esa|ese|estos|estas|esa persona|esta persona|esos|esas|anteriores?|de arriba|consulta|resultado)\b/.test(
       n,
     ) ||
-    /\b(persona|personas|registros?)\b/.test(n);
+      /\b(de\s+esa|de\s+esta|de\s+ese|de\s+este)\b/.test(n));
 
   let theme: string | null = null;
   const themeMatch = n.match(
@@ -262,5 +296,5 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
     theme = "Oficina";
   }
 
-  return { count, theme, fromContext };
+  return { count, theme, fromContext, origen };
 }

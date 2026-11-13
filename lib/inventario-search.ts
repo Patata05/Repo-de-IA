@@ -16,17 +16,27 @@ export function normalizeSearch(value: unknown): string {
     .trim();
 }
 
+/** Forma compacta para códigos: OF-0026 → of0026 */
+export function compactSearch(value: unknown): string {
+  return normalizeSearch(value).replace(/\s+/g, "");
+}
+
 export type PreparedSearch = {
   raw: string;
   q: string;
+  compact: string;
   /** Solo si el usuario escribió espacio al final (como Excel "biblioteca "). */
   requireTrailingSpace: boolean;
+  /** Parece código/etiqueta (OF-0026, 281367…). */
+  looksLikeCode: boolean;
 };
 
 /** Índice liviano: campos ya normalizados (una vez por carga). */
 export type RowSearchIndex = {
   row: InventarioRow;
   fields: string[];
+  /** Campos compactos (códigos sin espacios/guiones). */
+  compactFields: string[];
 };
 
 const SEARCH_KEYS = [
@@ -38,29 +48,52 @@ const SEARCH_KEYS = [
   "area",
   "persona",
   "observaciones",
+  "origen",
+  "estado",
 ] as const;
 
 export function buildSearchIndex(rows: InventarioRow[]): RowSearchIndex[] {
-  return rows.map((row) => ({
-    row,
-    fields: SEARCH_KEYS.map((key) => normalizeSearch(row[key as keyof InventarioRow])).filter(
-      Boolean,
-    ),
-  }));
+  return rows.map((row) => {
+    const fields = SEARCH_KEYS.map((key) =>
+      normalizeSearch(row[key as keyof InventarioRow]),
+    ).filter(Boolean);
+    return {
+      row,
+      fields,
+      compactFields: fields.map((f) => f.replace(/\s+/g, "")).filter(Boolean),
+    };
+  });
 }
 
 /**
  * Mín. 3 caracteres. Filtra en TODOS los campos.
  * "biblioteca" → 102 (contiene).
  * "biblioteca " (espacio escrito) → 97 (como Excel).
+ * "OF-0026" → of0026 (código, no se parte mal).
  */
 export function prepareSearch(rawQuery: string): PreparedSearch | null {
   const requireTrailingSpace = /\s$/.test(rawQuery);
   const raw = rawQuery.trim();
-  if (raw.length < 3) return null;
+  if (raw.length < 2) return null;
+  // Códigos cortos tipo A1, RH12: permitir desde 2 si hay dígito.
+  if (raw.length < 3 && !/\d/.test(raw)) return null;
   const q = normalizeSearch(raw);
   if (!q) return null;
-  return { raw, q, requireTrailingSpace };
+  const compact = q.replace(/\s+/g, "");
+  const looksLikeCode =
+    /^[a-z]{0,8}\d{2,}$/i.test(compact) ||
+    /^\d{4,}$/.test(compact) ||
+    /[a-z]+\d+|\d+[a-z]+/i.test(compact);
+  return { raw, q, compact, requireTrailingSpace, looksLikeCode };
+}
+
+function tokenInField(field: string, tok: string): boolean {
+  if (!tok) return false;
+  const tokens = field.split(" ").filter(Boolean);
+  if (tokens.includes(tok)) return true;
+  // Substring solo con tokens ≥ 3 (evita “of” → “oficina”).
+  if (tok.length >= 3 && field.includes(tok)) return true;
+  return false;
 }
 
 function fieldMatches(field: string, prepared: PreparedSearch): boolean {
@@ -69,22 +102,36 @@ function fieldMatches(field: string, prepared: PreparedSearch): boolean {
     return field.includes(`${prepared.q} `);
   }
   if (field.includes(prepared.q)) return true;
+  // OF-0026 vs of 0026: comparar compacto
+  const fieldCompact = field.replace(/\s+/g, "");
+  if (prepared.compact && fieldCompact.includes(prepared.compact)) return true;
+
   const fieldTokens = field.split(" ").filter(Boolean);
   const queryTokens = prepared.q.split(" ").filter(Boolean);
+
+  // Códigos: no usar sinónimos ni tokens sueltos (“of” / “0026” por separado).
+  if (prepared.looksLikeCode) {
+    return false;
+  }
+
   if (queryTokens.length > 1 && queryTokens.every((tok) => fieldTokens.includes(tok))) {
     return true;
   }
   // Sinónimos: "pc" también encuentra "laptop" / "computadora".
   if (queryTokens.length) {
     const expanded = expandSearchTokens(queryTokens);
-    if (expanded.some((tok) => tok !== prepared.q && field.includes(tok))) {
+    if (
+      expanded.some(
+        (tok) => tok !== prepared.q && tok.length >= 3 && tokenInField(field, tok),
+      )
+    ) {
       return true;
     }
     if (
-      expanded.length > 1 &&
+      queryTokens.length > 1 &&
       queryTokens.every((tok) => {
         const alts = expandSearchTokens([tok]);
-        return alts.some((alt) => fieldTokens.includes(alt) || field.includes(alt));
+        return alts.some((alt) => tokenInField(field, alt));
       })
     ) {
       return true;
@@ -202,12 +249,25 @@ export function formatDidYouMeanReply(query: string, suggestions: string[]): str
 }
 
 export function indexMatchesPrepared(entry: RowSearchIndex, prepared: PreparedSearch): boolean {
-  return entry.fields.some((field) => fieldMatches(field, prepared));
+  if (entry.fields.some((field) => fieldMatches(field, prepared))) return true;
+  if (
+    prepared.compact &&
+    entry.compactFields?.some((field) => field.includes(prepared.compact))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function rowMatchesPrepared(row: InventarioRow, prepared: PreparedSearch): boolean {
   for (const key of SEARCH_KEYS) {
     if (fieldMatches(normalizeSearch(row[key as keyof InventarioRow]), prepared)) return true;
+  }
+  if (prepared.compact) {
+    for (const key of SEARCH_KEYS) {
+      const c = compactSearch(row[key as keyof InventarioRow]);
+      if (c && c.includes(prepared.compact)) return true;
+    }
   }
   return false;
 }

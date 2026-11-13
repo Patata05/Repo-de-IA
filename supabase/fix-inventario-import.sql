@@ -50,6 +50,14 @@ ALTER TABLE public.inventario ALTER COLUMN estado SET DEFAULT 'Activo';
 CREATE INDEX IF NOT EXISTS idx_inventario_area     ON public.inventario (area);
 CREATE INDEX IF NOT EXISTS idx_inventario_persona  ON public.inventario (persona);
 CREATE INDEX IF NOT EXISTS idx_inventario_articulo ON public.inventario (articulo);
+-- Solo etiqueta es única por origen; serie y demás campos SÍ se repiten.
+ALTER TABLE public.inventario DROP CONSTRAINT IF EXISTS inventario_serie_key;
+DROP INDEX IF EXISTS public.inventario_serie_key;
+DROP INDEX IF EXISTS public.inventario_serie_origen_key;
+
+ALTER TABLE public.inventario DROP CONSTRAINT IF EXISTS inventario_etiqueta_key;
+DROP INDEX IF EXISTS public.inventario_etiqueta_key;
+
 CREATE UNIQUE INDEX IF NOT EXISTS inventario_etiqueta_origen_key
   ON public.inventario (etiqueta, origen);
 

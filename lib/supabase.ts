@@ -302,30 +302,73 @@ async function insertPayloadBatch(
     return { data: [], error: mapImportError(msg) };
   }
 
-  // Lote con choques de únicos: insertar uno a uno y conservar los válidos
+  // Lote con choques de únicos: insertar uno a uno y conservar los válidos.
+  // Solo ETIQUETA+ORIGEN es único; serie repetida = bug de esquema en Supabase.
+  // Clasificar cada fila solo con SU error (no el del lote: contamina el resto).
   const saved: InventarioRow[] = [];
-  const failed: string[] = [];
+  const failedEtiqueta: string[] = [];
+  const failedSerie: string[] = [];
+  const failedOther: string[] = [];
   for (const payload of payloads) {
     const one = await (await inventarioTable()).insert([payload]).select().single();
     if (one.error || !one.data) {
-      const detail = payload.serie
-        ? `${payload.etiqueta} / serie ${payload.serie}`
-        : payload.etiqueta;
-      if (failed.length < 10) failed.push(detail);
+      const em = (one.error?.message || "").toLowerCase();
+      const et = String(payload.etiqueta || "").trim() || "—";
+      const looksSerie =
+        em.includes("inventario_serie_key") ||
+        em.includes("inventario_serie_origen_key") ||
+        (em.includes("serie") &&
+          (em.includes("duplicate") || em.includes("unique")));
+      const looksEtiqueta =
+        em.includes("inventario_etiqueta_key") ||
+        em.includes("inventario_etiqueta_origen_key") ||
+        (em.includes("etiqueta") &&
+          (em.includes("duplicate") || em.includes("unique")));
+      if (looksSerie && !looksEtiqueta) {
+        if (failedSerie.length < 12) failedSerie.push(et);
+      } else if (looksEtiqueta) {
+        if (failedEtiqueta.length < 12) failedEtiqueta.push(et);
+      } else if (em.includes("duplicate") || em.includes("unique")) {
+        // Sin nombre de índice: serie en payload → UNIQUE viejo de serie.
+        if (payload.serie && failedSerie.length < 12) failedSerie.push(et);
+        else if (failedEtiqueta.length < 12) failedEtiqueta.push(et);
+      } else if (failedOther.length < 8) {
+        failedOther.push(et);
+      }
       continue;
     }
     saved.push(one.data as InventarioRow);
   }
 
   if (saved.length) {
+    // Éxito parcial: devolver lo guardado; el chat reporta omitidas aparte.
     return { data: saved, error: null };
+  }
+
+  if (failedSerie.length) {
+    return {
+      data: [],
+      error:
+        "La base aún bloquea series repetidas. En Supabase → SQL Editor ejecuta " +
+        "Database/allow-serie-duplicates-so.sql y vuelve a copiar. " +
+        `Ej. etiquetas afectadas: ${failedSerie.join(", ")}.`,
+    };
+  }
+  if (failedEtiqueta.length) {
+    return {
+      data: [],
+      error:
+        `Ya existían en el destino (etiqueta única por inventario): ${failedEtiqueta.join(", ")}` +
+        (failedEtiqueta.length >= 12 ? "…" : "") +
+        `. El resto no se pudo insertar; revisa si falta el SQL de serie o vuelve a intentar.`,
+    };
   }
 
   return {
     data: [],
     error:
-      failed.length > 0
-        ? `No se pudo importar. Conflictos en: ${failed.join(", ")}`
+      failedOther.length > 0
+        ? `No se pudo importar: ${failedOther.join(", ")}`
         : mapImportError(msg),
   };
 }

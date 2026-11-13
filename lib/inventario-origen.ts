@@ -1,4 +1,4 @@
-import type { InventarioRow } from "@/lib/supabase";
+import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 
 /** Extrae el número de nombres tipo "Inventario 3". */
 export function inventarioNumber(name: string): number | null {
@@ -29,6 +29,71 @@ export function listExistingOrigens(rows: InventarioRow[]): string[] {
 
 /** Primera base de datos (sin origen previo). */
 export const ORIGEN_SIN_ORIGEN = "S/O";
+
+/** Alta manual sin archivo ni conteo. */
+export const ORIGEN_NUEVO_REGISTRO = "nuevo registro";
+
+export type FileOrigenKind = "xlsx" | "xls" | "csv";
+
+/** Extensión del archivo → kind de origen (xlsx / xls / csv). */
+export function detectFileOrigenKind(fileName: string): FileOrigenKind | null {
+  const ext = String(fileName || "")
+    .trim()
+    .toLowerCase()
+    .match(/\.([a-z0-9]+)$/)?.[1];
+  if (ext === "csv") return "csv";
+  if (ext === "xls") return "xls";
+  if (ext === "xlsx" || ext === "xlsm") return "xlsx";
+  return null;
+}
+
+function fileOrigenNumber(name: string, kind: FileOrigenKind): number | null {
+  const n = foldOrigenText(name);
+  const m = n.match(new RegExp(`^${kind}\\s*(\\d+)$`));
+  if (!m) return null;
+  const num = Number(m[1]);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+/** Siguiente origen de archivo: csv 1, xlsx 2, … */
+export function nextFileOrigenName(
+  kind: FileOrigenKind,
+  existing: string[] = [],
+): string {
+  let max = 0;
+  for (const name of existing) {
+    const num = fileOrigenNumber(name, kind);
+    if (num != null && num > max) max = num;
+  }
+  return `${kind} ${max + 1}`;
+}
+
+/** Origen por defecto al importar un Excel/CSV (no S/O). */
+export function nextFileOrigenFromFileName(
+  fileName: string,
+  existing: string[] = [],
+): string {
+  const kind = detectFileOrigenKind(fileName) || "xlsx";
+  return nextFileOrigenName(kind, existing);
+}
+
+/**
+ * Ranking de “más actual” (mayor = más reciente / prioritario):
+ * Inventario N > xlsx/xls/csv N > nuevo registro > S/O.
+ */
+export function origenCurrencyRank(origen: string): number {
+  const raw = String(origen ?? "").trim();
+  const fold = foldOrigenText(raw);
+  if (!fold || fold === "s o" || fold === "so" || fold === "sin origen") return 0;
+  if (fold === "nuevo registro" || fold === "nuevo") return 10_000;
+  const inv = inventarioNumber(raw);
+  if (inv != null) return 1_000_000 + inv;
+  for (const kind of ["xlsx", "xls", "csv"] as FileOrigenKind[]) {
+    const num = fileOrigenNumber(raw, kind);
+    if (num != null) return 100_000 + num;
+  }
+  return 1_000;
+}
 
 /** Siguiente inventario de conteo: Inventario N+1 (después de S/O arranca en Inventario 1). */
 export function nextInventarioName(existing: string[]): string {
@@ -83,8 +148,8 @@ export function normalizeOrigenLabel(
 }
 
 /**
- * Destino desde nombre de archivo/hoja:
- * “Inventario 1.xlsx”, “inventario_oficina_1-v3.xlsx”, hoja “Inventario 1”.
+ * Destino desde nombre de archivo/hoja solo si apunta a un Inventario N.
+ * Si no, el import usará csv/xlsx N (no devolver el nombre libre del archivo).
  */
 export function matchOrigenFromFileName(
   fileName: string,
@@ -120,7 +185,19 @@ export function matchOrigenFromFileName(
     }
   }
 
-  return normalizeOrigenLabel(base, existing) || undefined;
+  // Ya es un origen de archivo tipado (csv 1, xlsx 2…)
+  for (const kind of ["xlsx", "xls", "csv"] as FileOrigenKind[]) {
+    const num = fileOrigenNumber(base, kind);
+    if (num != null) {
+      const label = `${kind} ${num}`;
+      const hit = existing.find(
+        (e) => foldOrigenText(e) === foldOrigenText(label),
+      );
+      return hit || label;
+    }
+  }
+
+  return undefined;
 }
 
 export type ImportOrigenPlan =
@@ -138,8 +215,8 @@ export type ImportOrigenPlan =
 
 /**
  * Decide destino de importación:
- * columna uniforme → hoja → archivo → prompt → filtro → S/O.
- * Si la columna trae varios orígenes con datos → mixed (pendiente).
+ * columna uniforme → prompt → hoja/archivo Inventario N → csv/xlsx N → filtro.
+ * Ya no cae en S/O si hay archivo: usa xlsx 1 / csv 1…
  */
 export function planImportOrigen(input: {
   promptText?: string;
@@ -157,6 +234,9 @@ export function planImportOrigen(input: {
   const file = input.fileName
     ? matchOrigenFromFileName(input.fileName, existing)
     : undefined;
+  const fileSequential = input.fileName
+    ? nextFileOrigenFromFileName(input.fileName, existing)
+    : null;
 
   const colNorm = (input.columnOrigens || [])
     .map((v) => normalizeOrigenLabel(v, existing))
@@ -170,8 +250,6 @@ export function planImportOrigen(input: {
     const counts = [...countsMap.entries()]
       .map(([origen, count]) => ({ origen, count }))
       .sort((a, b) => b.count - a.count);
-    // Mezclado solo si hay ≥2 orígenes con al menos 1 registro cada uno
-    // y el archivo tiene “varios” (umbral práctico: ≥2 orígenes y ≥2 filas).
     if (counts.length >= 2 && colNorm.length >= 2) {
       return { kind: "mixed", counts };
     }
@@ -201,8 +279,11 @@ export function planImportOrigen(input: {
       : null) ||
     (sheet ? { origen: sheet, source: "sheet" as const } : null) ||
     (file ? { origen: file, source: "file" as const } : null) ||
+    (fileSequential
+      ? { origen: fileSequential, source: "file" as const }
+      : null) ||
     (filter ? { origen: filter, source: "filter" as const } : null) || {
-      origen: ORIGEN_SIN_ORIGEN,
+      origen: ORIGEN_NUEVO_REGISTRO,
       source: "default" as const,
     };
 
@@ -325,39 +406,27 @@ export function findByEtiquetaCascade(
     }
   }
 
-  // Fuente: inventarios anteriores al destino (S/O = base, siempre anterior a Inventario N)
+  // Fuente: distinto al destino; Inventario N > csv/xlsx N > nuevo registro.
   const sourceCandidates = matches.filter((row) => {
     const origen = origenOf(row);
     if (!destino) return true;
-    if (origen === destino) return false;
+    if (foldOrigenText(origen) === foldOrigenText(destino)) return false;
     const n = inventarioNumber(origen);
-    // Destino sin número (p. ej. S/O): cualquier otro origen puede ser fuente
-    if (targetNum === null) return origen !== destino;
-    // Destino Inventario N: sirven Inventario 1..N-1 y S/O (sin número)
-    if (n === null) return true;
-    return n < targetNum;
+    if (targetNum != null && n != null && n >= targetNum) return false;
+    return true;
   });
 
   if (!sourceCandidates.length) return null;
 
-  // Primero el inventario con número más alto; dentro de él, el updated_at más reciente
-  const byOrigen = new Map<string, InventarioRow[]>();
-  for (const row of sourceCandidates) {
-    const key = origenOf(row);
-    const list = byOrigen.get(key) ?? [];
-    list.push(row);
-    byOrigen.set(key, list);
-  }
-
-  const origenOrder = sortInventariosNewestFirst([...byOrigen.keys()]);
-  for (const origen of origenOrder) {
-    const best = pickNewestRow(byOrigen.get(origen) ?? []);
-    if (best) {
-      return { row: best, foundIn: origen, inDestino: false };
-    }
-  }
-
-  return null;
+  sourceCandidates.sort((a, b) => {
+    const d = origenCurrencyRank(origenOf(b)) - origenCurrencyRank(origenOf(a));
+    if (d !== 0) return d;
+    return rowTimestamp(b) - rowTimestamp(a);
+  });
+  const best = sourceCandidates[0];
+  return best
+    ? { row: best, foundIn: origenOf(best), inDestino: false }
+    : null;
 }
 
 export function rowToFormFields(row: InventarioRow) {
@@ -400,6 +469,10 @@ export type InventarioFieldDiff = {
 export type InventarioDiffResult = {
   left: string;
   right: string;
+  leftCount: number;
+  rightCount: number;
+  /** Misma etiqueta en ambos y campos iguales. */
+  same: InventarioRow[];
   /** En left pero no en right → “faltan” en right. */
   onlyLeft: InventarioRow[];
   /** En right pero no en left → “sobran” en right. */
@@ -443,6 +516,7 @@ export function diffInventarios(
 
   const onlyLeft: InventarioRow[] = [];
   const onlyRight: InventarioRow[] = [];
+  const same: InventarioRow[] = [];
   const changed: InventarioFieldDiff[] = [];
 
   for (const [etq, row] of leftMap) {
@@ -454,10 +528,12 @@ export function diffInventarios(
   for (const [etq, leftRow] of leftMap) {
     const rightRow = rightMap.get(etq);
     if (!rightRow) continue;
+    let fieldChanges = 0;
     for (const field of DIFF_FIELDS) {
       const from = fieldText(leftRow, field);
       const to = fieldText(rightRow, field);
       if (from.localeCompare(to, "es", { sensitivity: "base" }) === 0) continue;
+      fieldChanges += 1;
       changed.push({
         etiqueta: String(leftRow.etiqueta ?? rightRow.etiqueta ?? etq),
         field,
@@ -467,9 +543,19 @@ export function diffInventarios(
         rightId: rightRow.id,
       });
     }
+    if (!fieldChanges) same.push(rightRow);
   }
 
-  return { left, right, onlyLeft, onlyRight, changed };
+  return {
+    left,
+    right,
+    leftCount: leftMap.size,
+    rightCount: rightMap.size,
+    same,
+    onlyLeft,
+    onlyRight,
+    changed,
+  };
 }
 
 /**
@@ -484,7 +570,9 @@ export function detectCompareInventariosAsk(
   const wants =
     /\b(compara|comparar|comparacion|diff|diferencia|diferencias|versus)\b/.test(
       n,
-    ) || /\bvs\b/.test(n);
+    ) ||
+    /\bvs\b/.test(n) ||
+    /^comparar\s+inventarios?$/.test(n);
   if (!wants) return undefined;
 
   const found: string[] = [];
@@ -503,26 +591,44 @@ export function detectCompareInventariosAsk(
   for (const origen of existing) {
     const on = foldOrigenText(origen);
     if (on.length < 2) continue;
+    // Evitar que “comparar inventarios” meta todos los orígenes por substring débil.
+    if (on === "inventario" || /^inventario\s+\d+$/.test(on)) {
+      if (!numbered.length && !/\binventario\s*\d+\b/.test(n)) continue;
+    }
     if (n.includes(on) && !found.includes(origen)) found.push(origen);
   }
 
   if (found.length >= 2) {
     const a = found[0];
     const b = found[1];
-    // S/O como base (left) cuando se compara contra Inventario N.
     if (a === ORIGEN_SIN_ORIGEN) return { left: a, right: b };
     if (b === ORIGEN_SIN_ORIGEN) return { left: b, right: a };
+    const na = inventarioNumber(a);
+    const nb = inventarioNumber(b);
+    if (na != null && nb != null && na !== nb) {
+      return na < nb ? { left: a, right: b } : { left: b, right: a };
+    }
     return { left: a, right: b };
   }
   if (found.length === 1 && found[0] !== ORIGEN_SIN_ORIGEN) {
-    return { left: ORIGEN_SIN_ORIGEN, right: found[0] };
+    const others = sortInventariosNewestFirst(
+      existing.filter((o) => o !== found[0]),
+    );
+    if (others[0]) return { left: others[0], right: found[0] };
   }
-  // “compara inventarios” sin nombres → último vs S/O
-  const latest = latestInventarioName(
+
+  // “comparar inventarios” sin nombres → dos más recientes (o último vs S/O).
+  const named = sortInventariosNewestFirst(
     existing.filter((o) => o !== ORIGEN_SIN_ORIGEN),
   );
-  if (latest && latest !== ORIGEN_SIN_ORIGEN) {
-    return { left: ORIGEN_SIN_ORIGEN, right: latest };
+  if (named.length >= 2) {
+    return { left: named[1], right: named[0] };
+  }
+  if (named.length === 1 && existing.includes(ORIGEN_SIN_ORIGEN)) {
+    return { left: ORIGEN_SIN_ORIGEN, right: named[0] };
+  }
+  if (named.length === 1) {
+    return { left: ORIGEN_SIN_ORIGEN, right: named[0] };
   }
   return undefined;
 }
@@ -530,14 +636,50 @@ export function detectCompareInventariosAsk(
 export function formatInventarioDiffReply(diff: InventarioDiffResult): string {
   const faltan = diff.onlyLeft.length;
   const sobran = diff.onlyRight.length;
+  const iguales = diff.same.length;
   const cambiaron = new Set(diff.changed.map((c) => c.etiqueta.toLowerCase())).size;
   const lines: string[] = [
-    `Comparé **${diff.left}** vs **${diff.right}**:`,
+    `Comparé **${diff.left}** (${diff.leftCount.toLocaleString("es-MX")}) vs **${diff.right}** (${diff.rightCount.toLocaleString("es-MX")}):`,
     "",
+    `• **Iguales:** **${iguales.toLocaleString("es-MX")}** (misma etiqueta y mismos datos)`,
     `• **Faltan en ${diff.right}:** **${faltan.toLocaleString("es-MX")}** (están en ${diff.left})`,
     `• **Sobran en ${diff.right}:** **${sobran.toLocaleString("es-MX")}** (no están en ${diff.left})`,
     `• **Cambiaron:** **${cambiaron.toLocaleString("es-MX")}** etiqueta${cambiaron === 1 ? "" : "s"} con campos distintos`,
   ];
+
+  if (!diff.leftCount && !diff.rightCount) {
+    lines.push(
+      "",
+      `Ninguno de los dos orígenes tiene etiquetas para comparar. Importa o elige otros inventarios.`,
+    );
+    return lines.join("\n");
+  }
+  if (!diff.leftCount) {
+    lines.push(
+      "",
+      `**${diff.left}** está vacío: todo lo de **${diff.right}** cuenta como sobrante.`,
+    );
+  } else if (!diff.rightCount) {
+    lines.push(
+      "",
+      `**${diff.right}** está vacío: todo lo de **${diff.left}** falta en ese inventario.`,
+    );
+  } else if (!faltan && !sobran && !cambiaron) {
+    lines.push("", "Los inventarios coinciden al 100% en etiquetas y campos comparados.");
+  }
+
+  if (faltan) {
+    const sample = diff.onlyLeft
+      .slice(0, 5)
+      .map((r) => `• **${String(r.etiqueta ?? "").trim()}** · ${String(r.articulo ?? "").trim() || "—"}`);
+    lines.push("", `Ejemplos que faltan en ${diff.right}:`, ...sample);
+  }
+  if (sobran) {
+    const sample = diff.onlyRight
+      .slice(0, 5)
+      .map((r) => `• **${String(r.etiqueta ?? "").trim()}** · ${String(r.articulo ?? "").trim() || "—"}`);
+    lines.push("", `Ejemplos que sobran en ${diff.right}:`, ...sample);
+  }
   if (diff.changed.length) {
     const sample = diff.changed.slice(0, 6).map(
       (c) =>
@@ -547,7 +689,752 @@ export function formatInventarioDiffReply(diff: InventarioDiffResult): string {
   }
   lines.push(
     "",
-    "El detalle está en el visor derecho. ¿Quieres ver solo los que faltan, los que sobran o los que cambiaron?",
+    "El detalle está en el visor derecho. ¿Quieres ver solo los que faltan, los que sobran, los iguales o los que cambiaron?",
   );
   return lines.join("\n");
+}
+
+export type PendingNewInventario = {
+  name: string;
+  askedAt: number;
+  /** Si el usuario ya pidió dejarlo vacío. */
+  emptyOk?: boolean;
+};
+
+export type CreateInventarioAsk = {
+  name: string;
+  alreadyExists: boolean;
+};
+
+export type FillNewInventarioPlan =
+  | { kind: "empty" }
+  | { kind: "copy_origen"; source: string }
+  | { kind: "copy_etiquetas"; etiquetas: string[] }
+  | { kind: "unclear" };
+
+/** “inventario 1”, “inventari 1”, “alnventario 3”, “inventario tres”. */
+const INV_TOKEN = "(?:al)?inventari[oa]?s?|alnventario";
+const INV_WORD_NUM: Record<string, number> = {
+  uno: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10,
+};
+
+function parseInventarioNumToken(raw: string): number | undefined {
+  const t = String(raw || "").trim().toLowerCase();
+  if (!t) return undefined;
+  if (/^\d+$/.test(t)) {
+    const n = Number(t);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  }
+  return INV_WORD_NUM[t];
+}
+
+function collectInventarioNumsFromText(n: string): number[] {
+  const out: number[] = [];
+  const re = new RegExp(
+    `\\b(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+    "g",
+  );
+  for (const m of n.matchAll(re)) {
+    const num = parseInventarioNumToken(m[1]);
+    if (num != null) out.push(num);
+  }
+  return out;
+}
+
+/** “omite/excluye esa etiqueta” (+ códigos en texto o del hilo). */
+export function detectExcludedEtiquetasAsk(
+  text: string,
+  contextEtiquetas: string[] = [],
+): string[] {
+  const n = foldOrigenText(text);
+  if (!n) return [];
+  const wantsOmit =
+    /\b(omite\w*|omitir\w*|excluye\w*|excluir\w*|salta\w*|saltar\w*|excepto|menos)\b/.test(
+      n,
+    ) ||
+    /\bsi\s+hay\b/.test(n) ||
+    /\bya\s+existe/.test(n) ||
+    /\bno\s+(copies|copie|importes|importe|pases|pase|agregues|agregue)\b/.test(n);
+  if (!wantsOmit) return [];
+
+  const fromText = [
+    ...new Set(
+      [...text.matchAll(/\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,10}|\d{4,12})\b/g)].map(
+        (m) => m[1],
+      ),
+    ),
+  ].filter((et) => {
+    const low = et.toLowerCase();
+    return !/^inventario\d*$/i.test(low) && !/^\d{1,3}$/.test(low);
+  });
+
+  if (fromText.length) return fromText.slice(0, 20);
+  // “omite esa” → etiqueta del mensaje de arriba
+  if (
+    /\b(esa|ese|eso|esta|este|esa etiqueta|la etiqueta)\b/.test(n) &&
+    contextEtiquetas.length
+  ) {
+    return [contextEtiquetas[0]];
+  }
+  // “si hay alguna en el 3 omítela” = saltar duplicados en destino (no lista fija).
+  return [];
+}
+
+/**
+ * “pasa todas las etiquetas de Inventario 1 al Inventario 3;
+ *  si ya existe alguna, notifícame”.
+ * También: “importa todos los registros de inventari 1 a inventario 3”.
+ */
+export function detectBulkCopyBetweenInventariosAsk(
+  text: string,
+  existing: string[] = [],
+): { source: string; dest: string; notifyExisting: boolean } | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+
+  const transferVerb =
+    /\b(pasa\w*|copia\w*|mete\w*|mueve\w*|mover\w*|traslad\w*|traspas\w*|llena\w*|echale\w*|importa\w*|trae\w*|traer\w*|continua\w*|contin\w*|pon\w*|agrega\w*)\b/.test(
+      n,
+    );
+  if (!transferVerb) return undefined;
+
+  const hasInvMention =
+    collectInventarioNumsFromText(n).length > 0 ||
+    new RegExp(`\\b(?:${INV_TOKEN})\\b`).test(n);
+  if (
+    !/\b(etiqueta|etiquetas|registro|registros|regsitros|todo|toda|todas|todos|todosa|completo|completa)\b/.test(
+      n,
+    ) &&
+    !hasInvMention
+  ) {
+    // Aún puede ser “pasa inventario 1 a inventario 3”
+    if (
+      !new RegExp(`\\b(a|al|hacia|en)\\s+(?:el\\s+)?(?:${INV_TOKEN})`).test(n)
+    ) {
+      return undefined;
+    }
+  }
+
+  const resolveNum = (num: number) =>
+    existing.find((o) => inventarioNumber(o) === num) || `Inventario ${num}`;
+
+  // Preferir “de/del/desde Inventario X” → source y “a/al/hacia Inventario Y” → dest
+  const fromRe = new RegExp(
+    `\\b(?:de|del|desde)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+  );
+  const toRe = new RegExp(
+    `\\b(?:a|al|hacia|en)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+  );
+  const fromMatch = n.match(fromRe);
+  const toMatch = n.match(toRe);
+
+  let source: string | undefined;
+  let dest: string | undefined;
+  if (fromMatch && toMatch) {
+    const fromNum = parseInventarioNumToken(fromMatch[1]);
+    const toNum = parseInventarioNumToken(toMatch[1]);
+    if (fromNum == null || toNum == null) return undefined;
+    source = resolveNum(fromNum);
+    dest = resolveNum(toNum);
+  } else {
+    const uniqueNums = [
+      ...new Set(
+        collectInventarioNumsFromText(n).filter(
+          (x) => Number.isFinite(x) && x > 0,
+        ),
+      ),
+    ];
+    if (uniqueNums.length < 2) return undefined;
+    source = resolveNum(uniqueNums[0]);
+    dest = resolveNum(uniqueNums[1]);
+  }
+
+  if (!source || !dest || source === dest) return undefined;
+
+  return { source, dest, notifyExisting: true };
+}
+
+/**
+ * “pasa todos sus registros / su inventario a Inventario 4”
+ * También: “estos registros de hector pasalos al inventario 4”
+ * (persona del hilo o nombrada; no solo las etiquetas de ejemplo del chat).
+ */
+export function detectCopyPersonRecordsToInventarioAsk(
+  text: string,
+  existing: string[] = [],
+): { dest: string } | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  const transferVerb =
+    /\b(pasa|pasar|pases|pase|pasame|pasalos|pasalas|copia|copiar|copialos|copialas|mete|meter|mueve|mover|traslada|traspasa|agrega|agregar|importa|importar)\b/.test(
+      n,
+    );
+  if (!transferVerb) return undefined;
+  const personBulk =
+    /\b(sus?|tod[oa]s?\s+sus?)\s+(registros?|etiquetas?|equipos?|articulos?|cosas|inventario)\b/.test(
+      n,
+    ) ||
+    /\b(todo|toda|todos|todas)\s+(su|sus)\s+(inventario|registros?|etiquetas?)\b/.test(
+      n,
+    ) ||
+    /\bsu\s+inventario\b/.test(n) ||
+    // Anáfora al panel de persona: “estos/esas registros/etiquetas”
+    /\best[oa]s?\s+(registros?|etiquetas?|equipos?|articulos?)\b/.test(n) ||
+    // “registros de hector” / “los de hector”
+    /\b(registros?|etiquetas?|equipos?|articulos?)\s+de\s+[a-z]/.test(n) ||
+    /\blos\s+de\s+[a-z]/.test(n);
+  if (!personBulk) return undefined;
+  // Bulk entre Inventario N→M lo maneja otro detector.
+  if (
+    /\b(todo|toda|todas|todos)\b/.test(n) &&
+    collectInventarioNumsFromText(n).length >= 2 &&
+    !/\b(su|sus|est[oa]s?)\b/.test(n) &&
+    !/\b(registros?|etiquetas?)\s+de\s+[a-z]/.test(n)
+  ) {
+    return undefined;
+  }
+  const nums = collectInventarioNumsFromText(n);
+  if (!nums.length) return undefined;
+  const destNum = nums[nums.length - 1];
+  const dest =
+    existing.find((o) => inventarioNumber(o) === destNum) ||
+    `Inventario ${destNum}`;
+  return { dest };
+}
+
+/**
+ * “agrega etiqueta 283586 a Inventario 2” / “pasa esa a inventario 2”
+ * (etiquetas pueden venir del hilo vía contextEtiquetas).
+ */
+export function detectCopyEtiquetasToInventarioAsk(
+  text: string,
+  existing: string[] = [],
+  contextEtiquetas: string[] = [],
+): { etiquetas: string[]; dest: string } | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+
+  // “todos sus registros → Inv N” lo maneja detectCopyPersonRecordsToInventarioAsk.
+  if (detectCopyPersonRecordsToInventarioAsk(text, existing)) {
+    return undefined;
+  }
+
+  const transferVerb =
+    /\b(pasa|pasar|pases|pase|pasame|copia|copiar|mete|meter|mueve|mover|traslada|traspasa|agrega|agregar|agregala|agregalo|importa|importar|pon|poner|trae|traer)\b/.test(
+      n,
+    );
+  if (!transferVerb) return undefined;
+
+  const nums = collectInventarioNumsFromText(n);
+  if (!nums.length) return undefined;
+  // Destino = último Inventario N citado (“a inventario 2”).
+  const destNum = nums[nums.length - 1];
+  const dest =
+    existing.find((o) => inventarioNumber(o) === destNum) ||
+    `Inventario ${destNum}`;
+
+  const fromText = [
+    ...new Set(
+      [...text.matchAll(/\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,10}|\d{4,12})\b/g)].map(
+        (m) => m[1],
+      ),
+    ),
+  ].filter((et) => {
+    const low = et.toLowerCase();
+    return !/^inventario\d*$/i.test(low) && !/^\d{1,3}$/.test(low);
+  });
+
+  const etiquetas = fromText.length
+    ? fromText
+    : contextEtiquetas.map((e) => String(e).trim()).filter(Boolean);
+
+  if (!etiquetas.length) return undefined;
+  // Bulk “todo inventario 1 → 3” lo maneja otro detector.
+  if (
+    /\b(todo|toda|todas|todos|completo|completa)\b/.test(n) &&
+    nums.length >= 2 &&
+    !fromText.length
+  ) {
+    return undefined;
+  }
+
+  return { etiquetas: etiquetas.slice(0, 40), dest };
+}
+
+/** “haz un nuevo inventario llamado Inventario 3” / “crea inventario 3”. */
+export function detectCreateInventarioAsk(
+  text: string,
+  existing: string[] = [],
+): CreateInventarioAsk | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  if (/\b(compara|comparar|comparacion|diff|diferencia)\b/.test(n)) {
+    return undefined;
+  }
+  // “mete/copia al nuevo inventario…” es relleno, no creación.
+  if (
+    /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|traslada|trasladar|agrega|agregar)\b/.test(
+      n,
+    ) &&
+    !/\b(crea|crear|haz|hacer|has|abre|abrir|genera|generar)\b/.test(n)
+  ) {
+    return undefined;
+  }
+
+  // “dame el inventario de Héctor / panorama / totales” ≠ crear Inventario N.
+  if (
+    /\binventario\s+(general\s+)?de\b/.test(n) ||
+    /\b(panorama|resumen|totales?|registros?)\b/.test(n)
+  ) {
+    return undefined;
+  }
+  if (
+    /\b(dame|muestra|mostrar|ver|lista|listar|cuant[oa]s?)\b/.test(n) &&
+    !/\b(crea|crear|haz|hacer|abre|abrir|genera|generar|nuevo)\b/.test(n)
+  ) {
+    return undefined;
+  }
+  const createVerb =
+    /\b(crea|crear|haz|hacer|abre|abrir|genera|generar)\b/.test(n) ||
+    /\b(quiero|necesito)\s+(un\s+)?(nuevo\s+)?inventario\b/.test(n);
+  const nuevoInventario = /\bnuevo\s+inventario\b/.test(n);
+  if (!createVerb && !(nuevoInventario && /\b(llamado|llamada|nombre)\b/.test(n))) {
+    return undefined;
+  }
+  if (!/\binventarios?\b/.test(n)) return undefined;
+
+  let name: string | undefined;
+  const called = n.match(
+    /\b(?:llamado|llamada|nombre|nombrado)\s+((?:inventario\s*)?\d+|[a-z0-9][a-z0-9 _-]{1,40})/,
+  );
+  if (called?.[1]) {
+    const raw = called[1].trim();
+    const num = raw.match(/(?:inventario\s*)?(\d+)\s*$/);
+    name = num ? `Inventario ${Number(num[1])}` : raw.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  if (!name) {
+    const numbered = n.match(/\binventarios?\s*(\d+)\b/);
+    if (numbered) name = `Inventario ${Number(numbered[1])}`;
+  }
+  if (!name) {
+    // “haz un nuevo inventario” sin número → siguiente libre.
+    name = nextInventarioName(existing);
+  }
+
+  const alreadyExists = existing.some(
+    (e) => foldOrigenText(e) === foldOrigenText(name!),
+  );
+  return { name, alreadyExists };
+}
+
+/** Consultas que NO son relleno del inventario pendiente. */
+export function looksLikeNonFillInventarioAsk(text: string): boolean {
+  const n = foldOrigenText(text);
+  if (!n) return false;
+  return /\b(duplicadas?|duplicados?|repetidas?|repetidos?|compara|comparar|diff|diferencia|checa|chequea|revisa|busca|cuant[oa]s|cuantos|lista|muestra|dame|ver|personas|areas?|estado|qr|excel|csv|xlsx)\b/.test(
+    n,
+  );
+}
+
+/** Follow-up tras pedir un inventario nuevo: vacío / etiquetas / copiar otro origen. */
+export function detectFillNewInventarioAsk(
+  text: string,
+  pending: PendingNewInventario | null,
+  existing: string[] = [],
+): FillNewInventarioPlan | undefined {
+  if (!pending?.name) return undefined;
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  // No hijackear “checa duplicados en Inventario 1”, comparaciones, etc.
+  if (looksLikeNonFillInventarioAsk(text)) return undefined;
+
+  if (
+    /\b(vacio|vacia|nada|sin\s+nada|dejalo\s+vacio|dejala\s+vacia|solo\s+vacio)\b/.test(
+      n,
+    )
+  ) {
+    return { kind: "empty" };
+  }
+
+  const fillVerb =
+    /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|agrega|agregar|traslada|trasladar|llevalo|echale)\b/.test(
+      n,
+    );
+
+  const source = matchOrigenFromPrompt(text, existing);
+  const wantsWhole =
+    fillVerb &&
+    /\b(todo|toda|completo|completa|entero|entera)\b/.test(n) &&
+    /\binventario\s*\d+\b/.test(n);
+  if (
+    source &&
+    foldOrigenText(source) !== foldOrigenText(pending.name) &&
+    wantsWhole
+  ) {
+    return { kind: "copy_origen", source };
+  }
+
+  const etiquetas = [
+    ...new Set(
+      [...text.matchAll(/\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,8}|\d{4,10})\b/g)].map(
+        (m) => m[1],
+      ),
+    ),
+  ].filter((et) => {
+    const low = et.toLowerCase();
+    return !/^inventario\d*$/i.test(low) && !/^\d{1,3}$/.test(low);
+  });
+
+  // Solo meter etiquetas si hay verbo de relleno o el mensaje es casi solo códigos.
+  if (etiquetas.length && (fillVerb || /^\s*([a-z0-9/_-]+\s*,?\s*)+$/i.test(text.trim()))) {
+    return { kind: "copy_etiquetas", etiquetas };
+  }
+
+  // Solo pedir aclaración con verbo de meter / respuesta al pending.
+  if (fillVerb || /\bnuevo\s+inventario\b/.test(n)) {
+    return { kind: "unclear" };
+  }
+
+  return undefined;
+}
+
+export type DuplicateEtiquetasAsk = {
+  /** Si viene, busca duplicados solo dentro de ese origen. */
+  origen?: string;
+  /** Si hay dos orígenes, busca etiquetas compartidas entre ambos. */
+  between?: [string, string];
+};
+
+/** “checa etiquetas duplicadas en Inventario 1” / “entre Inventario 1 e Inventario 3”. */
+export function detectDuplicateEtiquetasAsk(
+  text: string,
+  existing: string[] = [],
+): DuplicateEtiquetasAsk | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  if (
+    !/\b(duplicadas?|duplicados?|duplicada|duplicado|repetidas?|repetidos?|misma etiqueta|etiquetas iguales)\b/.test(
+      n,
+    )
+  ) {
+    return undefined;
+  }
+
+  const numbered = [...n.matchAll(/\binventarios?\s*(\d+)\b/g)].map((m) =>
+    Number(m[1]),
+  );
+  const origens = numbered
+    .map((num) => {
+      const hit = existing.find((o) => inventarioNumber(o) === num);
+      return hit || `Inventario ${num}`;
+    })
+    .filter(Boolean);
+
+  if (origens.length >= 2) {
+    return { between: [origens[0], origens[1]] };
+  }
+  if (origens.length === 1) {
+    return { origen: origens[0] };
+  }
+
+  const fileHit = existing.find((o) => {
+    const on = foldOrigenText(o);
+    return (
+      (/^(xlsx|xls|csv)\s*\d+$/.test(on) && n.includes(on)) ||
+      (on.length >= 3 && n.includes(on) && !/^inventario/.test(on))
+    );
+  });
+  if (fileHit) return { origen: fileHit };
+
+  return {};
+}
+
+export type DuplicateEtiquetaGroup = {
+  etiqueta: string;
+  count: number;
+  origens: string[];
+  rows: InventarioRow[];
+};
+
+/** Duplicados de etiqueta dentro de un origen, o compartidas entre dos. */
+export function findDuplicateEtiquetas(
+  rows: InventarioRow[],
+  ask: DuplicateEtiquetasAsk,
+): DuplicateEtiquetaGroup[] {
+  if (ask.between) {
+    const [a, b] = ask.between;
+    const setA = new Map<string, InventarioRow>();
+    const setB = new Map<string, InventarioRow>();
+    for (const row of rows) {
+      const et = String(row.etiqueta ?? "").trim();
+      if (!et) continue;
+      const o = String(row.origen ?? "").trim();
+      const key = et.toLowerCase();
+      if (o === a) setA.set(key, row);
+      if (o === b) setB.set(key, row);
+    }
+    const out: DuplicateEtiquetaGroup[] = [];
+    for (const [key, rowA] of setA) {
+      const rowB = setB.get(key);
+      if (!rowB) continue;
+      out.push({
+        etiqueta: String(rowA.etiqueta ?? key),
+        count: 2,
+        origens: [a, b],
+        rows: [rowA, rowB],
+      });
+    }
+    out.sort((x, y) => x.etiqueta.localeCompare(y.etiqueta, "es"));
+    return out;
+  }
+
+  const scoped = ask.origen
+    ? rows.filter((r) => String(r.origen ?? "").trim() === ask.origen)
+    : rows;
+  const byEtq = new Map<string, InventarioRow[]>();
+  for (const row of scoped) {
+    const et = String(row.etiqueta ?? "").trim();
+    if (!et) continue;
+    const key = et.toLowerCase();
+    const bucket = byEtq.get(key) || [];
+    bucket.push(row);
+    byEtq.set(key, bucket);
+  }
+
+  const out: DuplicateEtiquetaGroup[] = [];
+  for (const [, group] of byEtq) {
+    if (group.length < 2) continue;
+    const etiqueta = String(group[0].etiqueta ?? "");
+    const origens = [
+      ...new Set(group.map((r) => String(r.origen ?? "").trim()).filter(Boolean)),
+    ];
+    out.push({ etiqueta, count: group.length, origens, rows: group });
+  }
+  out.sort((a, b) => b.count - a.count || a.etiqueta.localeCompare(b.etiqueta, "es"));
+  return out;
+}
+
+export function formatDuplicateEtiquetasReply(
+  ask: DuplicateEtiquetasAsk,
+  groups: DuplicateEtiquetaGroup[],
+): string {
+  const scope = ask.between
+    ? `entre **${ask.between[0]}** y **${ask.between[1]}**`
+    : ask.origen
+      ? `solo en **${ask.origen}**`
+      : "en todo el inventario";
+
+  if (!groups.length) {
+    return (
+      `No encontré etiquetas duplicadas ${scope}. ` +
+      `Cada etiqueta aparece una sola vez` +
+      (ask.origen ? ` dentro de ese origen` : "") +
+      `. ` +
+      (ask.origen
+        ? `Nota: la misma etiqueta sí puede existir en otro inventario (es copia de conteo), y eso no cuenta como duplicado interno.`
+        : "")
+    );
+  }
+
+  const sample = groups.slice(0, 12).map((g) => {
+    const where =
+      g.origens.length > 1
+        ? g.origens.map((o) => `**${o}**`).join(" + ")
+        : `×${g.count}`;
+    const art = String(g.rows[0]?.articulo ?? "").trim();
+    return `• **${g.etiqueta}** ${art ? `(${art}) ` : ""}— ${where}`;
+  });
+  const more =
+    groups.length > 12
+      ? `\n…y **${groups.length - 12}** más.`
+      : "";
+
+  return (
+    `Encontré **${groups.length.toLocaleString("es-MX")}** etiqueta` +
+    `${groups.length === 1 ? "" : "s"} duplicada${groups.length === 1 ? "" : "s"} ${scope}:\n\n` +
+    sample.join("\n") +
+    more +
+    `\n\nEl detalle está en el visor derecho.`
+  );
+}
+
+export function rowToNewInventarioItem(
+  row: InventarioRow,
+  destOrigen: string,
+): NewInventarioItem {
+  const from = String(row.origen ?? "").trim();
+  const prevObs = row.observaciones?.toString().trim() || "";
+  const copyNote =
+    from && foldOrigenText(from) !== foldOrigenText(destOrigen)
+      ? `Copiado desde ${from}.`
+      : "";
+  const observaciones = copyNote
+    ? prevObs && !/copiado desde/i.test(prevObs)
+      ? `${prevObs}\n${copyNote}`
+      : prevObs || copyNote
+    : prevObs || null;
+  return {
+    etiqueta: String(row.etiqueta ?? "").trim(),
+    articulo: String(row.articulo ?? "").trim(),
+    marca: row.marca?.toString().trim() || null,
+    modelo: row.modelo?.toString().trim() || null,
+    serie: row.serie?.toString().trim() || null,
+    area: String(row.area ?? "").trim() || "Sin asignar",
+    persona: row.persona?.toString().trim() || null,
+    cantidad:
+      typeof row.cantidad === "number" && !Number.isNaN(row.cantidad)
+        ? row.cantidad
+        : 1,
+    observaciones,
+    estado: row.estado,
+    origen: destOrigen,
+  };
+}
+
+/**
+ * Origen de datos (fuente) vs inventario del conteo.
+ * Prioridad de nota “Copiado desde…”, si no el sibling más actual.
+ */
+export function resolveFuenteOrigen(
+  product: InventarioRow,
+  catalog: InventarioRow[] = [],
+): string | null {
+  const obs = String(product.observaciones ?? "");
+  const fromObs = obs.match(/copiado desde\s+([^\n.]+)/i)?.[1]?.trim();
+  if (fromObs) return fromObs;
+
+  const etq = String(product.etiqueta ?? "").trim().toLowerCase();
+  if (!etq || !catalog.length) return null;
+  const current = String(product.origen ?? "").trim();
+  const siblings = catalog.filter((row) => {
+    if (String(row.etiqueta ?? "").trim().toLowerCase() !== etq) return false;
+    if (product.id != null && row.id != null && Number(row.id) === Number(product.id)) {
+      return false;
+    }
+    const o = String(row.origen ?? "").trim();
+    return o && foldOrigenText(o) !== foldOrigenText(current);
+  });
+  if (!siblings.length) return null;
+  siblings.sort((a, b) => {
+    const d =
+      origenCurrencyRank(String(b.origen ?? "")) -
+      origenCurrencyRank(String(a.origen ?? ""));
+    if (d !== 0) return d;
+    return rowTimestamp(b) - rowTimestamp(a);
+  });
+  return String(siblings[0]?.origen ?? "").trim() || null;
+}
+
+/** Valor a mostrar en columna Origen (fuente de datos, no solo el conteo). */
+export function displayOrigenLabel(
+  product: InventarioRow,
+  catalog: InventarioRow[] = [],
+): string {
+  const current = String(product.origen ?? "").trim();
+  const fold = foldOrigenText(current);
+  const fuente = resolveFuenteOrigen(product, catalog);
+  if (fuente) return fuente;
+  // Orígenes de archivo se muestran tal cual (csv 1, xlsx 2…).
+  if (/^(xlsx|xls|csv)\s*\d+$/.test(fold)) return current;
+  if (fold === "nuevo registro" || fold === "nuevo") return ORIGEN_NUEVO_REGISTRO;
+  // Conteo Inventario N sin fuente → registro nuevo en ese conteo.
+  if (inventarioNumber(current) != null) return ORIGEN_NUEVO_REGISTRO;
+  return current || ORIGEN_NUEVO_REGISTRO;
+}
+
+/**
+ * Elige la fila fuente más actual por etiqueta:
+ * Inventario N (mayor) > xlsx/csv N (mayor) > nuevo registro.
+ */
+export function pickSourceRowsForEtiquetas(
+  inventory: InventarioRow[],
+  etiquetas: string[],
+  destOrigen: string,
+): { found: InventarioRow[]; missing: string[]; alreadyInDest: string[] } {
+  const destFold = foldOrigenText(destOrigen);
+  const byEtq = new Map<string, InventarioRow[]>();
+  for (const row of inventory) {
+    const et = String(row.etiqueta ?? "").trim().toLowerCase();
+    if (!et) continue;
+    const bucket = byEtq.get(et) || [];
+    bucket.push(row);
+    byEtq.set(et, bucket);
+  }
+
+  const found: InventarioRow[] = [];
+  const missing: string[] = [];
+  const alreadyInDest: string[] = [];
+
+  for (const raw of etiquetas) {
+    const key = raw.trim().toLowerCase();
+    let rows = byEtq.get(key) || [];
+    if (!rows.length && /^\d{4,10}$/.test(key)) {
+      for (const [et, bucket] of byEtq) {
+        const m = et.match(/(\d{4,10})$/);
+        if (m && m[1] === key) rows = rows.concat(bucket);
+      }
+      if (rows.length > 1) {
+        const uniq = new Map<string, InventarioRow>();
+        for (const r of rows) {
+          const id = r.id != null ? `id:${r.id}` : `e:${r.etiqueta}:${r.origen}`;
+          uniq.set(id, r);
+        }
+        rows = [...uniq.values()];
+      }
+    }
+    if (!rows.length) {
+      missing.push(raw);
+      continue;
+    }
+    const inDest = rows.filter(
+      (r) => foldOrigenText(String(r.origen ?? "")) === destFold,
+    );
+    const sources = rows.filter(
+      (r) => foldOrigenText(String(r.origen ?? "")) !== destFold,
+    );
+    if (!sources.length) {
+      alreadyInDest.push(String(inDest[0]?.etiqueta ?? raw));
+      continue;
+    }
+    sources.sort((a, b) => {
+      const d =
+        origenCurrencyRank(String(b.origen ?? "")) -
+        origenCurrencyRank(String(a.origen ?? ""));
+      if (d !== 0) return d;
+      return rowTimestamp(b) - rowTimestamp(a);
+    });
+    found.push(sources[0]);
+  }
+
+  return { found, missing, alreadyInDest };
+}
+
+export function buildCreateInventarioAskReply(
+  name: string,
+  existing: string[],
+): string {
+  const others = existing
+    .filter((o) => o !== ORIGEN_SIN_ORIGEN)
+    .slice(0, 4)
+    .map((o) => `**${o}**`)
+    .join(", ");
+  return (
+    `De acuerdo: preparo **${name}**.\n\n` +
+    `¿Qué meto en ese inventario?\n` +
+    `• Una o varias **etiquetas** (ej. \`283586\` o \`OF-0026, 264162\`)\n` +
+    `• **Todo** un inventario existente` +
+    (others ? ` (${others})` : "") +
+    `\n` +
+    `• O dime **vacío** si solo quieres dejarlo creado sin registros`
+  );
 }
