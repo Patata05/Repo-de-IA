@@ -16,95 +16,62 @@ from inventario.supabase_client import (
 
 _GREETING_REPLIES = (
     (
-        "¡Hola! ¿En qué te puedo ayudar con el inventario?\n\n"
-        "Puedo consultar datos reales, ayudarte a registrar artículos "
-        "o importar un archivo. Si quieres empezar, dime por ejemplo:\n"
-        "• ¿Consultamos el inventario general, por área o por persona?\n"
-        "• ¿Buscamos por etiqueta/artículo o vemos los últimos registros?\n"
-        "• ¿Quieres dar de alta un artículo nuevo (+ Nuevo artículo)?\n"
-        "• ¿Prefieres importar un Excel o CSV con + → Excel/CSV?\n"
-        "• ¿Generamos códigos QR de algún grupo?\n\n"
-        "Dime qué camino prefieres y lo hacemos."
+        "¡Hola! Estoy listo para ayudarte con el inventario: consultas por "
+        "persona o área, etiquetas, QR, altas o importar un Excel/CSV. "
+        "¿Qué te gustaría hacer primero?"
     ),
     (
-        "¡Qué tal! Estoy listo para el inventario.\n\n"
-        "Puedo ayudarte con:\n"
-        "• Totales, áreas y personas\n"
-        "• Buscar una etiqueta o artículo concreto\n"
-        "• Últimos registros o códigos QR\n"
-        "• Alta de artículos o importar Excel/CSV\n\n"
-        "¿Por dónde empezamos?"
+        "¡Qué tal! Puedo buscar registros, ver totales, generar códigos QR "
+        "o ayudarte a pasar datos entre personas y áreas. ¿Por dónde empezamos?"
     ),
     (
-        "¡Hola! Cuéntame qué necesitas del inventario.\n\n"
-        "Algunas ideas rápidas:\n"
-        "• «cuántas áreas hay» o «dame el inventario general»\n"
-        "• «qué tiene [persona]» o «equipos de [área]»\n"
-        "• «dame los últimos registros» o «genera QR de…»\n"
-        "• Importar un Excel/CSV desde el clip 📎\n\n"
-        "Escribe tu consulta y lo resolvemos."
+        "¡Hola! Cuéntame qué necesitas del inventario y lo vemos juntos. "
+        "Si quieres, prueba con algo como «qué tiene Juan» o «equipos de Biblioteca»."
     ),
     (
-        "¡Bienvenido! Soy tu asistente de inventario.\n\n"
-        "Sirvo para consultar, filtrar, generar QR y orientar altas o importaciones.\n"
-        "Prueba con:\n"
-        "• Inventario general / por área / por persona\n"
-        "• Buscar por etiqueta, marca o artículo\n"
-        "• Ver recientes o crear códigos QR\n\n"
-        "¿Qué te gustaría revisar primero?"
+        "¡Bienvenido! Soy tu asistente de inventario. Dime qué quieres "
+        "revisar o cambiar y te guío en lenguaje natural."
     ),
 )
 
 _HELP_REPLIES = (
     (
-        "Puedo trabajar contigo el inventario así:\n"
-        "• Consultar totales, áreas, personas y artículos\n"
-        "• Buscar por etiqueta, persona o área\n"
-        "• Ver últimos registros o generar códigos QR\n"
-        "• Orientarte para dar de alta un artículo (+ Nuevo artículo)\n"
-        "• Importar Excel/CSV con el clip 📎\n"
-        "• Resumen general del inventario\n\n"
-        "Dime qué quieres hacer y te guío paso a paso."
+        "Puedo consultar el inventario con datos reales, filtrar por persona "
+        "o área, mostrar listados en el visor, generar QR, importar Excel/CSV "
+        "y ayudarte con cambios o traspasos (siempre con confirmación). "
+        "¿Qué quieres hacer ahora?"
     ),
     (
-        "Estas son mis funciones principales:\n"
-        "• Conteos exactos (áreas, personas, activos/inactivos)\n"
-        "• Listados y fichas en el visor derecho\n"
-        "• QR de una o varias etiquetas\n"
-        "• Apoyo para altas y carga masiva Excel/CSV\n\n"
-        "Ejemplo: «dame lo que tiene Juan Pérez» o «cuántas tarjas hay»."
+        "Piénsame como un chat del inventario: me pides algo en español "
+        "normal y te respondo con cifras y contexto. Por ejemplo, "
+        "«dame lo que tiene Juan Pérez» o «mueve todo de Juan a María». "
+        "¿Con qué empezamos?"
     ),
     (
-        "Piensa en mí como un atajo al inventario:\n"
-        "pregunto poco, respondo con datos reales y te dejo opciones claras.\n\n"
-        "Puedo: buscar, contar, mostrar en el panel, generar QR e importar archivos.\n"
-        "¿Qué tarea quieres hacer ahora?"
+        "Sirvo para buscar, contar, mostrar en el panel, armar QR e importar "
+        "archivos. Dime la tarea en una frase y lo resolvemos."
     ),
 )
 
 _ACK_REPLIES = (
     (
-        "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
-        "por persona o área, consultar estados/marcas, generar QR, registrar uno nuevo o importar Excel/CSV."
+        "Perfecto. Cuando quieras seguimos: puedo revisar a alguien, un área, "
+        "una etiqueta, armar QR o importar un archivo. ¿Qué hacemos?"
     ),
     (
-        "Va. Si quieres seguir, puedo:\n"
-        "• Mostrar un área o persona\n"
-        "• Buscar por etiqueta/artículo\n"
-        "• Traer últimos registros o QR\n"
-        "• Ayudarte a importar Excel/CSV\n\n"
-        "¿Qué te late?"
+        "Va. Si quieres, vemos un área o una persona, buscamos una etiqueta, "
+        "traemos lo reciente o te ayudo a importar un Excel. ¿Qué te late?"
     ),
     (
-        "Listo. Estoy aquí para consultas del inventario.\n"
-        "Prueba con «dame el inventario general», «equipos de [área]» o «cuántas áreas hay»."
+        "Listo. Estoy aquí para lo que necesites del inventario; "
+        "dime la siguiente consulta cuando quieras."
     ),
     (
         "De acuerdo. ¿Seguimos con una búsqueda, un total, QR o una importación?"
     ),
     (
-        "¡Hecho! Dime la siguiente consulta cuando quieras "
-        "(persona, área, etiqueta, recientes o QR)."
+        "¡Hecho! Cuando quieras, dime persona, área, etiqueta o lo que "
+        "necesites y lo vemos."
     ),
 )
 
@@ -185,6 +152,34 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
     if any(k in msg for k in ("ayuda", "qué puedes", "que puedes")):
         return (pick_help_reply(), [])
 
+    # Traspaso masivo: lo confirma el front (sí/no). Evitar N updates 1×1.
+    if (
+        any(
+            k in msg
+            for k in (
+                "mueve",
+                "mover",
+                "pasa",
+                "pasar",
+                "traslada",
+                "trasladar",
+                "transfiere",
+                "transferir",
+                "reasigna",
+                "reasignar",
+            )
+        )
+        and " a " in f" {msg} "
+        and not any(k in msg for k in ("excel", "xlsx", "xls", "csv", "archivo"))
+    ):
+        return (
+            "Para un traspaso masivo (persona o área) el chat te pedirá confirmación "
+            "y aplicará el cambio en lote. Prueba con «mueve todo de Juan a María», "
+            "«pasa todo de Sistemas a Biblioteca» o «pasa estos a María» "
+            "(usando el listado del visor). Responde **sí** o **no** cuando te lo proponga.",
+            [],
+        )
+
     if any(
         k in msg
         for k in (
@@ -232,15 +227,20 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
                 [],
             )
         items = rows
-        lines = []
-        for r in rows[:8]:
-            et = r.get("etiqueta") or "S/E"
-            art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-            lines.append(
-                f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} ({r.get('area') or 'General'})"
-            )
-        titulo = "Registros de hoy" if solo_hoy else "Último(s) registro(s)"
-        return f"{titulo} (modo local):\n" + "\n".join(lines), items
+        sample = rows[0]
+        et = sample.get("etiqueta") or "S/E"
+        art = (
+            f"{sample.get('articulo') or ''} {sample.get('marca') or ''}".strip()
+            or "artículo"
+        )
+        titulo = "Registros de hoy" if solo_hoy else "Últimos registros"
+        more = f" ({len(rows)} en total)" if len(rows) > 1 else ""
+        return (
+            f"{titulo}{more} (modo local). El más reciente es {et}: {art} — "
+            f"{sample.get('persona') or 'Sin asignar'} "
+            f"({sample.get('area') or 'General'}). El detalle está en el visor.",
+            items,
+        )
 
     # "dame 5/trece etiquetas" → lista (sin QR)
     if "etiqueta" in msg and "qr" not in msg:
@@ -280,18 +280,16 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         if not rows:
             return "No hay etiquetas para mostrar en el inventario.", []
         items = rows
-        lines = []
-        for r in rows[:8]:
-            et = r.get("etiqueta") or "S/E"
-            art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-            lines.append(
-                f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} "
-                f"({r.get('area') or 'General'})"
-            )
-        more = f"\n… y {len(rows) - 8} más." if len(rows) > 8 else ""
+        sample = rows[0]
+        et = sample.get("etiqueta") or "S/E"
+        art = (
+            f"{sample.get('articulo') or ''} {sample.get('marca') or ''}".strip()
+            or "artículo"
+        )
         return (
-            f"Aquí tienes {len(rows)} etiqueta(s). El detalle está en el visor "
-            f"derecho.\n\n" + "\n".join(lines) + more,
+            f"Aquí tienes {len(rows)} etiqueta(s). Por ejemplo {et}: {art} — "
+            f"{sample.get('persona') or 'Sin asignar'} "
+            f"({sample.get('area') or 'General'}). El detalle está en el visor.",
             items,
         )
 
@@ -425,12 +423,9 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         return (
             f"Inventario general: {real_total} artículos, "
             f"{data.get('personas', '—')} personas y {data.get('areas', '—')} áreas"
-            f"{obs_txt}. El desglose está en el visor derecho.\n\n"
-            "Si quieres seguir, dime por ejemplo:\n"
-            "• Filtrar por un área o persona\n"
-            "• Ver los últimos registros o generar QR\n"
-            "• Dar de alta un artículo (+ Nuevo artículo)\n"
-            "• Importar un Excel o CSV con el clip 📎",
+            f"{obs_txt}. "
+            "Si quieres seguir, dime un área, una persona, los últimos registros, "
+            "QR o importar un Excel/CSV.",
             [],
         )
 
@@ -450,17 +445,13 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         )
 
     items = rows
-    lines = []
-    for r in rows[:8]:
-        et = r.get("etiqueta") or "S/E"
-        art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-        lines.append(
-            f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} ({r.get('area') or 'General'})"
-        )
-    more = f"\n… y {len(rows) - 8} más." if len(rows) > 8 else ""
+    sample = rows[0]
+    et = sample.get("etiqueta") or "S/E"
+    art = f"{sample.get('articulo') or ''} {sample.get('marca') or ''}".strip() or "artículo"
+    more = f" (y {len(rows) - 1} más)" if len(rows) > 1 else ""
     return (
-        f"Encontré {len(rows)} registro(s) (modo local):\n"
-        + "\n".join(lines)
-        + more,
+        f"Encontré {len(rows)} registro(s){more} (modo local). "
+        f"Por ejemplo {et}: {art} — {sample.get('persona') or 'Sin asignar'} "
+        f"({sample.get('area') or 'General'}). El detalle está en el visor.",
         items,
     )
