@@ -42,7 +42,7 @@ export async function GET() {
   }
 }
 
-/** Proxy al Backend-ia (NVIDIA/Muse/DeepSeek/Groq/Ollama/Gemini) para evitar CORS en el navegador. */
+/** Proxy al Backend-ia (solo DeepSeek) para evitar CORS en el navegador. */
 export async function POST(request: Request) {
   let body: unknown;
   try {

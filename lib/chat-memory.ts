@@ -441,20 +441,24 @@ export function hydrateMemoryFromChatSessions(
 
 /** ¿Pide restaurar el valor/nombre anterior de un campo? */
 export function looksLikeRevertPreviousValue(question: string): boolean {
-  const q = question.trim().toLowerCase();
+  const q = question
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "");
   if (!q) return false;
   if (
-    /\b(cu[aá]ntos?|total|totales|registros?|inventario)\b/.test(q) &&
-    /\b(antes|hab[ií]a|anterior)\b/.test(q) &&
-    !/\b(nombre|persona|campo|valor|como estaba|conten[ií]a)\b/.test(q)
+    /\b(cuantos?|total|totales|registros?|inventario)\b/.test(q) &&
+    /\b(antes|habia|anterior)\b/.test(q) &&
+    !/\b(nombre|persona|campo|valor|como estaba|como antes|contenia)\b/.test(q)
   ) {
     return false;
   }
   return (
-    /\b(vuelve|volver|regresa|regresar|restaura|restaurar|revierte|revertir|deshaz|deshacer|cambia|cambiar|pon|poner|deja|dejar)\b/.test(
+    /\b(vuelve|volver|regresa|regresar|restaura|restaurar|revierte|revertir|deshaz|deshacer|cambia|cambiar|pon|poner|ponlo|ponla|deja|dejar|dejalo|dejala|restaura(?:lo|la)?)\b/.test(
       q,
     ) &&
-    /\b(antes|anterior|previo|original|conten[ií]a|ten[ií]a|como estaba|el de antes|la de antes)\b/.test(
+    /\b(antes|anterior|previo|original|contenia|tenia|como estaba|como antes|el de antes|la de antes)\b/.test(
       q,
     )
   );
