@@ -74,19 +74,45 @@ import {
 } from "@/lib/chat-api";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import {
+  buildCreateInventarioAskReply,
+  detectBulkCopyBetweenInventariosAsk,
   detectCompareInventariosAsk,
+  detectCopyEtiquetasToInventarioAsk,
+  detectCopyPersonRecordsToInventarioAsk,
+  detectCreateInventarioAsk,
+  detectDuplicateEtiquetasAsk,
+  detectExcludedEtiquetasAsk,
+  detectFillNewInventarioAsk,
   diffInventarios,
+  displayOrigenLabel,
+  findDuplicateEtiquetas,
+  formatDuplicateEtiquetasReply,
   formatInventarioDiffReply,
   listExistingOrigens,
+  looksLikeNonFillInventarioAsk,
   matchOrigenFromPrompt,
+  nextFileOrigenFromFileName,
+  nextInventarioName,
   normalizeOrigenLabel,
+  origenCurrencyRank,
+  pickSourceRowsForEtiquetas,
   planImportOrigen,
+  resolveFuenteOrigen,
+  rowToNewInventarioItem,
+  inventarioNumber,
   ORIGEN_SIN_ORIGEN,
+  type PendingNewInventario,
 } from "@/lib/inventario-origen";
+import { normalizeChatSpellingAsync } from "@/lib/chat-spell";
+import {
+  detectInventarioMultiPlan,
+  looksLikeInventarioMultiAsk,
+} from "@/lib/chat-multi-plan";
 import { formatInventarioQrCompact } from "@/lib/inventario-qr";
 import {
   answerFromMemoryAboutBefore,
   buildCrossChatHistorySnippet,
+  buildMutationConfirmReply,
   buildRevertProposalReply,
   formatChatMemoryForPrompt,
   hydrateMemoryFromChatSessions,
@@ -98,6 +124,12 @@ import {
   loadChatMemory,
   type ChatFieldChange,
 } from "@/lib/chat-memory";
+import {
+  analyzeChatTurn,
+  rowsByEtiquetaPrefix,
+  type ChatTurnAnalysis,
+} from "@/lib/chat-intent";
+import { resolveChatTurnContext } from "@/lib/chat-turn-context";
 import {
   buildSearchIndex,
   formatDidYouMeanReply,
@@ -126,31 +158,31 @@ const CHAT_QUICK_ACTIONS = [
   {
     label: "Buscar por persona",
     hint: "Consulta qué artículos tiene asignados alguien.",
-    prompt: "Dame lo que tiene Juan Pérez",
+    prompt: "Búsqueda por persona",
     icon: Users,
   },
   {
     label: "Equipos por área",
     hint: "Lista el equipo registrado en un área concreta.",
-    prompt: "Dame los equipos de Sistemas",
+    prompt: "Equipos por área",
     icon: MapPin,
   },
   {
     label: "Últimos registros",
     hint: "Revisa las altas más recientes del inventario.",
-    prompt: "Dame los últimos registros",
+    prompt: "Últimos registros",
     icon: ListChecks,
   },
   {
     label: "Comparar inventarios",
     hint: "Diff real: faltan / sobran / cambiaron vs S/O.",
-    prompt: "Compara el último inventario vs S/O",
+    prompt: "Comparar inventarios",
     icon: Layers,
   },
   {
     label: "Ideas de consulta",
     hint: "Descubre qué puedes preguntarle al asistente.",
-    prompt: "¿Qué puedo preguntarte del inventario?",
+    prompt: "Ideas de consulta",
     icon: Lightbulb,
   },
 ] as const;
@@ -205,6 +237,8 @@ const CHAT_TOKEN_METERS_KEY = "inventario-chat-token-meters";
 const CHAT_SELECTED_MODEL_PREFIX = "inventario-selected-model:";
 const MAX_CHAT_SESSIONS = 50;
 const CHAT_USER_COLLAPSE_AT = 160;
+/** Visor derecho: no truncar a 80 en copias/importaciones masivas. */
+const CHAT_SIDE_RESULT_CAP = 2000;
 const PERSONA_SIN_ASIGNAR_ID = "__SIN_ASIGNAR__";
 const PERSONA_SIN_ASIGNAR_NAME = "Sin asignar";
 
@@ -264,11 +298,17 @@ function estimateTextTokens(text: string): number {
 }
 
 function formatCompactTokens(value: number): string {
-  const n = Math.max(0, Math.round(value));
+  const raw = Number(value);
+  const n = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 64_000;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 10_000) return `${Math.round(n / 1000)}k`;
   if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+function normalizeModelTokenBudget(value: unknown, fallback = 64_000): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 function loadChatSessions(): ChatSession[] {
@@ -499,8 +539,23 @@ function parseEtiquetaListAsk(userText: string): number | null {
 function looksLikeResultAnaphora(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
+  // “todo lo que está en el inventario 2…” ≠ anáfora de listado.
   if (
-    /\b(esas|esos|estas|estos|esa|ese|este|esta)\b/.test(n) ||
+    /\binventari/.test(n) &&
+    /\b(mete\w*|pasa\w*|copia\w*|importa\w*|mueve\w*|continua\w*|omite\w*|todo|faltantes?)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  if (/\besta\s+en\b/.test(n) || /\blo\s+que\s+esta\b/.test(n)) {
+    return false;
+  }
+  if (
+    /\b(esas|esos|estas|estos)\b/.test(n) ||
+    /\b(esa|ese|este|esta)\s+(etiqueta|etiquetas|ficha|fichas|consulta|resultado|persona|area)\b/.test(
+      n,
+    ) ||
     /\b(las|los)\s+(de\s+arriba|anteriores?|previas?|mismas?|mismos|anteriores)\b/.test(
       n,
     ) ||
@@ -530,6 +585,144 @@ function looksLikeContextAnaphora(userText: string) {
     return true;
   }
   return false;
+}
+
+/** “último registro / recién metido / más recientes” (global, no del área previa). */
+function detectRecentRecordsAsk(
+  userText: string,
+): { limit: number; soloHoy: boolean } | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  // “mete este registro al nuevo inventario” ≠ últimos registros.
+  if (
+    /\bnuevo\s+inventario\b/.test(n) ||
+    (/\b(crea|crear|haz|hacer|has|abre|abrir)\b/.test(n) &&
+      /\binventarios?\b/.test(n)) ||
+    (/\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|traslada)\b/.test(n) &&
+      /\binventarios?\b/.test(n))
+  ) {
+    return undefined;
+  }
+  const soloHoy = /\bhoy\b/.test(n);
+  const wantsNoun = intentHas(
+    n,
+    "registro",
+    "registros",
+    "articulo",
+    "articulos",
+    "equipo",
+    "equipos",
+    "alta",
+    "altas",
+    "entrada",
+    "entradas",
+  );
+  const wantsRecentWord = intentHas(
+    n,
+    "ultimo",
+    "ultimos",
+    "reciente",
+    "recientes",
+    "nuevo",
+    "nueva",
+    "nuevos",
+    "nuevas",
+  );
+  const wantsRecentPhrase =
+    /\b(se\s+metio|se\s+agrego|acabo\s+de|recien\s+(met|agreg|registr)|mas\s+nuev|mas\s+recient|base\s+de\s+datos)\b/.test(
+      n,
+    );
+  if (!wantsRecentWord && !wantsRecentPhrase) return undefined;
+  if (!wantsNoun && !wantsRecentPhrase && !soloHoy) return undefined;
+  // “nuevo/nueva” solo cuenta si también hay señal temporal (últimos/recientes/hoy).
+  if (
+    intentHas(n, "nuevo", "nueva", "nuevos", "nuevas") &&
+    !intentHas(n, "ultimo", "ultimos", "reciente", "recientes") &&
+    !wantsRecentPhrase &&
+    !soloHoy
+  ) {
+    return undefined;
+  }
+  // Singular “el último registro” → 1; plural / hoy / recientes → varios.
+  const singular =
+    intentHas(n, "ultimo") &&
+    !intentHas(n, "ultimos", "recientes") &&
+    !soloHoy;
+  return { limit: singular ? 1 : 10, soloHoy };
+}
+
+function getRecentInventoryRows(
+  inventory: InventarioRow[],
+  limit: number,
+  soloHoy = false,
+) {
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const todayMs = startOfToday.getTime();
+  return [...inventory]
+    .filter((row) => {
+      if (!soloHoy) return true;
+      const ts =
+        Date.parse(String(row.created_at ?? "")) ||
+        Date.parse(String(row.updated_at ?? "")) ||
+        0;
+      return ts >= todayMs;
+    })
+    .sort((a, b) => {
+      const ta =
+        Date.parse(String(a.created_at ?? "")) ||
+        Date.parse(String(a.updated_at ?? "")) ||
+        Number(a.id ?? 0) ||
+        0;
+      const tb =
+        Date.parse(String(b.created_at ?? "")) ||
+        Date.parse(String(b.updated_at ?? "")) ||
+        Number(b.id ?? 0) ||
+        0;
+      return tb - ta;
+    })
+    .slice(0, Math.max(1, Math.min(10, limit)));
+}
+
+function buildRecentRecordsReply(
+  rows: InventarioRow[],
+  ask: { limit: number; soloHoy: boolean },
+) {
+  if (!rows.length) {
+    return ask.soloHoy
+      ? "No encontré registros de **hoy**. ¿Quieres ver los más recientes en general?"
+      : "No encontré registros recientes en el inventario.";
+  }
+  const fmt = (n: number) => n.toLocaleString("es-MX");
+  const sample = rows[0];
+  const et = String(sample.etiqueta ?? "").trim() || "S/E";
+  const art =
+    [sample.articulo, sample.marca].map((v) => String(v ?? "").trim()).filter(Boolean).join(" — ") ||
+    "Artículo";
+  const per = String(sample.persona ?? "").trim() || "Sin asignar";
+  const area = String(sample.area ?? "").trim() || "Sin área";
+  if (ask.limit === 1 || rows.length === 1) {
+    return (
+      `El **último registro** dado de alta es **${et}**: **${art}** ` +
+      `(${area} · ${per}).\n\n` +
+      `El detalle está en el visor derecho. ` +
+      `¿Quieres generar su QR, ver más recientes o consultar otra ficha?`
+    );
+  }
+  const lines = rows.map((row) => {
+    const e = String(row.etiqueta ?? "").trim() || "S/E";
+    const a = String(row.articulo ?? "").trim() || "Artículo";
+    const p = String(row.persona ?? "").trim() || "Sin asignar";
+    const ar = String(row.area ?? "").trim() || "Sin área";
+    return `• **${e}** — ${a} (${ar} · ${p})`;
+  });
+  return (
+    `Estos son los **${fmt(rows.length)}** registros más recientes` +
+    `${ask.soloHoy ? " de hoy" : ""}:\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `El listado interactivo está en el visor. ` +
+    `¿Quieres inspeccionar uno o generar códigos QR?`
+  );
 }
 
 /**
@@ -566,6 +759,36 @@ function detectContextFollowUpAsk(
     return undefined;
   }
   if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
+    return undefined;
+  }
+  // “último registro / recién metido” es global: no reusar el área del turno anterior.
+  if (detectRecentRecordsAsk(userText)) {
+    return undefined;
+  }
+  if (looksLikeRecordMutationAsk(userText)) {
+    return undefined;
+  }
+  // Copia / import entre Inventario N → M: no reusar Contabilidad u otra área previa.
+  if (
+    detectBulkCopyBetweenInventariosAsk(
+      userText,
+      listExistingOrigens(inventory),
+    ) ||
+    (/\b(importa\w*|pasa\w*|copia\w*|mueve\w*|traslad\w*|traspas\w*|mete\w*|trae\w*)\b/.test(
+      n,
+    ) &&
+      /\binventari/.test(n) &&
+      /\b(?:a|al|hacia)\b/.test(n))
+  ) {
+    return undefined;
+  }
+  // “etiqueta 283586 de qué inventario…” ≠ reabrir Contabilidad.
+  if (
+    detectEtiquetaOrigenAsk(userText, inventory) ||
+    (/\betiqueta/.test(n) &&
+      /\b\d{3,}\b/.test(n) &&
+      /\b(inventari|origen|fuente|venia|venía|antes)\b/.test(n))
+  ) {
     return undefined;
   }
 
@@ -645,31 +868,43 @@ function detectContextFollowUpAsk(
 
   if (!useContext) return undefined;
 
+  // Solo el ÚLTIMO bot cuenta. Remontar historial reabría Contabilidad
+  // aunque el hilo actual fuera de inventarios/etiquetas.
+  let lastBot:
+    | {
+        from: string;
+        text: string;
+        viewerFocus?: string;
+        viewerOverview?: ViewerOverview;
+      }
+    | undefined;
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    if (recentMessages[i].from === "bot") {
+      lastBot = recentMessages[i];
+      break;
+    }
+  }
+  if (!lastBot) return undefined;
+
   let focusName = "";
   let focusKind: "area" | "person" | "" = "";
-  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
-    const message = recentMessages[i];
-    if (message.from !== "bot") continue;
-    const focus = String(message.viewerFocus || "").trim();
-    if (!focus) continue;
+  const focus = String(lastBot.viewerFocus || "").trim();
+  if (focus) {
     if (
-      message.viewerOverview === "areaTotal" ||
-      message.viewerOverview === "areaMatches"
+      lastBot.viewerOverview === "areaTotal" ||
+      lastBot.viewerOverview === "areaMatches"
     ) {
       focusName = focus.includes("::")
         ? focus.slice(0, focus.indexOf("::")).trim() || focus
         : focus;
-      // areaMatches focus is query label; prefer candidate from encode
       if (focus.includes("::")) {
         const parsed = parseMatchesFocusFromMessage(focus);
         focusName = parsed?.candidates[0] || focusName;
       }
       focusKind = "area";
-      break;
-    }
-    if (
-      message.viewerOverview === "personTotal" ||
-      message.viewerOverview === "personMatches"
+    } else if (
+      lastBot.viewerOverview === "personTotal" ||
+      lastBot.viewerOverview === "personMatches"
     ) {
       focusName = focus.includes("::")
         ? (() => {
@@ -678,46 +913,39 @@ function detectContextFollowUpAsk(
           })()
         : focus;
       focusKind = "person";
-      break;
-    }
-    // Bot habló de un área en texto aunque no haya overview
-    focusName = focus;
-    const areaHit = getAllAreaCatalog(inventory).find(
-      (c) => c.name === focus || areaMatchesNeedle(c.name, focus),
-    );
-    if (areaHit) {
-      focusKind = "area";
-      focusName = areaHit.name;
-      break;
-    }
-    const personHit = getAllPersonCatalog(inventory).find(
-      (c) => c.name === focus || normalizePlain(c.name).includes(normalizePlain(focus)),
-    );
-    if (personHit) {
-      focusKind = "person";
-      focusName = personHit.name;
-      break;
+    } else {
+      const areaHit = getAllAreaCatalog(inventory).find(
+        (c) => c.name === focus || areaMatchesNeedle(c.name, focus),
+      );
+      if (areaHit) {
+        focusKind = "area";
+        focusName = areaHit.name;
+      } else {
+        const personHit = getAllPersonCatalog(inventory).find(
+          (c) =>
+            c.name === focus ||
+            normalizePlain(c.name).includes(normalizePlain(focus)),
+        );
+        if (personHit) {
+          focusKind = "person";
+          focusName = personHit.name;
+        }
+      }
     }
   }
 
-  // También del lastConcreteSide si no hubo viewerFocus
-  if (!focusKind) {
-    // Buscar en el último bot mención de área conocida en el reply
-    for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
-      const message = recentMessages[i];
-      if (message.from !== "bot" || !message.text) continue;
-      const catalog = getAllAreaCatalog(inventory);
-      for (const area of catalog) {
-        if (
-          message.text.includes(area.name) ||
-          normalizePlain(message.text).includes(area.norm)
-        ) {
-          focusKind = "area";
-          focusName = area.name;
-          break;
-        }
+  // Sin viewerFocus: solo el texto del último bot (no chats viejos).
+  if (!focusKind && lastBot.text) {
+    const catalog = getAllAreaCatalog(inventory);
+    for (const area of catalog) {
+      if (
+        lastBot.text.includes(area.name) ||
+        normalizePlain(lastBot.text).includes(area.norm)
+      ) {
+        focusKind = "area";
+        focusName = area.name;
+        break;
       }
-      if (focusKind) break;
     }
   }
 
@@ -1105,21 +1333,13 @@ function buildChatImportPreviewReply(input: {
                   "que el Excel no dejaba claro el origen",
                 ]);
 
-  const open = pickOne(
-    origen === "S/O" || origen === ORIGEN_SIN_ORIGEN
-      ? [
-          `Listo, ya leí “${input.fileName}”${sheetBit}. Como no había origen claro (${sourcePhrase}), lo dejaré en **${ORIGEN_SIN_ORIGEN}**.`,
-          `Revisé “${input.fileName}”${sheetBit}. Sin un origen explícito (${sourcePhrase}), el destino será **${ORIGEN_SIN_ORIGEN}**.`,
-          `Archivo cargado: “${input.fileName}”${sheetBit}. Voy con **${ORIGEN_SIN_ORIGEN}** porque ${sourcePhrase}.`,
-        ]
-      : [
-          `Perfecto, ya leí “${input.fileName}”${sheetBit}. El destino queda en **${origen}** (según ${sourcePhrase}).`,
-          `Listo con “${input.fileName}”${sheetBit}. Voy a meterlo en **${origen}**, tomando ${sourcePhrase}.`,
-          `Ya revisé el Excel${sheetBit}. Origen: **${origen}** (${sourcePhrase}).`,
-          `“${input.fileName}”${sheetBit} listo. Lo asociaré a **${origen}**.`,
-          `Claro. Para este archivo el origen es **${origen}** (${sourcePhrase}).`,
-        ],
-  );
+  const open = pickOne([
+    `Perfecto, ya leí “${input.fileName}”${sheetBit}. El origen de los datos queda en **${origen}** (según ${sourcePhrase}).`,
+    `Listo con “${input.fileName}”${sheetBit}. Voy a importarlo con origen **${origen}**, tomando ${sourcePhrase}.`,
+    `Ya revisé el archivo${sheetBit}. Origen: **${origen}** (${sourcePhrase}).`,
+    `“${input.fileName}”${sheetBit} listo. Lo asociaré a **${origen}**.`,
+    `Claro. Para este archivo el origen es **${origen}** (${sourcePhrase}).`,
+  ]);
 
   const countLine =
     input.dups > 0
@@ -1322,6 +1542,14 @@ const AREA_STOP_WORDS = new Set([
   "con",
   "inventario",
   "inventarios",
+  "compara",
+  "comparar",
+  "comparacion",
+  "diff",
+  "diferencia",
+  "diferencias",
+  "versus",
+  "vs",
   "solo",
   "solamente",
   "persona",
@@ -1503,6 +1731,7 @@ function detectAreaListAsk(
 ): { area: string; limit: number } | undefined {
   const n = normalizeChatIntent(userText);
   if (!n) return undefined;
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
   if (detectAreaTotalAsk(userText, inventory)) return undefined;
   const wantsList = intentHas(
     n,
@@ -2082,6 +2311,19 @@ function findMatchingAreasForPrompt(
   if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
     return undefined;
   }
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
+  // “Comparar inventarios” ≠ área “Compras”.
+  const origensForSkip = listExistingOrigens(inventory);
+  if (detectCompareInventariosAsk(userText, origensForSkip)) {
+    return undefined;
+  }
+  // “Importa Inventario 1 a 3” ≠ área Contabilidad (ni foco previo).
+  if (detectBulkCopyBetweenInventariosAsk(userText, origensForSkip)) {
+    return undefined;
+  }
+  if (detectEtiquetaOrigenAsk(userText, inventory)) {
+    return undefined;
+  }
   const n = normalizeChatIntent(userText);
   if (!n) return undefined;
   // Mutaciones / ediciones no son consultas de área
@@ -2092,13 +2334,22 @@ function findMatchingAreasForPrompt(
       "cambiar",
       "actualiza",
       "actualizar",
+      "corrige",
+      "corregir",
+      "modifica",
+      "modificar",
       "agrega",
       "agregar",
       "sube",
       "subir",
       "importa",
       "importar",
-    )
+      "importaras",
+      "importame",
+      "importalos",
+      "importemos",
+    ) ||
+    /\bimporta\w*\b/.test(n)
   ) {
     return undefined;
   }
@@ -2115,6 +2366,20 @@ function findMatchingAreasForPrompt(
   if (
     !intentHas(n, "area", "areas", "edif", "edificio", "edificios") &&
     looksLikePersonAnaphora(userText)
+  ) {
+    return undefined;
+  }
+  // “inventario (general) de Héctor” → persona, no área fuzzy.
+  if (
+    !intentHas(n, "area", "areas", "edif", "edificio", "edificios") &&
+    (/\binventario\s+(general\s+)?de\b/.test(n) ||
+      /\b(inventario|registros?|equipos?)\s+(general\s+)?de\s+[a-z]{2,}/.test(n))
+  ) {
+    return undefined;
+  }
+  if (
+    !intentHas(n, "area", "areas") &&
+    findPersonInText(userText, inventory)
   ) {
     return undefined;
   }
@@ -2209,7 +2474,25 @@ function findMatchingPeopleForPrompt(
   if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
     return undefined;
   }
-  const n = normalizeChatIntent(userText);
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
+  const turn = analyzeTurnQuick(userText, inventory);
+  if (turn.isWriteTurn || turn.discourseOnly) return undefined;
+  // Solo buscar persona si hay señal de consulta o nombre de catálogo.
+  const nGate = normalizeChatIntent(userText);
+  const looksPersonInventory =
+    /\binventario\s+(general\s+)?de\b/.test(nGate) ||
+    /\b(inventario|registros?|equipos?)\s+(general\s+)?de\s+[a-z]{2,}/.test(
+      nGate,
+    );
+  if (
+    turn.primaryAction !== "query_person" &&
+    !turn.personas.length &&
+    !/\b(persona|personas|quien|quienes|inventario\s+de)\b/.test(turn.normalized) &&
+    !looksPersonInventory
+  ) {
+    return undefined;
+  }
+  const n = nGate;
   if (!n || /\b\d{4,}\b/.test(n)) return undefined;
   if (
     intentHas(
@@ -2223,6 +2506,10 @@ function findMatchingPeopleForPrompt(
       "cambiar",
       "actualiza",
       "actualizar",
+      "corrige",
+      "corregir",
+      "modifica",
+      "modificar",
     )
   ) {
     return undefined;
@@ -2241,6 +2528,20 @@ function findMatchingPeopleForPrompt(
     return undefined;
   }
 
+  // Si el clasificador ya resolvió personas del catálogo, úsalas.
+  if (turn.personas.length === 1) {
+    const catalog = getAllPersonCatalog(inventory);
+    const hit = catalog.find((p) => p.name === turn.personas[0]);
+    if (hit) {
+      return {
+        queryLabel: hit.name,
+        candidates: [hit],
+        intent: "total",
+        limit: null,
+      };
+    }
+  }
+
   const plain0 = stripRequestedCountPhrases(normalizePlain(userText));
   const rawTokens = plain0
     .split(" ")
@@ -2248,7 +2549,8 @@ function findMatchingPeopleForPrompt(
       (t) =>
         t.length > 2 &&
         !PERSON_STOP_WORDS.has(t) &&
-        !AREA_QUERY_STOP_WORDS.has(t),
+        !AREA_QUERY_STOP_WORDS.has(t) &&
+        !INTENT_DISCOURSE_LOCK.has(t),
     );
   if (!rawTokens.length) return undefined;
 
@@ -2408,12 +2710,18 @@ function buildExactPersonReply(
         ? areas.join(", ")
         : `${areas.slice(0, 3).join(", ")} y ${areas.length - 3} más`;
 
-  const samples = shownRows.slice(0, 5).map((row) => {
+  const sampleSeen = new Set<string>();
+  const samples: string[] = [];
+  for (const row of shownRows) {
+    if (samples.length >= 5) break;
     const tag = String(row.etiqueta ?? "").trim() || "S/E";
+    const key = tag.toLowerCase();
+    if (sampleSeen.has(key)) continue;
+    sampleSeen.add(key);
     const art = String(row.articulo ?? "").trim() || "Artículo";
     const ar = String(row.area ?? "").trim() || "Sin área";
-    return `**${tag}** (${art}, ${ar})`;
-  });
+    samples.push(`**${tag}** (${art}, ${ar})`);
+  }
   let sampleProse = "";
   if (samples.length === 1) {
     sampleProse = ` Por ejemplo: ${samples[0]}.`;
@@ -2951,13 +3259,659 @@ function findPersonInText(
 function looksLikePersonAnaphora(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
+  // No tratar “su id / su etiqueta” como inventario de persona.
+  if (/\b(su|sus)\s+(id|ids|etiqueta|etiquetas|codigo|codigos|folio)\b/.test(n)) {
+    return false;
+  }
   return (
-    /\b(su|sus)\b/.test(n) ||
+    /\b(su|sus)\s+(inventario|registros?|etiquetas?|equipos?|articulos?|cosas|ficha|fichas)\b/.test(
+      n,
+    ) ||
     /\bde el\b/.test(n) ||
     /\bde ella\b/.test(n) ||
     /\besa persona\b/.test(n) ||
     /\bde esa persona\b/.test(n)
   );
+}
+
+/** Cualquier etiqueta mencionada (patrón libre o coincidencia en inventario). */
+function extractEtiquetaMentions(
+  userText: string,
+  inventory: InventarioRow[],
+): string[] {
+  const raw = String(userText || "");
+  const found = new Set<string>();
+  const push = (value: string) => {
+    const tag = String(value || "").trim();
+    if (!tag || tag.length < 2) return;
+    found.add(tag);
+  };
+  for (const tag of extractEtiquetasFromText(raw)) push(tag);
+  // Prefijo-letra + dígitos (OF-0026, RH-12, A1-003…) y códigos numéricos largos
+  for (const match of raw.matchAll(
+    /\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,8}|\d{4,10})\b/g,
+  )) {
+    push(match[1]);
+  }
+  // “etiqueta X” / “id interno N” (id solo si lo dicen explícito)
+  for (const match of raw.matchAll(
+    /(?:etiqueta|tag|folio|codigo)\s*[:=]?\s*\*{0,2}([A-Za-z0-9/_-]{2,})\*{0,2}/gi,
+  )) {
+    push(match[1]);
+  }
+
+  if (!inventory.length) return [...found];
+
+  const byNorm = new Map<string, string>();
+  for (const row of inventory) {
+    const et = String(row.etiqueta ?? "").trim();
+    if (!et) continue;
+    byNorm.set(et.toLowerCase(), et);
+  }
+  // También: etiqueta del inventario que aparezca completa en el texto
+  const rawLower = raw.toLowerCase();
+  const plain = normalizePlain(raw);
+  for (const [norm, et] of byNorm) {
+    if (norm.length < 3) continue;
+    if (
+      rawLower.includes(norm) ||
+      plain.includes(normalizePlain(et))
+    ) {
+      found.add(et);
+    }
+  }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const hit of found) {
+    const exact = byNorm.get(hit.toLowerCase()) || hit;
+    const key = exact.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(exact);
+  }
+  // Preferir etiquetas más largas / con letras (OF-0026 antes que 0026)
+  return out.sort((a, b) => {
+    const aScore = (/[a-z]/i.test(a) ? 100 : 0) + a.length;
+    const bScore = (/[a-z]/i.test(b) ? 100 : 0) + b.length;
+    return bScore - aScore;
+  });
+}
+
+function looksLikeMutationVerb(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  return intentHas(
+    n,
+    "corrige",
+    "corregir",
+    "cambia",
+    "cambiar",
+    "actualiza",
+    "actualizar",
+    "modifica",
+    "modificar",
+    "aplica",
+    "aplicar",
+    "arregla",
+    "arreglar",
+    "edita",
+    "editar",
+    "pon",
+    "poner",
+    "restaura",
+    "restaurar",
+    "revierte",
+    "revertir",
+    "deshaz",
+    "deshacer",
+  );
+}
+
+function looksLikeWrongRecordRepairAsk(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  return (
+    /\b(al otro|el otro|la otra|ese otro|esa otra|el equivocado|la equivocada|el incorrecto|el error)\b/.test(
+      n,
+    ) ||
+    /\b(te equivoc|se equivoc|aplicaste mal|cambio mal|registro equivoc|no era (ese|esa|ese id|esa etiqueta)|era (este|esta|el otro))\b/.test(
+      n,
+    ) ||
+    /\b(el correcto|la correcta|el que quiero|la que quiero|este es (el|su|la)|esta es (la|su))\b/.test(
+      n,
+    )
+  );
+}
+
+/** Prefijo de etiqueta: “el de CF”, “empieza con OF”, “código RH”. */
+function extractEtiquetaPrefixAsk(userText: string): string | undefined {
+  const turn = analyzeTurnQuick(userText);
+  if (turn.etiquetaPrefix) return turn.etiquetaPrefix;
+  const raw = String(userText || "");
+  const n = normalizeChatIntent(userText);
+  const m =
+    raw.match(/\b(?:codigo|código|etiqueta|tag|folio)\s+de\s+([A-Za-z]{1,6})\b/i) ||
+    raw.match(/\b(?:codigo|código|etiqueta|tag|folio)\s+([A-Za-z]{2,6})\b/i) ||
+    n.match(
+      /\b(?:empieza(?:n)?\s+con|comienza(?:n)?\s+con|que\s+empieza?\s+con|prefijo|empiece\s+con)\s+([a-z]{1,6})\b/,
+    ) ||
+    raw.match(/\b([A-Za-z]{2,4})\s+o\s+que\s+empieza/i) ||
+    raw.match(/\bempieza(?:n)?\s+con\s+([A-Za-z]{1,6})\b/i);
+  const prefix = String(m?.[1] || "").trim().toLowerCase();
+  if (!prefix || prefix.length < 1 || prefix.length > 6) return undefined;
+  if (
+    /^(el|la|los|las|de|un|una|con|por|que|como|antes|activo|area|id|lo|te|me|se|ya|en|al|codigo|etiqueta)$/i.test(
+      prefix,
+    )
+  ) {
+    return undefined;
+  }
+  return prefix;
+}
+
+function looksLikeEtiquetaOnlyReply(userText: string) {
+  const t = String(userText || "").trim();
+  if (!t || t.length > 40) return false;
+  return /^(?:etiqueta\s+)?[A-Za-z]{0,10}[-_/]?[A-Za-z0-9]*\d{2,10}$/i.test(t);
+}
+
+type InferredFieldPatch = { field: string; value: string };
+
+type PendingFixContext = {
+  revert: ChatFieldChange | null;
+  patches: InferredFieldPatch[];
+  askedAt: number;
+};
+
+function buildApplyChangesForRow(
+  targetRow: InventarioRow,
+  patches: InferredFieldPatch[],
+  sessionId: string | null,
+): ChatFieldChange[] {
+  return patches.map((p) => {
+    const currentVal = String(
+      (targetRow as Record<string, unknown>)[p.field] ?? "",
+    ).trim();
+    return {
+      at: new Date().toISOString(),
+      id: targetRow.id,
+      etiqueta: String(targetRow.etiqueta ?? ""),
+      articulo: String(targetRow.articulo ?? ""),
+      field: p.field,
+      oldValue: currentVal || "(vacío)",
+      newValue: p.value,
+      chatId: sessionId,
+    };
+  });
+}
+
+/** Intención de escribir / corregir / revertir — delega al clasificador. */
+function looksLikeRecordMutationAsk(userText: string) {
+  const turn = analyzeTurnQuick(userText);
+  if (turn.isWriteTurn) return true;
+  if (turn.primaryAction === "mutate" || turn.primaryAction === "revert") {
+    return true;
+  }
+  // Compat con heurísticas previas (multi-petición / typos).
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (looksLikeRevertPreviousValue(userText)) return true;
+  if (looksLikeWrongRecordRepairAsk(userText)) return true;
+  if (/\b(como antes|como estaba|valor anterior)\b/.test(n)) return true;
+  if (extractEtiquetaPrefixAsk(userText) || turn.etiquetaPrefix) return true;
+  return false;
+}
+
+function stripLeadingAffirmative(userText: string) {
+  return String(userText || "")
+    .trim()
+    .replace(
+      /^(sí|si|yes|ok|okay|okey|vale|dale|claro|listo|de acuerdo|confirma|confirmo|adelante|hazlo|procede|proceder)([\s,.:;!-]+|$)/i,
+      "",
+    )
+    .replace(/^(y|tambien|además|ademas)\s+/i, "")
+    .trim();
+}
+
+/** Infiera estado/observaciones/etc. desde lenguaje natural (cualquier registro). */
+function inferFieldPatchesFromText(userText: string): InferredFieldPatch[] {
+  const n = normalizeChatIntent(userText);
+  if (!n) return [];
+  const patches: InferredFieldPatch[] = [];
+
+  if (
+    /\b(inactivo|inactiva|dar\s+de\s+baja|dado\s+de\s+baja)\b/.test(n)
+  ) {
+    patches.push({ field: "estado", value: "Inactivo" });
+  } else if (
+    /\b(activo|activa|reactivar|activar)\b/.test(n) &&
+    !/\b(cuantos|cuantas|totales?|salud|porcentaje)\b/.test(n)
+  ) {
+    patches.push({ field: "estado", value: "Activo" });
+  }
+
+  const quoted =
+    userText.match(/["“«]([^"”»]{3,200})["”»]/)?.[1] ||
+    userText.match(/'([^']{3,200})'/)?.[1];
+  if (quoted && quoted.trim().length >= 3) {
+    patches.push({ field: "observaciones", value: quoted.trim() });
+  } else if (
+    /\b(arreglad|reparad|ya\s+funciona|funciona\s+correct|equipo\s+reparad|computadora\s+arreg|pc\s+arreg|laptop\s+arreg)\b/.test(
+      n,
+    )
+  ) {
+    patches.push({
+      field: "observaciones",
+      value: "Equipo reparado, ya funciona correctamente",
+    });
+  } else {
+    const obs =
+      userText.match(
+        /observaciones?\s*[:=]\s*["“]?([^"”\n]+)["”]?/i,
+      )?.[1] ||
+      userText.match(
+        /(?:nota|comentario)\s*[:=]\s*["“]?([^"”\n]+)["”]?/i,
+      )?.[1];
+    if (obs && obs.trim().length >= 3) {
+      patches.push({ field: "observaciones", value: obs.trim() });
+    }
+  }
+
+  // Solo asignar persona con señal clara (evitar “por lo que…” / falsos positivos).
+  const persona = userText.match(
+    /(?:\bpersona\s*[:=]\s*|\basignar(?:lo|la)?\s+a\s+|\bponer(?:lo|la)?\s+a\s+)([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ .]{2,40})/i,
+  )?.[1];
+  if (
+    persona &&
+    !/^(activo|inactivo|el|la|los|las|lo|que|te|dije|antes)\b/i.test(
+      persona.trim(),
+    )
+  ) {
+    patches.push({ field: "persona", value: persona.trim() });
+  }
+
+  const area = userText.match(
+    /(?:\barea|\bárea)\s*[:=]\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9][A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 ./-]{1,40})/i,
+  )?.[1];
+  if (area) patches.push({ field: "area", value: area.trim() });
+
+  return patches;
+}
+
+/** Resuelve etiqueta citada contra inventario (typos OF/CF, mayúsculas…). */
+function resolveEtiquetaAgainstInventory(
+  rawEtiqueta: string,
+  inventory: InventarioRow[],
+): InventarioRow | undefined {
+  const needle = String(rawEtiqueta || "").trim();
+  if (!needle || !inventory.length) return undefined;
+  const lower = needle.toLowerCase();
+  const exact = inventory.find(
+    (row) => String(row.etiqueta ?? "").trim().toLowerCase() === lower,
+  );
+  if (exact) return exact;
+
+  // Prefijo letra confuso (CF-0026 vs OF-0026): mismo sufijo numérico
+  const m = needle.match(/^([A-Za-z]{1,6})([-_/]?)(\d{2,8})$/);
+  if (m) {
+    const suffix = m[3];
+    const sep = m[2] || "-";
+    const candidates = inventory.filter((row) => {
+      const et = String(row.etiqueta ?? "").trim();
+      const em = et.match(/^([A-Za-z]{1,6})([-_/]?)(\d{2,8})$/i);
+      return Boolean(em && em[3] === suffix);
+    });
+    if (candidates.length === 1) return candidates[0];
+    const swapped = inventory.find((row) => {
+      const et = String(row.etiqueta ?? "").trim().toLowerCase();
+      return (
+        et === `o${lower.slice(1)}` ||
+        et === `c${lower.slice(1)}` ||
+        et === `${m[1].toLowerCase() === "cf" ? "of" : "cf"}${sep}${suffix}`.toLowerCase()
+      );
+    });
+    if (swapped) return swapped;
+  }
+  return undefined;
+}
+
+type RecordMutationPlan =
+  | {
+      action: "multi";
+      revert?: ChatFieldChange | null;
+      applies: Array<{
+        etiqueta: string;
+        row: InventarioRow;
+        patches: InferredFieldPatch[];
+      }>;
+      ask?: string;
+    }
+  | {
+      action: "fix_and_revert";
+      fixEtiqueta: string;
+      last: ChatFieldChange;
+      patches?: InferredFieldPatch[];
+    }
+  | { action: "revert_only"; last: ChatFieldChange }
+  | {
+      action: "propose_patches";
+      fixEtiqueta: string;
+      patches: InferredFieldPatch[];
+    }
+  | {
+      action: "ask_fix_etiqueta";
+      last: ChatFieldChange | null;
+      hint?: string;
+    }
+  | { action: "pass_to_llm" };
+
+type EtiquetaSpan = {
+  raw: string;
+  etiqueta: string;
+  row?: InventarioRow;
+  start: number;
+  end: number;
+};
+
+/** Localiza cada etiqueta citada con su posición (para multi-petición). */
+function extractEtiquetaSpans(
+  userText: string,
+  inventory: InventarioRow[],
+): EtiquetaSpan[] {
+  const raw = String(userText || "");
+  if (!raw.trim()) return [];
+  const spans: EtiquetaSpan[] = [];
+  const seen = new Set<string>();
+  const pushSpan = (value: string, start: number, end: number) => {
+    const cleaned = String(value || "").trim();
+    if (!cleaned) return;
+    const row = resolveEtiquetaAgainstInventory(cleaned, inventory);
+    const etiqueta = String(row?.etiqueta ?? cleaned);
+    const key = `${etiqueta.toLowerCase()}@${start}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    spans.push({ raw: cleaned, etiqueta, row, start, end });
+  };
+
+  for (const match of raw.matchAll(
+    /\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,8}|\d{4,10})\b/g,
+  )) {
+    if (match.index == null) continue;
+    pushSpan(match[1], match.index, match.index + match[1].length);
+  }
+  for (const match of raw.matchAll(
+    /(?:etiqueta|tag|folio|codigo|id)\s*[:=]?\s*\*{0,2}([A-Za-z0-9/_-]{2,})\*{0,2}/gi,
+  )) {
+    if (match.index == null) continue;
+    pushSpan(match[1], match.index, match.index + match[0].length);
+  }
+
+  // Etiquetas del inventario presentes en texto (cualquier formato)
+  for (const row of inventory) {
+    const et = String(row.etiqueta ?? "").trim();
+    if (!et || et.length < 3) continue;
+    const idx = raw.toLowerCase().indexOf(et.toLowerCase());
+    if (idx >= 0) pushSpan(et, idx, idx + et.length);
+  }
+
+  return spans.sort((a, b) => a.start - b.start);
+}
+
+function clauseForSpan(
+  userText: string,
+  span: EtiquetaSpan,
+  all: EtiquetaSpan[],
+): string {
+  const idx = all.findIndex((s) => s.start === span.start && s.end === span.end);
+  const prevEnd = idx > 0 ? all[idx - 1].end : 0;
+  const nextStart = idx >= 0 && idx < all.length - 1 ? all[idx + 1].start : userText.length;
+  // Un poco antes de la etiqueta para capturar “deja … como antes”
+  const start = Math.max(prevEnd, span.start - 48);
+  return userText.slice(start, nextStart).trim();
+}
+
+function clauseWantsRevert(clause: string) {
+  const n = normalizeChatIntent(clause);
+  return (
+    looksLikeRevertPreviousValue(clause) ||
+    /\b(como antes|como estaba|valor anterior|restaura|restaurar|deshaz|deshacer|revierte)\b/.test(
+      n,
+    )
+  );
+}
+
+function clauseWantsChange(clause: string) {
+  return (
+    looksLikeMutationVerb(clause) ||
+    inferFieldPatchesFromText(clause).length > 0 ||
+    /\b(cambialo|cambiala|corrigelo|corrigela|ponlo|ponla|actualizalo|modificalo)\b/.test(
+      normalizeChatIntent(clause),
+    )
+  );
+}
+
+/**
+ * Multi-petición genérica: un mensaje puede pedir varias acciones
+ * sobre distintas etiquetas (revertir A + corregir B + …).
+ */
+function detectMultiRecordMutationPlan(
+  userText: string,
+  inventory: InventarioRow[],
+  lastChange: ChatFieldChange | null | undefined,
+): RecordMutationPlan | undefined {
+  if (!looksLikeRecordMutationAsk(userText)) return undefined;
+  const n = normalizeChatIntent(userText);
+  let spans = extractEtiquetaSpans(userText, inventory);
+  const globalPatches = inferFieldPatchesFromText(userText);
+  const globalRevert =
+    looksLikeRevertPreviousValue(userText) ||
+    looksLikeWrongRecordRepairAsk(userText) ||
+    /\b(como antes|como estaba|valor anterior)\b/.test(n);
+
+  // “el código CF / empieza con CF” → etiquetas por prefijo (cualquier serie).
+  const turnGate = analyzeTurnQuick(userText, inventory);
+  const prefix = turnGate.etiquetaPrefix || extractEtiquetaPrefixAsk(userText);
+  if (prefix && !spans.some((s) => s.etiqueta.toLowerCase().startsWith(prefix))) {
+    const prefixed = rowsByEtiquetaPrefix(prefix, inventory);
+    if (prefixed.length === 1) {
+      const row = prefixed[0];
+      const et = String(row.etiqueta ?? "");
+      spans = [
+        ...spans,
+        {
+          raw: et,
+          etiqueta: et,
+          row,
+          start: userText.toLowerCase().indexOf(prefix),
+          end: userText.toLowerCase().indexOf(prefix) + prefix.length,
+        },
+      ].sort((a, b) => a.start - b.start);
+    } else if (prefixed.length > 1 && globalPatches.length) {
+      // Varias CF-*: pedir cuál, sin abrir personas/áreas.
+      return {
+        action: "ask_fix_etiqueta",
+        last: lastChange || null,
+        hint: prefixed
+          .slice(0, 6)
+          .map((r) => String(r.etiqueta ?? ""))
+          .filter(Boolean)
+          .join(", "),
+      };
+    }
+  }
+
+  const applies: Array<{
+    etiqueta: string;
+    row: InventarioRow;
+    patches: InferredFieldPatch[];
+  }> = [];
+  let revert: ChatFieldChange | null | undefined;
+  const unresolved: string[] = [];
+
+  for (const span of spans) {
+    const clause = clauseForSpan(userText, span, spans);
+    const localPatches = inferFieldPatchesFromText(clause);
+    const wantRevert = clauseWantsRevert(clause);
+    const wantChange = clauseWantsChange(clause);
+    const row =
+      span.row || resolveEtiquetaAgainstInventory(span.etiqueta, inventory);
+
+    if (wantRevert) {
+      if (
+        lastChange &&
+        String(lastChange.etiqueta ?? "")
+          .trim()
+          .toLowerCase() === span.etiqueta.trim().toLowerCase()
+      ) {
+        revert = lastChange;
+      } else if (lastChange && spans.length >= 2 && !revert) {
+        // “deja E1 como antes” aunque el lastChange sea E1
+        const lastEt = String(lastChange.etiqueta ?? "")
+          .trim()
+          .toLowerCase();
+        if (lastEt === span.etiqueta.trim().toLowerCase() || lastEt === span.raw.toLowerCase()) {
+          revert = lastChange;
+        } else if (
+          String(lastChange.id ?? "") === span.raw ||
+          String(lastChange.id ?? "") === span.etiqueta
+        ) {
+          revert = lastChange;
+        }
+      }
+      // Si piden revertir una etiqueta concreta igual al último cambio
+      if (
+        !revert &&
+        lastChange &&
+        String(lastChange.etiqueta ?? "").trim().toLowerCase() ===
+          String(row?.etiqueta ?? span.etiqueta)
+            .trim()
+            .toLowerCase()
+      ) {
+        revert = lastChange;
+      }
+    }
+
+    if (wantChange) {
+      if (!row?.id) {
+        unresolved.push(span.raw || span.etiqueta);
+        continue;
+      }
+      let patches = localPatches.length ? localPatches : [];
+      // Sin patches locales: hereda globales o el valor del último cambio movido
+      if (!patches.length && globalPatches.length && spans.length === 1) {
+        patches = globalPatches;
+      }
+      if (
+        !patches.length &&
+        lastChange &&
+        String(lastChange.etiqueta ?? "")
+          .trim()
+          .toLowerCase() !==
+          String(row.etiqueta ?? "")
+            .trim()
+            .toLowerCase()
+      ) {
+        // “cámbialo / corrígelo” sin detalle → reutilizar el valor del cambio previo
+        patches = [{ field: lastChange.field, value: lastChange.newValue }];
+      }
+      if (!patches.length && globalPatches.length) {
+        patches = globalPatches;
+      }
+      if (patches.length) {
+        applies.push({
+          etiqueta: String(row.etiqueta ?? span.etiqueta),
+          row,
+          patches,
+        });
+      } else {
+        unresolved.push(String(row.etiqueta ?? span.etiqueta));
+      }
+    }
+  }
+
+  // “al otro déjalo como antes” sin repetir la etiqueta mala
+  if (!revert && globalRevert && lastChange) {
+    const lastEt = String(lastChange.etiqueta ?? "")
+      .trim()
+      .toLowerCase();
+    const appliesOther = applies.some(
+      (a) => a.etiqueta.trim().toLowerCase() !== lastEt,
+    );
+    if (appliesOther || looksLikeWrongRecordRepairAsk(userText) || spans.length === 0) {
+      revert = lastChange;
+    }
+    // Una sola etiqueta mencionada + revert global → esa es la a restaurar si coincide
+    if (
+      !revert &&
+      spans.length === 1 &&
+      lastEt === spans[0].etiqueta.trim().toLowerCase()
+    ) {
+      revert = lastChange;
+    }
+    if (!revert && spans.length === 1 && lastChange) {
+      // “deja 281367 como antes” aunque digan id
+      const only = spans[0];
+      if (
+        lastEt === only.etiqueta.toLowerCase() ||
+        lastEt === only.raw.toLowerCase() ||
+        String(lastChange.id) === only.raw
+      ) {
+        revert = lastChange;
+      }
+    }
+    if (!revert && lastChange && (globalRevert || spans.length === 0)) {
+      revert = lastChange;
+    }
+  }
+
+  // Una etiqueta + patches globales (sin verbo de revert)
+  if (!applies.length && spans.length === 1 && globalPatches.length) {
+    const span = spans[0];
+    const row =
+      span.row || resolveEtiquetaAgainstInventory(span.etiqueta, inventory);
+    if (row?.id) {
+      applies.push({
+        etiqueta: String(row.etiqueta ?? span.etiqueta),
+        row,
+        patches: globalPatches,
+      });
+    }
+  }
+
+  if (revert || applies.length) {
+    return {
+      action: "multi",
+      revert: revert || null,
+      applies,
+      ask: unresolved.length
+        ? `No pude resolver: ${unresolved.map((u) => `**${u}**`).join(", ")}. ¿Me confirmas la etiqueta exacta?`
+        : undefined,
+    };
+  }
+
+  if (unresolved.length) {
+    return {
+      action: "ask_fix_etiqueta",
+      last: lastChange || null,
+      hint: unresolved[0],
+    };
+  }
+
+  if (globalRevert && !lastChange) {
+    return { action: "ask_fix_etiqueta", last: null, hint: "" };
+  }
+
+  return { action: "pass_to_llm" };
+}
+
+/** Compat: delega al plan multi genérico. */
+function detectRecordMutationPlan(
+  userText: string,
+  inventory: InventarioRow[],
+  lastChange: ChatFieldChange | null | undefined,
+): RecordMutationPlan | undefined {
+  return detectMultiRecordMutationPlan(userText, inventory, lastChange);
 }
 
 function resolvePersonFocus(
@@ -3026,6 +3980,18 @@ function detectPersonTotalAsk(
   if (!user) return undefined;
   if (parseEtiquetaListAsk(userText) != null) return undefined;
   if (userAskedQr(userText)) return undefined;
+  const turn = analyzeTurnQuick(userText, inventory);
+  if (turn.isWriteTurn || turn.discourseOnly || looksLikeRecordMutationAsk(userText)) {
+    return undefined;
+  }
+  // Persona solo si el clasificador vio consulta de persona o un nombre real del catálogo.
+  if (
+    turn.primaryAction !== "query_person" &&
+    !turn.personas.length &&
+    !/\b(persona|personas|quien|quienes)\b/.test(turn.normalized)
+  ) {
+    return undefined;
+  }
   const wantsPersonView =
     intentHas(
       user,
@@ -3245,6 +4211,27 @@ const INTENT_ALIAS: Record<string, string> = {
   codgio: "codigo",
   activso: "activos",
   inactivso: "inactivos",
+  cmabialo: "cambia",
+  cmabiaro: "cambia",
+  cambialo: "cambia",
+  cambiala: "cambia",
+  crrigelo: "corrige",
+  crrigeló: "corrige",
+  corrigelo: "corrige",
+  corrigela: "corrige",
+  corrijelo: "corrige",
+  arrgelada: "arreglada",
+  arrgelado: "arreglado",
+  arregada: "arreglada",
+  reparada: "reparada",
+  // No convertir “perdón/perdon” → persona (revuelve overview de personas).
+  perdon: "perdon",
+  perdón: "perdon",
+  eja: "deja",
+  ejalo: "dejalo",
+  dejal: "deja",
+  dejalo: "dejalo",
+  dejala: "dejala",
   ensename: "muestra",
   ensenarme: "muestra",
   muestrame: "muestra",
@@ -3269,8 +4256,42 @@ const INTENT_ALIAS: Record<string, string> = {
 const INTENT_CANONICAL_SET = new Set<string>(INTENT_CANONICAL as readonly string[]);
 const normalizeIntentCache = new Map<string, string>();
 
+/** Muletillas: nunca “corregir” a persona/área/registro por distancia. */
+const INTENT_DISCOURSE_LOCK = new Set([
+  "perdon",
+  "perdona",
+  "perdoname",
+  "disculpa",
+  "disculpe",
+  "gracias",
+  "hola",
+  "hey",
+  "ok",
+  "okay",
+  "vale",
+  "bueno",
+  "bien",
+  "claro",
+  "listo",
+  "ahora",
+  "entonces",
+  "pues",
+  "mira",
+  "favor",
+  "por",
+  "que",
+  "te",
+  "me",
+  "lo",
+  "la",
+  "de",
+  "dije",
+  "dicho",
+]);
+
 function correctIntentToken(token: string) {
   if (!token) return token;
+  if (INTENT_DISCOURSE_LOCK.has(token)) return token;
   if (INTENT_ALIAS[token]) return INTENT_ALIAS[token];
   if (INTENT_CANONICAL_SET.has(token)) return token;
   const budget = typoBudget(token);
@@ -3278,6 +4299,10 @@ function correctIntentToken(token: string) {
   let best = token;
   let bestDist = Infinity;
   for (const canon of intentCandidatesFor(token)) {
+    // No mapear muletillas hacia entidades de dominio.
+    if (canon === "persona" || canon === "personas" || canon === "area" || canon === "areas") {
+      if (token.length <= 7 && !token.startsWith(canon.slice(0, 3))) continue;
+    }
     const dist = levenshtein(token, canon);
     if (dist < bestDist && dist <= budget) {
       bestDist = dist;
@@ -3286,6 +4311,36 @@ function correctIntentToken(token: string) {
     }
   }
   return best;
+}
+
+function analyzeTurnQuick(
+  userText: string,
+  inventory: InventarioRow[] = [],
+): ChatTurnAnalysis {
+  const personNames = inventory.length
+    ? [
+        ...new Set(
+          inventory
+            .map((r) => String(r.persona ?? "").trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  const areaNames = inventory.length
+    ? [
+        ...new Set(
+          inventory
+            .map((r) => String(r.area ?? "").trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  return analyzeChatTurn({
+    text: userText,
+    inventory,
+    personNames,
+    areaNames,
+  });
 }
 
 /** Normaliza + corrige typos de intención (áreas, personas, inventario…). */
@@ -3323,6 +4378,7 @@ function detectAreaTotalAsk(
 ): string | undefined {
   const user = normalizeChatIntent(userText);
   if (!user) return undefined;
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
   // "todas las areas" es ranking, no total de una.
   if (
     intentHas(user, "todas", "todos") &&
@@ -3395,7 +4451,7 @@ function isExploratoryChatAsk(userText: string) {
   if (!n) return true;
   if (isNonConcreteChatAsk(userText)) return true;
   if (
-    /\b(que se puede|que puedes|que puedo|que hacemos|que hay para|que hay de nuevo|el dia de hoy|para que sirves|como te uso|como funciona|en que me ayudas|opciones|gustaria saber|quisiera saber|me ayudas)\b/.test(
+    /\b(que se puede|que puedes|que puedo|que hacemos|que hay para|que hay de nuevo|el dia de hoy|para que sirves|como te uso|como funciona|en que me ayudas|opciones|gustaria saber|quisiera saber|me ayudas|ideas?\s+(de\s+)?consultas?)\b/.test(
       n,
     )
   ) {
@@ -3627,6 +4683,9 @@ function resolveRecordRowsFromPrompt(
 
   const rows: InventarioRow[] = [];
   const seen = new Set<string>();
+  const explicitInternalId = /\b(id\s*interno|id\s*#|primary\s*key)\b/i.test(
+    `${userText}\n${botText}`,
+  );
   for (const tag of tags) {
     if (rows.length >= max) break;
     const needle = String(tag || "")
@@ -3650,7 +4709,9 @@ function resolveRecordRowsFromPrompt(
       }
       continue;
     }
-    if (/^\d+$/.test(needle)) {
+    // Solo caer a id interno si lo pidieron explícito o el número es largo
+    // y no parece una etiqueta parcial. Evita OF-0026 → id 26.
+    if (/^\d+$/.test(needle) && (explicitInternalId || needle.length >= 4)) {
       const id = Number(needle);
       const byId = inventory.find((row) => Number(row.id) === id);
       if (byId) {
@@ -3715,6 +4776,7 @@ function shouldAttachSidePanel(
   if (userAskedQr(userText)) return true;
   if (parseEtiquetaListAsk(userText) != null) return true;
   if (detectMarcasAreaAsk(userText, inventory)) return true;
+  if (detectRecentRecordsAsk(userText)) return true;
   if (
     looksLikeResultAnaphora(userText) &&
     (/\betiquet/.test(normalizeChatIntent(userText)) ||
@@ -3776,6 +4838,7 @@ function detectAreaPersonasAsk(
 } | undefined {
   const n = normalizeChatIntent(userText);
   if (!n || !inventory.length) return undefined;
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
   if (
     !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
   ) {
@@ -3935,6 +4998,7 @@ function detectOrigenPersonasAsk(
 ): string | undefined {
   const n = normalizeChatIntent(userText);
   if (!n || !inventory.length) return undefined;
+  if (looksLikeRecordMutationAsk(userText)) return undefined;
   if (
     !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
   ) {
@@ -4086,18 +5150,95 @@ function buildUnspecifiedAreaAskReply(inventory: InventarioRow[]) {
   );
 }
 
+/** Foco del panel según la petición: Inventario 3, Tickets, todo el inventario… */
+function resolveOverviewFocus(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  const origens = listExistingOrigens(inventory);
+  const origen = matchOrigenFromPrompt(userText, origens);
+  if (origen) return origen;
+  const typoInv = n.match(
+    /\b(?:al)?inventari[oa]?s?\s*(\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b/,
+  );
+  if (typoInv) {
+    const wordMap: Record<string, number> = {
+      uno: 1,
+      una: 1,
+      dos: 2,
+      tres: 3,
+      cuatro: 4,
+      cinco: 5,
+      seis: 6,
+      siete: 7,
+      ocho: 8,
+      nueve: 9,
+      diez: 10,
+    };
+    const raw = typoInv[1];
+    const num = /^\d+$/.test(raw) ? Number(raw) : wordMap[raw];
+    if (num && num > 0) {
+      const hit = origens.find((o) => {
+        const m = String(o).match(/(\d+)/);
+        return m && Number(m[1]) === num;
+      });
+      return hit || `Inventario ${num}`;
+    }
+  }
+  // Área concreta: “totales de tickets”, “panorama de contabilidad”
+  const area = matchAreaFromPrompt(userText, inventory);
+  if (area) return area;
+  const areas = getAllAreaCatalog(inventory);
+  for (const a of areas) {
+    const an = normalizeChatIntent(a.name);
+    if (an.length >= 3 && n.includes(an)) return a.name;
+  }
+  if (
+    /\b(todo|toda|todos|todas|completo|completa|general)\b/.test(n) &&
+    /\b(inventario|inventarios|registros)\b/.test(n)
+  ) {
+    return "Todo el inventario";
+  }
+  return undefined;
+}
+
+function filterInventoryByOverviewFocus(
+  inventory: InventarioRow[],
+  focus: string | undefined,
+): InventarioRow[] {
+  const label = String(focus || "").trim();
+  if (!label || /^(todo el inventario|en el inventario)$/i.test(label)) {
+    return inventory;
+  }
+  const fold = normalizeChatIntent(label);
+  const byOrigen = inventory.filter(
+    (row) => normalizeChatIntent(String(row.origen ?? "")) === fold,
+  );
+  if (byOrigen.length) return byOrigen;
+  const byArea = inventory.filter(
+    (row) => normalizeChatIntent(String(row.area ?? "")) === fold,
+  );
+  if (byArea.length) return byArea;
+  return inventory;
+}
+
 /** Respuestas locales exactas para overview (áreas, totales, etc.). */
 function buildLocalOverviewReply(
   overview: ViewerOverview,
   inventory: InventarioRow[],
+  focusLabel?: string,
+  userText?: string,
 ): string | null {
   if (!inventory.length) return null;
-  const total = inventory.length;
+  const scoped = filterInventoryByOverviewFocus(inventory, focusLabel);
+  const total = scoped.length;
   const areaCounts = new Map<string, number>();
   const personCounts = new Map<string, number>();
   const marcaCounts = new Map<string, number>();
   let activos = 0;
-  for (const row of inventory) {
+  for (const row of scoped) {
     const area = String(row.area ?? "").trim() || "Sin área";
     areaCounts.set(area, (areaCounts.get(area) || 0) + 1);
     const persona = String(row.persona ?? "").trim();
@@ -4113,6 +5254,14 @@ function buildLocalOverviewReply(
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
   const fmt = (n: number) => n.toLocaleString("es-MX");
+  const focus = String(focusLabel || "").trim();
+  const ask = normalizeChatIntent(userText || "");
+  const wantsPanorama = /\b(panorama|resumen|dashboard)\b/.test(ask);
+  const scopeTitle = focus
+    ? focus
+    : wantsPanorama
+      ? "Inventario general"
+      : "Inventario general";
 
   if (overview === "areas") {
     const topProse =
@@ -4128,7 +5277,7 @@ function buildLocalOverviewReply(
               )
               .join(", ")} y **${topAreas[topAreas.length - 1][0]}** (${fmt(topAreas[topAreas.length - 1][1])}).`;
     return (
-      `Este inventario tiene **${fmt(areaCounts.size)}** área` +
+      `En **${scopeTitle}** hay **${fmt(areaCounts.size)}** área` +
       `${areaCounts.size === 1 ? "" : "s"} distintas ` +
       `(**${fmt(total)}** registros en total).` +
       topProse +
@@ -4144,8 +5293,13 @@ function buildLocalOverviewReply(
             .map(([a, c]) => `**${a}** (${fmt(c)})`)
             .join(", ")}.`
         : "";
+    const lead = wantsPanorama
+      ? `Panorama de **${scopeTitle}**`
+      : overview === "stats"
+        ? `Totales de **${scopeTitle}**`
+        : `**${scopeTitle}**`;
     return (
-      `Inventario general: **${fmt(total)}** registros, ` +
+      `${lead}: **${fmt(total)}** registros, ` +
       `**${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} y ` +
       `**${fmt(areaCounts.size)}** área${areaCounts.size === 1 ? "" : "s"}. ` +
       `Hay **${fmt(activos)}** activos y **${fmt(inactivos)}** inactivos.` +
@@ -4156,7 +5310,7 @@ function buildLocalOverviewReply(
 
   if (overview === "personas") {
     return (
-      `Hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
+      `En **${scopeTitle}** hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
       `con equipo asignado (**${fmt(total)}** registros). ` +
       `Dime un nombre para ver su inventario, o pide «dame las personas» para el ranking.`
     );
@@ -4165,7 +5319,7 @@ function buildLocalOverviewReply(
   if (overview === "estado") {
     const pct = total ? Math.round((activos / total) * 100) : 0;
     return (
-      `Salud del inventario (**${fmt(total)}** registros): ` +
+      `Salud de **${scopeTitle}** (**${fmt(total)}** registros): ` +
       `**${fmt(activos)}** activos (${pct}%) y **${fmt(inactivos)}** inactivos. ` +
       `¿Quieres listar los inactivos o revisar un área?`
     );
@@ -4174,17 +5328,15 @@ function buildLocalOverviewReply(
   if (overview === "marcas") {
     return (
       `Hay **${fmt(marcaCounts.size)}** marca${marcaCounts.size === 1 ? "" : "s"} ` +
-      `registradas en el inventario.\n\n` +
+      `registradas en **${scopeTitle}**.\n\n` +
       `Puedo mostrarte el top de marcas o filtrar por una concreta.`
     );
   }
 
   if (overview === "recent") {
-    return (
-      `Puedo mostrarte los **últimos registros** del inventario.\n\n` +
-      `Di «dame los últimos registros» para verlos en el visor, ` +
-      `o indica un área/persona si quieres acotar.`
-    );
+    const ask = { limit: 10, soloHoy: false };
+    const rows = getRecentInventoryRows(scoped, ask.limit, ask.soloHoy);
+    return buildRecentRecordsReply(rows, ask);
   }
 
   return null;
@@ -4194,6 +5346,20 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
   // Solo incidencia visual/contable (estilo Google): no en cada mensaje.
   const user = normalizeChatIntent(userText);
   if (!user || /^(hola|buenas|hey|hi|hello)\b/.test(user)) return undefined;
+  // Atajos del home (sin nombres inventados tipo “Juan Pérez”).
+  if (/^(busqueda|buscar)\s+por\s+personas?$/.test(user)) return "personas";
+  if (/^(equipos?|articulos?|registros?)\s+por\s+areas?$/.test(user)) return "areas";
+  const turn = analyzeTurnQuick(userText);
+  // Escritura / corrección / muletillas: nunca ranking personas/áreas/estado.
+  if (turn.isWriteTurn || turn.discourseOnly || looksLikeRecordMutationAsk(userText)) {
+    return undefined;
+  }
+  if (!turn.isCatalogQuery && turn.primaryAction === "unknown") {
+    // Sin verbo de consulta de catálogo, no inventar overview.
+    if (!/\b(dame|muestra|ver|lista|cuant|ranking|todas|todos|resumen|total|busqueda|buscar|equipos|ultimos)\b/.test(user)) {
+      return undefined;
+    }
+  }
 
   // "cuántos tiene GARCIA…" → lista de esa persona, no overview global.
   const stop = new Set([
@@ -4263,11 +5429,7 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
     "ensenar",
   );
 
-  if (
-    intentHas(user, "recientes", "reciente") ||
-    (intentHas(user, "ultimos", "ultimo") &&
-      intentHas(user, "registros", "registro", "articulos", "articulo"))
-  ) {
+  if (detectRecentRecordsAsk(userText)) {
     return "recent";
   }
 
@@ -4304,13 +5466,16 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
     !asksSpecificOwner &&
     intentHas(user, "personas", "persona") &&
     (askVerb ||
-      intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
+      intentHas(user, "top", "desglose", "cuantas", "cuantos", "todas", "todos", "ranking") ||
+      /\bpor\s+personas?\b/.test(user) ||
       /^(personas?|por\s+personas?)$/.test(user))
   ) {
     // "personas del inventario 1" lo resuelve el detector de origen, no el ranking.
     if (/\binventarios?\s*\d+\b/.test(user) || /\binventario\b/.test(user)) {
       return undefined;
     }
+    // “perdón…” u otras frases no son ranking de personas.
+    if (/\bperdon\b/.test(user)) return undefined;
     return "personas";
   }
 
@@ -4383,6 +5548,110 @@ function extractEtiquetasFromText(text: string): string[] {
     push(match[1]);
   }
   return tags;
+}
+
+/**
+ * “la etiqueta 283586 de qué inventario venía / antes / origen”.
+ */
+function detectEtiquetaOrigenAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): { etiqueta: string; rows: InventarioRow[] } | undefined {
+  if (!inventory.length) return undefined;
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  const asksOrigen =
+    /\b(origen|fuente|venia|vino|antes|de donde|de que inventario|que inventario|cual inventario|en que inventario)\b/.test(
+      n,
+    ) ||
+    (/\binventari/.test(n) &&
+      /\b(antes|venia|vino|origen|fuente|o del|o de)\b/.test(n));
+  if (!asksOrigen) return undefined;
+
+  let tags = extractEtiquetasFromText(userText);
+  if (!tags.length) {
+    const bare = userText.match(/\b(\d{4,12})\b/);
+    if (bare && /\betiqueta/.test(n)) tags = [bare[1]];
+  }
+  if (!tags.length) return undefined;
+
+  const etiqueta = tags[0];
+  const key = etiqueta.toLowerCase();
+  const rows = inventory.filter(
+    (row) => String(row.etiqueta ?? "").trim().toLowerCase() === key,
+  );
+  if (!rows.length) {
+    return { etiqueta, rows: [] };
+  }
+  return { etiqueta, rows };
+}
+
+function buildEtiquetaOrigenReply(
+  ask: { etiqueta: string; rows: InventarioRow[] },
+  catalog: InventarioRow[],
+): string {
+  if (!ask.rows.length) {
+    return (
+      `No encontré la etiqueta **${ask.etiqueta}** en el inventario. ` +
+      `¿Quieres que busque otra etiqueta o un Inventario N concreto?`
+    );
+  }
+
+  const byOrigen = new Map<string, InventarioRow>();
+  for (const row of ask.rows) {
+    const origen = String(row.origen ?? "").trim() || "Sin origen";
+    if (!byOrigen.has(origen)) byOrigen.set(origen, row);
+  }
+  const entries = [...byOrigen.entries()].sort(
+    (a, b) => origenCurrencyRank(a[0]) - origenCurrencyRank(b[0]),
+  );
+  const sample = ask.rows[0];
+  const art = String(sample.articulo ?? "").trim() || "—";
+  const invNums = entries
+    .map(([o]) => {
+      const m = o.match(/\binventario\s*(\d+)\b/i);
+      return m ? Number(m[1]) : null;
+    })
+    .filter((n): n is number => n != null);
+  const oldestInv = invNums.length ? Math.min(...invNums) : null;
+  const newestInv = invNums.length ? Math.max(...invNums) : null;
+
+  const lines = entries.map(([origen]) => {
+    const num = origen.match(/\binventario\s*(\d+)\b/i);
+    const n = num ? Number(num[1]) : null;
+    let role = "ficha en este conteo";
+    if (n != null && oldestInv != null && newestInv != null && oldestInv !== newestInv) {
+      if (n === oldestInv) role = "origen / venía de aquí";
+      else if (n === newestInv)
+        role = `también en este conteo (copiada desde Inventario ${oldestInv})`;
+      else role = "también aparece aquí";
+    } else if (!num) {
+      const fuente = resolveFuenteOrigen(
+        byOrigen.get(origen) || sample,
+        catalog,
+      );
+      if (fuente && fuente.trim().toLowerCase() !== origen.trim().toLowerCase()) {
+        role = `fuente de datos: ${fuente}`;
+      }
+    }
+    return `• **${origen}** — ${role}`;
+  });
+
+  const beforeNote =
+    oldestInv != null && newestInv != null && oldestInv !== newestInv
+      ? `\n\nResumen: la etiqueta **${ask.etiqueta}** venía de **Inventario ${oldestInv}**; ` +
+        `en **Inventario ${newestInv}** es la misma etiqueta (no es otra pieza). ` +
+        `En el panel derecho ves **una ficha por inventario**.`
+      : entries.length === 1
+        ? `\n\nSolo la veo en **${entries[0][0]}** (no aparece en otro Inventario N).`
+        : `\n\nEn el panel derecho ves **una ficha por origen**.`;
+
+  return (
+    `La etiqueta **${ask.etiqueta}** (**${art}**) tiene **${entries.length}** ficha` +
+    `${entries.length === 1 ? "" : "s"}:\n` +
+    lines.join("\n") +
+    beforeNote
+  );
 }
 
 function buildQrSideFromRows(rows: InventarioRow[]): {
@@ -5328,15 +6597,18 @@ const InventoryTableRow = memo(function InventoryTableRow({
   isChecked,
   onToggle,
   onOpen,
+  catalogItems,
 }: {
   row: InventarioRow;
   selectMode: boolean;
   isChecked: boolean;
   onToggle: (id: number) => void;
   onOpen: (row: InventarioRow) => void;
+  catalogItems: InventarioRow[];
 }) {
   const rowId = Number(row.id);
   const hasId = Number.isFinite(rowId);
+  const origenLabel = displayOrigenLabel(row, catalogItems);
 
   return (
     <tr
@@ -5370,10 +6642,11 @@ const InventoryTableRow = memo(function InventoryTableRow({
             key === "modelo" ||
             key === "serie" ||
             key === "area" ||
-            key === "persona" ||
-            key === "origen"
+            key === "persona"
               ? textOf(row[key]) || undefined
-              : undefined
+              : key === "origen"
+                ? origenLabel || undefined
+                : undefined
           }
         >
           {key === "etiqueta" && selectMode ? (
@@ -5409,6 +6682,8 @@ const InventoryTableRow = memo(function InventoryTableRow({
             >
               {estadoLabel(row.estado)}
             </span>
+          ) : key === "origen" ? (
+            origenLabel || "—"
           ) : (
             textOf(row[key]) || "—"
           )}
@@ -5910,6 +7185,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [peopleOrigenFilter, setPeopleOrigenFilter] = useState("ALL");
   const [peopleSearch, setPeopleSearch] = useState("");
   const [debouncedPeopleSearch, setDebouncedPeopleSearch] = useState("");
+  const [areaSearch, setAreaSearch] = useState("");
+  const [debouncedAreaSearch, setDebouncedAreaSearch] = useState("");
+  const [estadoSearch, setEstadoSearch] = useState("");
+  const [debouncedEstadoSearch, setDebouncedEstadoSearch] = useState("");
   const [rail, setRail] = useState("inventario");
   const [railReady, setRailReady] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
@@ -5934,6 +7213,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [pendingFieldRevert, setPendingFieldRevert] = useState<ChatFieldChange | null>(
     null,
   );
+  const [pendingFieldApply, setPendingFieldApply] = useState<ChatFieldChange[]>(
+    [],
+  );
   const [pendingBulkTransfer, setPendingBulkTransfer] =
     useState<PendingBulkTransfer | null>(null);
   const [pendingChatDeleteRow, setPendingChatDeleteRow] =
@@ -5955,11 +7237,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     keyFingerprint: string;
     budget: number;
   }>({
-    provider: "nvidia",
-    providerLabel: "NVIDIA NIM",
-    model: "nvidia/nemotron-3.5-bolt-e4b",
+    provider: "deepseek",
+    providerLabel: "DeepSeek",
+    model: "deepseek-chat",
     keyFingerprint: "default",
-    budget: 128_000,
+    budget: 64_000,
   });
   const [tokenPopoverOpen, setTokenPopoverOpen] = useState(false);
   const tokenMeterWrapRef = useRef<HTMLDivElement>(null);
@@ -5978,8 +7260,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const chatRequestGenRef = useRef(0);
   const pendingChatImportRef = useRef<NewInventarioItem[] | null>(null);
   const pendingFieldRevertRef = useRef<ChatFieldChange | null>(null);
+  const pendingFieldApplyRef = useRef<ChatFieldChange[]>([]);
+  const pendingFixContextRef = useRef<PendingFixContext | null>(null);
   const pendingBulkTransferRef = useRef<PendingBulkTransfer | null>(null);
   const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
+  const pendingNewInventarioRef = useRef<PendingNewInventario | null>(null);
   /** Último listado concreto (aunque el visor no se haya abierto) para follow-ups tipo "no se ven". */
   const lastConcreteSideRef = useRef<{
     resultItems: ChatApiItem[];
@@ -6073,7 +7358,50 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     let alive = true;
     void fetchChatHealth().then((llm) => {
       if (!alive || !llm) return;
-      const modelsList = Array.isArray(llm.available_models) ? llm.available_models : [];
+      const fromCatalog = Array.isArray(llm.available_models)
+        ? llm.available_models
+        : [];
+      // Compat: backends viejos solo mandan providers[] sin available_models.
+      const fromProviders: ChatModelOption[] =
+        fromCatalog.length > 0
+          ? []
+          : (llm.providers || []).flatMap((prov, provIdx) => {
+              const provider = String(prov.name || "").trim() || "llm";
+              const label =
+                String(prov.label || "").trim() || provider.toUpperCase();
+              const fp = String(prov.key_fingerprint || "default");
+              const budget =
+                Number(prov.token_budget) > 0
+                  ? Number(prov.token_budget)
+                  : 64_000;
+              return (prov.models || []).map((modelId, modelIdx) => {
+                const id = String(modelId || "").trim();
+                if (!id) return null;
+                const short = id.includes("/") ? id.split("/").pop() || id : id;
+                return {
+                  id,
+                  label: short,
+                  badge:
+                    provIdx === 0 && modelIdx === 0
+                      ? "Mejor · Por defecto"
+                      : label,
+                  provider,
+                  provider_label: label,
+                  key_fingerprint: fp,
+                  token_budget: budget,
+                  recommended: provIdx === 0 && modelIdx === 0,
+                } satisfies ChatModelOption;
+              });
+            }).filter(Boolean) as ChatModelOption[];
+      const modelsList = (fromCatalog.length ? fromCatalog : fromProviders).map(
+        (m) => ({
+          ...m,
+          token_budget: normalizeModelTokenBudget(
+            m.token_budget,
+            normalizeModelTokenBudget(llm.token_budget, 64_000),
+          ),
+        }),
+      );
       if (modelsList.length) {
         setAvailableModels(modelsList);
       }
@@ -6092,7 +7420,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const chosen = matchedSaved || bestDefault;
 
       const provider = String(
-        chosen?.provider || llm.active_provider || llm.providers?.[0]?.name || "nvidia",
+        chosen?.provider || llm.active_provider || llm.providers?.[0]?.name || "deepseek",
       );
       const providerLabel = String(
         chosen?.provider_label ||
@@ -6106,20 +7434,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           llm.active_model ||
           llm.preferred_model ||
           llm.providers?.[0]?.models?.[0] ||
-          "nvidia/nemotron-3.5-bolt-e4b",
+          "deepseek-chat",
       );
-      const budget = Number(
-        chosen?.token_budget ||
-          llm.token_budget ||
-          llm.providers?.[0]?.token_budget ||
-          128_000,
+      const budget = normalizeModelTokenBudget(
+        chosen?.token_budget ??
+          llm.token_budget ??
+          llm.providers?.[0]?.token_budget,
+        64_000,
       );
       setActiveLlmMeta({
         provider,
         providerLabel,
         model,
         keyFingerprint: String(chosen?.key_fingerprint || keyFingerprint),
-        budget: Number.isFinite(budget) && budget > 0 ? budget : 128_000,
+        budget,
       });
     });
     return () => {
@@ -6134,10 +7462,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       providerLabel: option.provider_label || option.provider.toUpperCase(),
       model: option.id,
       keyFingerprint: option.key_fingerprint,
-      budget:
-        Number.isFinite(option.token_budget) && option.token_budget > 0
-          ? option.token_budget
-          : 128_000,
+      budget: normalizeModelTokenBudget(option.token_budget, 64_000),
     });
   }, []);
 
@@ -6161,15 +7486,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
   const recordTokenConsumption = useCallback(
     (usage?: ChatTokenUsage | null, fallbackPrompt = "", fallbackReply = "") => {
-      const provider = String(usage?.provider || activeLlmMeta.provider || "nvidia");
-      const model = String(usage?.model || activeLlmMeta.model || "nvidia/nemotron-3.5-bolt-e4b");
+      const provider = String(usage?.provider || activeLlmMeta.provider || "deepseek");
+      const model = String(usage?.model || activeLlmMeta.model || "deepseek-chat");
       const keyFingerprint = String(
         usage?.key_fingerprint || activeLlmMeta.keyFingerprint || "default",
       );
-      const budget =
-        Number(usage?.token_budget) > 0
-          ? Number(usage?.token_budget)
-          : activeLlmMeta.budget || 128_000;
+      const budget = normalizeModelTokenBudget(
+        usage?.token_budget ?? activeLlmMeta.budget,
+        64_000,
+      );
       const promptTokens =
         usage && typeof usage.prompt_tokens === "number"
           ? usage.prompt_tokens
@@ -6222,7 +7547,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const stored = tokenMeters[meterId];
     const draftTokens = draft.trim() ? estimateTextTokens(draft) : 0;
     const baseUsed = stored?.used || 0;
-    const budget = stored?.budget || activeLlmMeta.budget || 128_000;
+    const budget = normalizeModelTokenBudget(
+      stored?.budget ?? activeLlmMeta.budget,
+      64_000,
+    );
     const totalUsed = Math.min(budget, baseUsed + draftTokens);
     const remaining = Math.max(0, budget - totalUsed);
     const pctUsed = Math.min(100, Math.max(0, (totalUsed / Math.max(1, budget)) * 100));
@@ -6298,6 +7626,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     }, 200);
     return () => window.clearTimeout(id);
   }, [peopleSearch]);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      startTransition(() => setDebouncedAreaSearch(areaSearch));
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [areaSearch]);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      startTransition(() => setDebouncedEstadoSearch(estadoSearch));
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [estadoSearch]);
 
   // Índice estable por `items`: no se reconstruye al cambiar de apartado
   const searchIndex = useMemo(() => buildSearchIndex(items), [items]);
@@ -6540,6 +7882,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     () => prepareSearch(debouncedPeopleSearch),
     [debouncedPeopleSearch],
   );
+  const preparedAreaSearch = useMemo(
+    () => prepareSearch(debouncedAreaSearch),
+    [debouncedAreaSearch],
+  );
+  const preparedEstadoSearch = useMemo(
+    () => prepareSearch(debouncedEstadoSearch),
+    [debouncedEstadoSearch],
+  );
   const preparedTopQuery = useMemo(() => prepareSearch(debouncedQuery), [debouncedQuery]);
   const preparedInventarioSearch = useMemo(
     () => prepareSearch(debouncedInventarioSearch),
@@ -6587,6 +7937,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       });
   }, [rail, personFolders, peopleAreaFilter, peopleOrigenFilter, preparedPeopleSearch, searchIndex]);
 
+  const visibleAreaFolders = useMemo(() => {
+    if (rail !== "areas") return areaFolders;
+
+    const groups = new Map<string, { id: string; name: string; rows: InventarioRow[] }>();
+    for (const entry of searchIndex) {
+      const row = entry.row;
+      if (preparedAreaSearch && !indexMatchesPrepared(entry, preparedAreaSearch)) continue;
+      const area = textOf(row.area);
+      const id = area || "sin-area";
+      const name = area || "Sin área";
+      const bucket = groups.get(id);
+      if (bucket) bucket.rows.push(row);
+      else groups.set(id, { id, name, rows: [row] });
+    }
+
+    return [...groups.values()]
+      .map((folder) => ({ ...folder, people: [] as string[] }))
+      .sort((a, b) => a.name.localeCompare(b.name, "es"));
+  }, [rail, areaFolders, preparedAreaSearch, searchIndex]);
+
   const inventarioOptions = useMemo(() => {
     if (rail !== "inventario") return [] as string[];
     return [
@@ -6630,35 +8000,46 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       );
     }
 
-    const selected = folders.find((folder) => folder.id === selectedId);
+    if (rail === "areas") {
+      const selected = visibleAreaFolders.find((folder) => folder.id === selectedId);
+      let base = selected
+        ? selected.rows
+        : visibleAreaFolders.flatMap((folder) => folder.rows);
+      if (preparedTopQuery) {
+        base = base.filter((row) => rowMatchesIndex(row, preparedTopQuery));
+      }
+      return [...base].sort(
+        (a, b) =>
+          textOf(a.area).localeCompare(textOf(b.area), "es") ||
+          textOf(a.etiqueta).localeCompare(textOf(b.etiqueta), "es"),
+      );
+    }
+
     let scoped = items;
     if (rail === "inventario" && selectedInventarios.length > 0) {
       const selectedSet = new Set(selectedInventarios);
       scoped = items.filter((row) => selectedSet.has(textOf(row.origen)));
     }
-    let base = selected
-      ? selected.rows.filter((row) => {
-          if (rail === "inventario" && selectedInventarios.length > 0) {
-            return selectedInventarios.includes(textOf(row.origen));
-          }
-          return true;
-        })
-      : scoped;
+    let base = scoped;
     if (rail === "inventario" && preparedInventarioSearch) {
       base = base.filter((row) => rowMatchesIndex(row, preparedInventarioSearch));
+    }
+    if (rail === "estado" && preparedEstadoSearch) {
+      base = base.filter((row) => rowMatchesIndex(row, preparedEstadoSearch));
     }
     if (preparedTopQuery) {
       base = base.filter((row) => rowMatchesIndex(row, preparedTopQuery));
     }
     return base;
   }, [
-    folders,
     preparedTopQuery,
     preparedInventarioSearch,
+    preparedEstadoSearch,
     rail,
     items,
     selectedId,
     visiblePersonFolders,
+    visibleAreaFolders,
     selectedInventarios,
     needsTableData,
     searchIndexById,
@@ -6678,6 +8059,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     peopleAreaFilter,
     peopleOrigenFilter,
     debouncedPeopleSearch,
+    debouncedAreaSearch,
+    debouncedEstadoSearch,
   ]);
 
   useEffect(() => {
@@ -7059,19 +8442,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       ) {
         const overview = detectViewerOverview(userText);
         if (overview) {
+          const focus = resolveOverviewFocus(userText, items);
           changed = true;
           lastSide = {
             resultItems: [],
             qr: [],
             viewerOverview: overview,
-            viewerFocus: undefined,
+            viewerFocus: focus,
           };
           return {
             ...message,
             resultItems: [],
             qr: undefined,
             viewerOverview: overview,
-            viewerFocus: undefined,
+            viewerFocus: focus,
           };
         }
       }
@@ -7160,6 +8544,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const setPendingFieldRevertSafe = (change: ChatFieldChange | null) => {
     pendingFieldRevertRef.current = change;
     setPendingFieldRevert(change);
+  };
+
+  const setPendingFieldApplySafe = (
+    change: ChatFieldChange | ChatFieldChange[] | null,
+  ) => {
+    const list = !change ? [] : Array.isArray(change) ? change : [change];
+    pendingFieldApplyRef.current = list;
+    setPendingFieldApply(list);
+  };
+
+  const setPendingFixContextSafe = (ctx: PendingFixContext | null) => {
+    pendingFixContextRef.current = ctx;
   };
 
   const setPendingBulkTransferSafe = (transfer: PendingBulkTransfer | null) => {
@@ -7440,11 +8836,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const runBulkChatImport = async (
       rows: NewInventarioItem[],
       sourceLabel: string,
+      opts?: { destLabel?: string; mode?: "import" | "copy"; etiquetas?: string[] },
     ) => {
       setPendingChatImportSafe(null);
       const saved: InventarioRow[] = [];
       let lastError = "";
       const total = rows.length;
+      const destLabel =
+        String(opts?.destLabel || rows[0]?.origen || "").trim() || null;
+      const progressLabel =
+        destLabel && destLabel !== sourceLabel
+          ? `${sourceLabel} → ${destLabel}`
+          : sourceLabel;
       for (let i = 0; i < rows.length; i += CHAT_IMPORT_CHUNK) {
         if (
           requestGen !== chatRequestGenRef.current ||
@@ -7458,9 +8861,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           m.id === botId
             ? {
                 ...m,
-                text: `Importando “${sourceLabel}”… ${done}/${total}`,
+                text: `Importando “${progressLabel}”… ${done}/${total}`,
                 at: Date.now(),
-                importProgress: { label: sourceLabel, done, total },
+                importProgress: { label: progressLabel, done, total },
               }
             : m,
         );
@@ -7492,24 +8895,37 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const totalAfter = totalBefore + saved.length;
       rememberMutation({
         kind: "import",
-        summary: `Importé ${saved.length} artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”`,
+        summary: `Importé ${saved.length} artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”${
+          destLabel ? ` a ${destLabel}` : ""
+        }`,
         totalBefore,
         totalAfter,
         count: saved.length,
         ids: saved.map((row) => row.id).filter((id): id is number => id != null),
         chatId: sessionId,
-        fact: `Import “${sourceLabel}”: +${saved.length} (antes ${totalBefore} → ahora ${totalAfter})`,
+        fact: `Import “${sourceLabel}”${destLabel ? ` → ${destLabel}` : ""}: +${saved.length} (antes ${totalBefore} → ahora ${totalAfter})`,
       });
       const skipped = total - saved.length;
       const skipNote =
         skipped > 0
           ? `\n${skipped} fila${skipped === 1 ? "" : "s"} no se importaron (duplicados u error).`
           : "";
-      const dest = String(rows[0]?.origen ?? "").trim();
-      const destNote = dest ? ` en **${dest}**` : "";
+      const destNote =
+        destLabel && destLabel !== sourceLabel
+          ? ` hacia **${destLabel}**`
+          : destLabel
+            ? ` en **${destLabel}**`
+            : "";
+      const etqNote =
+        opts?.etiquetas?.length
+          ? opts.etiquetas.map((e) => `**${e}**`).join(", ")
+          : null;
       const finalReply =
-        `Listo: importé **${formatNumber(saved.length)}** artículo${saved.length === 1 ? "" : "s"} desde “${sourceLabel}”${destNote}.\n` +
-        `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}`;
+        opts?.mode === "copy"
+          ? `Listo: copié ${etqNote || `**${formatNumber(saved.length)}** artículo${saved.length === 1 ? "" : "s"}`} desde **${sourceLabel}**${destNote} (con toda su información).\n` +
+            `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}`
+          : `Listo: importé **${formatNumber(saved.length)}** artículo${saved.length === 1 ? "" : "s"} desde **${sourceLabel}**${destNote}.\n` +
+            `Inventario: **${formatNumber(totalBefore)}** → **${formatNumber(totalAfter)}** registros.${skipNote}`;
 
       // Efecto “escribiendo…” al cerrar (el import largo ya gastó la pausa inicial).
       const wrapping = messagesRef.current.map((m) =>
@@ -7539,7 +8955,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         throw new DOMException("Aborted", "AbortError");
       }
 
-      finishBotReply(sessionId, botId, finalReply);
+      finishBotReply(sessionId, botId, finalReply, {
+        resultItems: saved
+          .slice(0, CHAT_SIDE_RESULT_CAP)
+          .map((row) => rowToChatApiItem(row)),
+        qr: [],
+      });
     };
 
     // Confirmar / cancelar traspaso masivo pendiente
@@ -7633,79 +9054,209 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // Confirmar restauración del valor anterior de un campo
+    // Confirmar restauración / corrección pendiente de campo(s)
     const pendingRevert =
       pendingFieldRevertRef.current || pendingFieldRevert;
-    if (pendingRevert && isAffirmativeChat(text)) {
+    let pendingApplyList = (
+      pendingFieldApplyRef.current?.length
+        ? pendingFieldApplyRef.current
+        : pendingFieldApply
+    ) as ChatFieldChange[];
+    const hasPendingEdits = Boolean(pendingRevert) || pendingApplyList.length > 0;
+    if (hasPendingEdits && isNegativeChat(text)) {
+      setPendingFieldRevertSafe(null);
+      setPendingFieldApplySafe(null);
+      setPendingFixContextSafe(null);
+      const cancelReply = "Listo, cancelé la corrección. No toqué ningún registro.";
       try {
-        let targetId = pendingRevert.id != null ? Number(pendingRevert.id) : null;
-        if (targetId == null && pendingRevert.etiqueta) {
-          const row = items.find(
-            (item) =>
-              String(item.etiqueta ?? "")
-                .trim()
-                .toLowerCase() ===
-              String(pendingRevert.etiqueta)
-                .trim()
-                .toLowerCase(),
-          );
-          targetId = row?.id != null ? Number(row.id) : null;
+        await ensureTypingPause(cancelReply);
+        finishBotReply(sessionId, botId, cancelReply);
+      } catch {
+        /* abort */
+      }
+      return;
+    }
+    if (hasPendingEdits && isAffirmativeChat(text)) {
+      try {
+        // “sí y el CF-0026 cámbialo / con activo…” → completa el apply si faltaba
+        const rest = stripLeadingAffirmative(text);
+        if (rest && pendingRevert && pendingApplyList.length === 0) {
+          const restMentions = extractEtiquetaMentions(rest, items);
+          const wrongEtq = String(pendingRevert.etiqueta ?? "")
+            .trim()
+            .toLowerCase();
+          const rawFix =
+            restMentions.find((et) => et.trim().toLowerCase() !== wrongEtq) ||
+            restMentions[0] ||
+            "";
+          const targetRow = rawFix
+            ? resolveEtiquetaAgainstInventory(rawFix, items)
+            : undefined;
+          if (targetRow?.id) {
+            const patches = inferFieldPatchesFromText(rest);
+            const basePatches: InferredFieldPatch[] = patches.length
+              ? patches
+              : [
+                  {
+                    field: pendingRevert.field,
+                    value: pendingRevert.newValue,
+                  },
+                ];
+            pendingApplyList = basePatches.map((p) => {
+              const currentVal = String(
+                (targetRow as Record<string, unknown>)[p.field] ?? "",
+              ).trim();
+              return {
+                at: new Date().toISOString(),
+                id: targetRow.id,
+                etiqueta: String(targetRow.etiqueta ?? rawFix),
+                articulo: String(targetRow.articulo ?? ""),
+                field: p.field,
+                oldValue: currentVal || "(vacío)",
+                newValue: p.value,
+                chatId: sessionId,
+              } satisfies ChatFieldChange;
+            });
+            setPendingFieldApplySafe(pendingApplyList);
+          }
         }
-        if (targetId == null) {
-          setPendingFieldRevertSafe(null);
-          finishBotReply(
-            sessionId,
-            botId,
-            "No pude ubicar el registro para restaurar el valor. Dime la etiqueta exacta.",
-          );
-          return;
-        }
-        const patch: Partial<NewInventarioItem> = {
-          [pendingRevert.field]: pendingRevert.oldValue,
-        } as Partial<NewInventarioItem>;
-        const result = await updateInventarioAction(targetId, patch);
-        setPendingFieldRevertSafe(null);
-        if (!result.success || !result.data) {
-          finishBotReply(
-            sessionId,
-            botId,
-            result.error || "No se pudo restaurar el valor anterior.",
-          );
-          return;
-        }
+
+        const resolveTargetId = (change: ChatFieldChange) => {
+          let targetId = change.id != null ? Number(change.id) : null;
+          if (targetId == null && change.etiqueta) {
+            const row =
+              resolveEtiquetaAgainstInventory(String(change.etiqueta), items) ||
+              items.find(
+                (item) =>
+                  String(item.etiqueta ?? "")
+                    .trim()
+                    .toLowerCase() ===
+                  String(change.etiqueta)
+                    .trim()
+                    .toLowerCase(),
+              );
+            targetId = row?.id != null ? Number(row.id) : null;
+          }
+          return targetId;
+        };
+        const touched: InventarioRow[] = [];
+        const notes: string[] = [];
         const stamp = new Date().toISOString();
-        setItems((prev) =>
-          prev.map((row) =>
-            Number(row.id) === targetId
-              ? { ...row, ...result.data!, updated_at: stamp }
-              : row,
-          ),
-        );
-        rememberFieldChange({
-          id: result.data.id,
-          etiqueta: result.data.etiqueta,
-          articulo: result.data.articulo,
-          field: pendingRevert.field,
-          oldValue: pendingRevert.newValue,
-          newValue: pendingRevert.oldValue,
-          chatId: sessionId,
-        });
-        const label =
-          result.data.etiqueta || String(result.data.id ?? targetId);
+
+        if (pendingRevert) {
+          const targetId = resolveTargetId(pendingRevert);
+          if (targetId == null) {
+            setPendingFieldRevertSafe(null);
+            setPendingFieldApplySafe(null);
+            finishBotReply(
+              sessionId,
+              botId,
+              "No pude ubicar el registro para restaurar el valor. Dime la etiqueta exacta.",
+            );
+            return;
+          }
+          const patch: Partial<NewInventarioItem> = {
+            [pendingRevert.field]: pendingRevert.oldValue,
+          } as Partial<NewInventarioItem>;
+          const result = await updateInventarioAction(targetId, patch);
+          if (!result.success || !result.data) {
+            setPendingFieldRevertSafe(null);
+            setPendingFieldApplySafe(null);
+            finishBotReply(
+              sessionId,
+              botId,
+              result.error || "No se pudo restaurar el valor anterior.",
+            );
+            return;
+          }
+          touched.push(result.data);
+          notes.push(
+            `restauré **${pendingRevert.field}** de “**${pendingRevert.newValue}**” a “**${pendingRevert.oldValue}**” en **${result.data.etiqueta || targetId}**`,
+          );
+          rememberFieldChange({
+            id: result.data.id,
+            etiqueta: result.data.etiqueta,
+            articulo: result.data.articulo,
+            field: pendingRevert.field,
+            oldValue: pendingRevert.newValue,
+            newValue: pendingRevert.oldValue,
+            chatId: sessionId,
+          });
+        }
+
+        for (const pendingApply of pendingApplyList) {
+          const targetId = resolveTargetId(pendingApply);
+          if (targetId == null) {
+            setPendingFieldRevertSafe(null);
+            setPendingFieldApplySafe(null);
+            finishBotReply(
+              sessionId,
+              botId,
+              "Restauré lo anterior, pero no ubiqué la etiqueta a corregir. Dime la etiqueta exacta.",
+            );
+            return;
+          }
+          const patch: Partial<NewInventarioItem> = {
+            [pendingApply.field]: pendingApply.newValue,
+          } as Partial<NewInventarioItem>;
+          const result = await updateInventarioAction(targetId, patch);
+          if (!result.success || !result.data) {
+            setPendingFieldRevertSafe(null);
+            setPendingFieldApplySafe(null);
+            finishBotReply(
+              sessionId,
+              botId,
+              result.error || "No se pudo aplicar la corrección en la etiqueta indicada.",
+            );
+            return;
+          }
+          touched.push(result.data);
+          notes.push(
+            `apliqué **${pendingApply.field}** “**${pendingApply.newValue}**” en **${result.data.etiqueta || targetId}**`,
+          );
+          rememberFieldChange({
+            id: result.data.id,
+            etiqueta: result.data.etiqueta,
+            articulo: result.data.articulo,
+            field: pendingApply.field,
+            oldValue: pendingApply.oldValue,
+            newValue: pendingApply.newValue,
+            chatId: sessionId,
+          });
+        }
+
+        setPendingFieldRevertSafe(null);
+        setPendingFieldApplySafe(null);
+        setPendingFixContextSafe(null);
+        if (touched.length) {
+          const byId = new Map(
+            touched.map((row) => [Number(row.id), row] as const),
+          );
+          setItems((prev) =>
+            prev.map((row) => {
+              const next = byId.get(Number(row.id));
+              return next ? { ...row, ...next, updated_at: stamp } : row;
+            }),
+          );
+        }
         const finalReply =
-          `Listo: restauré **${pendingRevert.field}** de “**${pendingRevert.newValue}**” a “**${pendingRevert.oldValue}**” en **${label}**.`;
+          notes.length === 1
+            ? `Listo: ${notes[0]}.`
+            : `Listo: ${notes.join("; y ")}.`;
         await ensureTypingPause(finalReply);
         finishBotReply(sessionId, botId, finalReply, {
-          resultItems: [rowToChatApiItem(result.data)],
+          resultItems: touched.map((row) => rowToChatApiItem(row)),
           qr: [],
         });
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setPendingFieldRevertSafe(null);
+        setPendingFieldApplySafe(null);
+        setPendingFixContextSafe(null);
         finishBotReply(
           sessionId,
           botId,
-          err instanceof Error ? err.message : "Error al restaurar el valor.",
+          err instanceof Error ? err.message : "Error al restaurar/corregir el valor.",
         );
       }
       return;
@@ -7753,25 +9304,397 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
-    // Pedir restaurar el nombre/valor de antes → propuesta con memoria
-    if (looksLikeRevertPreviousValue(text)) {
+    // Respuesta corta con etiqueta tras “¿cuál es la etiqueta?”
+    {
+      const pendingFix = pendingFixContextRef.current;
+      if (
+        pendingFix &&
+        looksLikeEtiquetaOnlyReply(userText || text)
+      ) {
+        const targetRow =
+          resolveEtiquetaAgainstInventory(String(userText || text).trim(), items) ||
+          items.find(
+            (row) =>
+              String(row.etiqueta ?? "")
+                .trim()
+                .toLowerCase() ===
+              String(userText || text)
+                .trim()
+                .toLowerCase(),
+          );
+        if (!targetRow?.id) {
+          try {
+            const ask = `No encontré **${String(userText || text).trim()}**. ¿Me confirmas la etiqueta exacta?`;
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        const patches =
+          pendingFix.patches.length > 0
+            ? pendingFix.patches
+            : pendingFix.revert
+              ? [
+                  {
+                    field: pendingFix.revert.field,
+                    value: pendingFix.revert.newValue,
+                  },
+                ]
+              : [];
+        if (!patches.length) {
+          setPendingFixContextSafe(null);
+          try {
+            const ask =
+              `Ubiqué **${targetRow.etiqueta}**, pero no tengo el valor a aplicar. ` +
+              `Dime p. ej. «activo» y la observación entre comillas.`;
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask, {
+              resultItems: [rowToChatApiItem(targetRow)],
+              qr: [],
+            });
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        const applyChanges = buildApplyChangesForRow(
+          targetRow,
+          patches,
+          sessionId,
+        );
+        setPendingFieldRevertSafe(pendingFix.revert);
+        setPendingFieldApplySafe(applyChanges);
+        setPendingFixContextSafe(null);
+        const confirmLines = [
+          ...(pendingFix.revert
+            ? [
+                {
+                  etiqueta: pendingFix.revert.etiqueta,
+                  field: pendingFix.revert.field,
+                  oldValue: pendingFix.revert.newValue,
+                  newValue: pendingFix.revert.oldValue,
+                },
+              ]
+            : []),
+          ...applyChanges.map((c) => ({
+            etiqueta: c.etiqueta,
+            field: c.field,
+            oldValue: c.oldValue,
+            newValue: c.newValue,
+          })),
+        ];
+        const proposal =
+          `Perfecto, usaré **${targetRow.etiqueta}**.\n\n` +
+          (buildMutationConfirmReply(confirmLines) || "");
+        try {
+          await ensureTypingPause(proposal);
+          finishBotReply(sessionId, botId, proposal, {
+            resultItems: [
+              ...(pendingFix.revert?.etiqueta
+                ? items
+                    .filter(
+                      (r) =>
+                        String(r.etiqueta ?? "")
+                          .trim()
+                          .toLowerCase() ===
+                        String(pendingFix.revert?.etiqueta)
+                          .trim()
+                          .toLowerCase(),
+                    )
+                    .slice(0, 1)
+                    .map((r) => rowToChatApiItem(r))
+                : []),
+              rowToChatApiItem(targetRow),
+            ],
+            qr: [],
+          });
+        } catch {
+          /* abort */
+        }
+        return;
+      }
+    }
+
+    // Mutaciones / correcciones / revert (cualquier etiqueta o situación)
+    {
       const mem = ensureLastFieldChangeFromMessages(
         messagesRef.current.map((m) => ({
           from: m.from,
           text: m.text || "",
         })),
       );
-      const proposal = buildRevertProposalReply(mem);
-      if (mem.lastFieldChange) {
-        setPendingFieldRevertSafe(mem.lastFieldChange);
+      const plan = detectRecordMutationPlan(
+        userText || text,
+        items,
+        mem.lastFieldChange,
+      );
+      if (plan && plan.action !== "pass_to_llm") {
+        try {
+          if (plan.action === "multi") {
+            const applyChanges: ChatFieldChange[] = [];
+            for (const item of plan.applies) {
+              for (const p of item.patches) {
+                const currentVal = String(
+                  (item.row as Record<string, unknown>)[p.field] ?? "",
+                ).trim();
+                applyChanges.push({
+                  at: new Date().toISOString(),
+                  id: item.row.id,
+                  etiqueta: item.etiqueta,
+                  articulo: String(item.row.articulo ?? ""),
+                  field: p.field,
+                  oldValue: currentVal || "(vacío)",
+                  newValue: p.value,
+                  chatId: sessionId,
+                });
+              }
+            }
+            if (!plan.revert && !applyChanges.length) {
+              const ask =
+                plan.ask ||
+                "Entendí varias peticiones, pero me falta la etiqueta o el valor. ¿Me lo confirmas en una frase?";
+              await ensureTypingPause(ask);
+              finishBotReply(sessionId, botId, ask);
+              return;
+            }
+            setPendingFieldRevertSafe(plan.revert || null);
+            setPendingFieldApplySafe(applyChanges);
+            setPendingFixContextSafe(null);
+            const confirmLines = [
+              ...(plan.revert
+                ? [
+                    {
+                      etiqueta: plan.revert.etiqueta,
+                      field: plan.revert.field,
+                      oldValue: plan.revert.newValue,
+                      newValue: plan.revert.oldValue,
+                    },
+                  ]
+                : []),
+              ...applyChanges.map((c) => ({
+                etiqueta: c.etiqueta,
+                field: c.field,
+                oldValue: c.oldValue,
+                newValue: c.newValue,
+              })),
+            ];
+            const header =
+              confirmLines.length > 1
+                ? `Voy a aplicar **${confirmLines.length}** cambios en una sola pasada:\n\n`
+                : `Voy a aplicar este cambio:\n\n`;
+            const proposal =
+              header +
+              (buildMutationConfirmReply(confirmLines) || "") +
+              (plan.ask ? `\n\n${plan.ask}` : "");
+            await ensureTypingPause(proposal);
+            finishBotReply(sessionId, botId, proposal, {
+              resultItems: [
+                ...(plan.revert?.etiqueta
+                  ? items
+                      .filter(
+                        (r) =>
+                          String(r.etiqueta ?? "")
+                            .trim()
+                            .toLowerCase() ===
+                          String(plan.revert?.etiqueta)
+                            .trim()
+                            .toLowerCase(),
+                      )
+                      .slice(0, 1)
+                      .map((r) => rowToChatApiItem(r))
+                  : []),
+                ...plan.applies.map((a) => rowToChatApiItem(a.row)),
+              ],
+              qr: [],
+            });
+            return;
+          }
+
+          if (plan.action === "ask_fix_etiqueta") {
+            const hintList = String(plan.hint || "")
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => s && !/^(de|el|la|los|las)$/i.test(s));
+            const patchesFromMsg = inferFieldPatchesFromText(userText || text);
+            const patches =
+              patchesFromMsg.length > 0
+                ? patchesFromMsg
+                : plan.last
+                  ? [{ field: plan.last.field, value: plan.last.newValue }]
+                  : [];
+            setPendingFixContextSafe({
+              revert: plan.last || null,
+              patches,
+              askedAt: Date.now(),
+            });
+            const ask =
+              hintList.length > 1
+                ? `Encontré varias etiquetas que coinciden (${hintList
+                    .slice(0, 6)
+                    .map((h) => `**${h}**`)
+                    .join(", ")}). ¿Cuál quieres corregir? Escríbela tal cual.` +
+                  (plan.last
+                    ? ` Mientras, puedo dejar **${plan.last.etiqueta || plan.last.id}** como estaba.`
+                    : "")
+                : plan.last
+                  ? `Claro. Para corregir el registro bueno necesito su **etiqueta** exacta` +
+                    (hintList[0] ? ` (p. ej. **${hintList[0]}**)` : "") +
+                    `. También puedo dejar **${plan.last.etiqueta || plan.last.id}** como estaba. Responde solo con la etiqueta.`
+                  : `Entendido. Dime la **etiqueta** exacta a corregir (solo el código).`;
+            if (plan.last) {
+              setPendingFieldRevertSafe(plan.last);
+              setPendingFieldApplySafe(null);
+            }
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          if (plan.action === "revert_only") {
+            const proposal = buildRevertProposalReply(mem);
+            setPendingFieldRevertSafe(plan.last);
+            setPendingFieldApplySafe(null);
+            await ensureTypingPause(proposal || "");
+            finishBotReply(
+              sessionId,
+              botId,
+              proposal || "No tengo ese cambio en memoria.",
+            );
+            return;
+          }
+
+          if (plan.action === "fix_and_revert") {
+            const { fixEtiqueta, last, patches } = plan;
+            const targetRow =
+              resolveEtiquetaAgainstInventory(fixEtiqueta, items) ||
+              items.find(
+                (row) =>
+                  String(row.etiqueta ?? "")
+                    .trim()
+                    .toLowerCase() === fixEtiqueta.trim().toLowerCase(),
+              );
+            if (!targetRow?.id) {
+              const ask = `No encontré la etiqueta **${fixEtiqueta}** en el inventario. ¿Me confirmas cómo está escrita?`;
+              await ensureTypingPause(ask);
+              finishBotReply(sessionId, botId, ask);
+              return;
+            }
+            const applyPatches: InferredFieldPatch[] = patches?.length
+              ? patches
+              : [{ field: last.field, value: last.newValue }];
+            const applyChanges: ChatFieldChange[] = applyPatches.map((p) => {
+              const currentVal = String(
+                (targetRow as Record<string, unknown>)[p.field] ?? "",
+              ).trim();
+              return {
+                at: new Date().toISOString(),
+                id: targetRow.id,
+                etiqueta: String(targetRow.etiqueta ?? fixEtiqueta),
+                articulo: String(targetRow.articulo ?? ""),
+                field: p.field,
+                oldValue: currentVal || "(vacío)",
+                newValue: p.value,
+                chatId: sessionId,
+              };
+            });
+            setPendingFieldRevertSafe(last);
+            setPendingFieldApplySafe(applyChanges);
+            const wrongLabel = last.etiqueta || String(last.id ?? "registro previo");
+            const proposal =
+              `Voy a deshacer el cambio en **${wrongLabel}** y corregir **${String(targetRow.etiqueta ?? fixEtiqueta)}**.\n\n` +
+              (buildMutationConfirmReply([
+                {
+                  etiqueta: last.etiqueta,
+                  field: last.field,
+                  oldValue: last.newValue,
+                  newValue: last.oldValue,
+                },
+                ...applyChanges.map((c) => ({
+                  etiqueta: c.etiqueta,
+                  field: c.field,
+                  oldValue: c.oldValue,
+                  newValue: c.newValue,
+                })),
+              ]) || "");
+            await ensureTypingPause(proposal);
+            finishBotReply(sessionId, botId, proposal, {
+              resultItems: [
+                ...(last.etiqueta
+                  ? items
+                      .filter(
+                        (r) =>
+                          String(r.etiqueta ?? "")
+                            .trim()
+                            .toLowerCase() ===
+                          String(last.etiqueta)
+                            .trim()
+                            .toLowerCase(),
+                      )
+                      .slice(0, 1)
+                      .map((r) => rowToChatApiItem(r))
+                  : []),
+                rowToChatApiItem(targetRow),
+              ],
+              qr: [],
+            });
+            return;
+          }
+
+          if (plan.action === "propose_patches") {
+            const targetRow =
+              resolveEtiquetaAgainstInventory(plan.fixEtiqueta, items) ||
+              items.find(
+                (row) =>
+                  String(row.etiqueta ?? "")
+                    .trim()
+                    .toLowerCase() === plan.fixEtiqueta.trim().toLowerCase(),
+              );
+            if (!targetRow?.id) {
+              const ask = `No encontré la etiqueta **${plan.fixEtiqueta}**. ¿Me confirmas la escritura exacta?`;
+              await ensureTypingPause(ask);
+              finishBotReply(sessionId, botId, ask);
+              return;
+            }
+            const applyChanges: ChatFieldChange[] = plan.patches.map((p) => {
+              const currentVal = String(
+                (targetRow as Record<string, unknown>)[p.field] ?? "",
+              ).trim();
+              return {
+                at: new Date().toISOString(),
+                id: targetRow.id,
+                etiqueta: String(targetRow.etiqueta ?? plan.fixEtiqueta),
+                articulo: String(targetRow.articulo ?? ""),
+                field: p.field,
+                oldValue: currentVal || "(vacío)",
+                newValue: p.value,
+                chatId: sessionId,
+              };
+            });
+            setPendingFieldRevertSafe(null);
+            setPendingFieldApplySafe(applyChanges);
+            const proposal =
+              `Voy a corregir **${String(targetRow.etiqueta ?? plan.fixEtiqueta)}**:\n\n` +
+              (buildMutationConfirmReply(
+                applyChanges.map((c) => ({
+                  etiqueta: c.etiqueta,
+                  field: c.field,
+                  oldValue: c.oldValue,
+                  newValue: c.newValue,
+                })),
+              ) || "");
+            await ensureTypingPause(proposal);
+            finishBotReply(sessionId, botId, proposal, {
+              resultItems: [rowToChatApiItem(targetRow)],
+              qr: [],
+            });
+            return;
+          }
+        } catch {
+          /* abort */
+        }
       }
-      try {
-        await ensureTypingPause(proposal || "");
-        finishBotReply(sessionId, botId, proposal || "No tengo ese cambio en memoria.");
-      } catch {
-        /* abort */
-      }
-      return;
     }
 
     // Confirmar importación Excel/CSV pendiente
@@ -7833,9 +9756,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             items.map((row) => String(row.origen ?? "").trim()).filter(Boolean),
           ),
         ];
+        const fileOrigenGuess = nextFileOrigenFromFileName(
+          attach.name,
+          existingOrigens,
+        );
         const parsed = await parseInventarioImportFile(
           attach.file,
-          ORIGEN_SIN_ORIGEN,
+          fileOrigenGuess,
         );
         if (!parsed.items.length) {
           setPendingChatImportSafe(null);
@@ -7881,7 +9808,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             );
             return {
               ...item,
-              origen: fromCol || ORIGEN_SIN_ORIGEN,
+              origen: fromCol || fileOrigenGuess,
             };
           });
           setPendingChatImportSafe(mixedItems);
@@ -8012,6 +9939,67 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       viewerFocus: message.viewerFocus,
       viewerOverview: message.viewerOverview,
     }));
+
+    // Ortografía: RapidFuzz + TheFuzz + pyspellchecker + Autocorrect (backend).
+    const spokenRaw = userText || text;
+    let spokenText = spokenRaw;
+    try {
+      const spelled = await normalizeChatSpellingAsync(
+        spokenRaw,
+        controller.signal,
+      );
+      if (spelled.normalized) spokenText = spelled.normalized;
+    } catch {
+      /* abort / red → texto crudo */
+    }
+
+    // Hilo de conversación: leer mensajes de arriba para no perder el tema.
+    const resolvedTurn = resolveChatTurnContext({
+      userText: spokenText,
+      recentMessages: messagesRef.current.map((m) => ({
+        from: m.from,
+        text: m.text || "",
+      })),
+    });
+    /** Texto enriquecido con contexto (detectores locales / IA). */
+    let intentText = resolvedTurn.effectiveText || spokenText;
+
+    // Multipetición inventarios: “mete Inv2→Inv3 y omite las que ya existan”.
+    {
+      const multi = detectInventarioMultiPlan(
+        intentText,
+        listExistingOrigens(items),
+      );
+      if (multi?.steps[0]?.kind === "bulk_copy") {
+        intentText = multi.primaryText;
+        resolvedTurn.topic = "fill_inventario";
+      }
+    }
+
+    // Primer mensaje muy vago → orientar, no inventar un área.
+    if (
+      resolvedTurn.isFirstUserTurn &&
+      resolvedTurn.topic === "unknown" &&
+      spokenText.trim().split(/\s+/).length <= 3 &&
+      !/\d{3,}/.test(spokenText) &&
+      isExploratoryChatAsk(spokenText)
+    ) {
+      try {
+        const ask =
+          `Claro. ¿Qué quieres hacer con el inventario?\n\n` +
+          `• Buscar por **persona**, **área** o **etiqueta**\n` +
+          `• **Comparar inventarios** o revisar **duplicados**\n` +
+          `• Crear un **nuevo inventario** / meter registros\n` +
+          `• Ver **últimos registros** o **ideas de consulta**\n\n` +
+          `Dímelo en una frase y lo hacemos.`;
+        recordTokenConsumption(null, spokenText, ask);
+        await ensureTypingPause(ask);
+        finishBotReply(sessionId, botId, ask);
+        return;
+      } catch {
+        /* abort */
+      }
+    }
 
     // 1. Resolver desambiguación pendiente (en memoria o reconstruida del último mensaje del bot)
     let activePending = pendingDisambiguationRef.current;
@@ -8179,6 +10167,914 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
+    // 1b-copy-person. “pasa todos sus registros al Inventario 4” (persona del hilo).
+    {
+      const personCopy = detectCopyPersonRecordsToInventarioAsk(
+        intentText,
+        listExistingOrigens(items),
+      );
+      if (personCopy) {
+        try {
+          pendingNewInventarioRef.current = null;
+          const personName =
+            resolvePersonFocus(intentText, items, chatHistory) ||
+            (lastConcreteSideRef.current?.viewerOverview === "personTotal"
+              ? String(lastConcreteSideRef.current.viewerFocus || "").trim()
+              : "") ||
+            (() => {
+              for (let i = messagesRef.current.length - 1; i >= 0; i -= 1) {
+                const m = messagesRef.current[i];
+                if (m.from !== "bot") continue;
+                if (m.viewerOverview === "personTotal" && m.viewerFocus) {
+                  return String(m.viewerFocus).trim();
+                }
+              }
+              return "";
+            })();
+          if (!personName) {
+            const ask =
+              `¿De **quién** paso los registros a **${personCopy.dest}**? Dime el nombre (ej. Héctor Silva).`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          const personRows = rowsForPersonName(items, personName);
+          if (!personRows.length) {
+            const ask = `No encontré registros de **${personName}** para pasar a **${personCopy.dest}**.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          // Una fila por etiqueta (la más “actual”); omitir las que ya están en destino.
+          const destFold = personCopy.dest
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/\p{M}/gu, "")
+            .replace(/\s+/g, " ")
+            .trim();
+          const destNum = inventarioNumber(personCopy.dest);
+          const sameDest = (origen: string) => {
+            const o = String(origen ?? "")
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/\p{M}/gu, "")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (o === destFold) return true;
+            if (destNum != null && inventarioNumber(origen) === destNum) {
+              return true;
+            }
+            return false;
+          };
+          const destEtq = new Set(
+            items
+              .filter((r) => sameDest(String(r.origen ?? "")))
+              .map((r) => String(r.etiqueta ?? "").trim().toLowerCase())
+              .filter(Boolean),
+          );
+          const byEtq = new Map<string, InventarioRow>();
+          const already: string[] = [];
+          for (const row of personRows) {
+            const et = String(row.etiqueta ?? "").trim();
+            const key = et.toLowerCase();
+            if (!key) continue;
+            if (destEtq.has(key)) {
+              if (!already.includes(et)) already.push(et);
+              continue;
+            }
+            // No copiar desde el propio destino.
+            if (sameDest(String(row.origen ?? ""))) continue;
+            const prev = byEtq.get(key);
+            if (!prev) {
+              byEtq.set(key, row);
+              continue;
+            }
+            // Preferir origen con mayor rango / más reciente
+            const rank = (r: InventarioRow) =>
+              origenCurrencyRank(String(r.origen ?? ""));
+            const ts = (r: InventarioRow) =>
+              Date.parse(String(r.updated_at || r.created_at || "")) || 0;
+            if (
+              rank(row) > rank(prev) ||
+              (rank(row) === rank(prev) && ts(row) > ts(prev))
+            ) {
+              byEtq.set(key, row);
+            }
+          }
+          const toCopy = [...byEtq.values()];
+          if (!toCopy.length) {
+            const ask =
+              `No importé nada nuevo a **${personCopy.dest}**: ` +
+              (already.length
+                ? `las **${already.length}** etiquetas de **${personName}** ya estaban ahí` +
+                  (already.length <= 10
+                    ? ` (${already.join(", ")})`
+                    : ` (ej. ${already.slice(0, 8).join(", ")}…)`)
+                : `no había etiquetas que copiar`) +
+              `.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          const payload = toCopy.map((row) =>
+            rowToNewInventarioItem(row, personCopy.dest),
+          );
+          setPendingChatImportSafe(null);
+          const saved: InventarioRow[] = [];
+          let lastError = "";
+          const total = payload.length;
+          for (let i = 0; i < payload.length; i += CHAT_IMPORT_CHUNK) {
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted
+            ) {
+              throw new DOMException("Aborted", "AbortError");
+            }
+            const chunk = payload.slice(i, i + CHAT_IMPORT_CHUNK);
+            const done = Math.min(i + chunk.length, total);
+            const progressing = messagesRef.current.map((m) =>
+              m.id === botId
+                ? {
+                    ...m,
+                    text: `Copiando registros de ${personName} → ${personCopy.dest}… ${done}/${total}`,
+                    at: Date.now(),
+                    importProgress: {
+                      label: `${personName} → ${personCopy.dest}`,
+                      done,
+                      total,
+                    },
+                  }
+                : m,
+            );
+            messagesRef.current = progressing;
+            setMessages(progressing);
+            const result = await addInventarioBulkAction(chunk);
+            if (result.success && result.data?.length) {
+              saved.push(...result.data);
+            } else if (result.error) {
+              lastError = result.error;
+            }
+          }
+
+          const attempted = total;
+          const inserted = saved.length;
+          const notInserted = Math.max(0, attempted - inserted);
+
+          if (!saved.length) {
+            const failText =
+              (already.length
+                ? `**${already.length}** ya estaban en **${personCopy.dest}**` +
+                  (already.length <= 10
+                    ? ` (${already.join(", ")})`
+                    : ` (ej. ${already.slice(0, 8).join(", ")}…)`) +
+                  `.\n\n`
+                : "") +
+              (lastError ||
+                `No se pudo copiar los **${attempted}** registros de **${personName}** a **${personCopy.dest}**.`);
+            await ensureTypingPause(failText);
+            finishBotReply(sessionId, botId, failText);
+            return;
+          }
+
+          const totalBefore = items.length;
+          const stamp = new Date().toISOString();
+          setItems((prev) => [
+            ...saved.map((row) => ({ ...row, updated_at: stamp })),
+            ...prev,
+          ]);
+          const totalAfter = totalBefore + saved.length;
+          rememberMutation({
+            kind: "import",
+            summary: `Copié ${saved.length} de ${personName} a ${personCopy.dest}`,
+            totalBefore,
+            totalAfter,
+            count: saved.length,
+            ids: saved
+              .map((row) => row.id)
+              .filter((id): id is number => id != null),
+            chatId: sessionId,
+            fact: `Copia ${personName}→${personCopy.dest}: +${saved.length}`,
+          });
+
+          const skipped = already.length;
+          const skipNote = skipped
+            ? `\n**${skipped}** ya estaban en **${personCopy.dest}** (misma etiqueta); no se duplicaron` +
+              (skipped <= 10
+                ? `: ${already.join(", ")}.`
+                : ` (ej. ${already.slice(0, 8).join(", ")}…).`)
+            : "";
+          const failNote = notInserted
+            ? `\n**${notInserted}** no se insertaron` +
+              (lastError ? `: ${lastError}` : ".")
+            : "";
+          const localReply =
+            `Listo: pasé **${saved.length.toLocaleString("es-MX")}** de **${attempted.toLocaleString("es-MX")}** registro` +
+            `${attempted === 1 ? "" : "s"} de **${personName}** a **${personCopy.dest}**.` +
+            `\nInventario: **${totalBefore.toLocaleString("es-MX")}** → **${totalAfter.toLocaleString("es-MX")}** registros.` +
+            skipNote +
+            failNote;
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: saved
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: undefined,
+            viewerFocus: undefined,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b-copy-tag. “agrega esa / etiqueta 283586 a Inventario 2” (usa hilo de arriba).
+    {
+      const tagCopy = detectCopyEtiquetasToInventarioAsk(
+        intentText,
+        listExistingOrigens(items),
+        resolvedTurn.threadEtiquetas || [],
+      );
+      if (tagCopy) {
+        try {
+          pendingNewInventarioRef.current = null;
+          const picked = pickSourceRowsForEtiquetas(
+            items,
+            tagCopy.etiquetas,
+            tagCopy.dest,
+          );
+          if (picked.missing.length && !picked.found.length && !picked.alreadyInDest.length) {
+            const ask =
+              `No encontré la etiqueta **${tagCopy.etiquetas.join(", ")}** para agregarla a **${tagCopy.dest}**.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          if (!picked.found.length) {
+            const ask =
+              `La etiqueta **${tagCopy.etiquetas.join(", ")}** ya está en **${tagCopy.dest}**` +
+              (picked.alreadyInDest.length
+                ? ` (${picked.alreadyInDest.join(", ")}). No la dupliqué.`
+                : `.`);
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask, {
+              resultItems: items
+                .filter((r) =>
+                  tagCopy.etiquetas.some(
+                    (e) =>
+                      String(r.etiqueta ?? "").trim().toLowerCase() ===
+                        e.toLowerCase() &&
+                      String(r.origen ?? "").trim() === tagCopy.dest,
+                  ),
+                )
+                .slice(0, 20)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+            });
+            return;
+          }
+
+          const payload = picked.found.map((row) =>
+            rowToNewInventarioItem(row, tagCopy.dest),
+          );
+          setPendingChatImportSafe(null);
+          const saved: InventarioRow[] = [];
+          let lastError = "";
+          for (let i = 0; i < payload.length; i += CHAT_IMPORT_CHUNK) {
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted
+            ) {
+              throw new DOMException("Aborted", "AbortError");
+            }
+            const chunk = payload.slice(i, i + CHAT_IMPORT_CHUNK);
+            const result = await addInventarioBulkAction(chunk);
+            if (result.success && result.data?.length) {
+              saved.push(...result.data);
+            } else if (result.error) {
+              lastError = result.error;
+              if (!saved.length) break;
+            }
+          }
+          if (!saved.length) {
+            const failText =
+              lastError || `No se pudo agregar a **${tagCopy.dest}**.`;
+            await ensureTypingPause(failText);
+            finishBotReply(sessionId, botId, failText);
+            return;
+          }
+          const totalBefore = items.length;
+          const stamp = new Date().toISOString();
+          setItems((prev) => [
+            ...saved.map((row) => ({ ...row, updated_at: stamp })),
+            ...prev,
+          ]);
+          const totalAfter = totalBefore + saved.length;
+          rememberMutation({
+            kind: "import",
+            summary: `Agregué ${saved.length} a ${tagCopy.dest}`,
+            totalBefore,
+            totalAfter,
+            count: saved.length,
+            ids: saved
+              .map((row) => row.id)
+              .filter((id): id is number => id != null),
+            chatId: sessionId,
+            fact: `Copia etiqueta→${tagCopy.dest}: +${saved.length}`,
+          });
+          const listSaved = saved
+            .map((r) => {
+              const et = String(r.etiqueta ?? "").trim();
+              const art = String(r.articulo ?? "").trim() || "—";
+              const from = String(
+                picked.found.find(
+                  (f) =>
+                    String(f.etiqueta ?? "").trim().toLowerCase() ===
+                    et.toLowerCase(),
+                )?.origen ?? "",
+              ).trim();
+              return `• **${et}** · ${art}${from ? ` (desde **${from}**)` : ""}`;
+            })
+            .join("\n");
+          const alreadyNote = picked.alreadyInDest.length
+            ? `\n\nYa estaban en **${tagCopy.dest}** (no se duplicaron): ${picked.alreadyInDest.join(", ")}.`
+            : "";
+          const missingNote = picked.missing.length
+            ? `\n\nNo encontré: ${picked.missing.join(", ")}.`
+            : "";
+          const localReply =
+            `Listo: agregué a **${tagCopy.dest}**:\n${listSaved}\n` +
+            `Inventario: **${totalBefore.toLocaleString("es-MX")}** → **${totalAfter.toLocaleString("es-MX")}** registros.` +
+            alreadyNote +
+            missingNote;
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: saved
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: undefined,
+            viewerFocus: undefined,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b-copy. “Pasa todo Inventario 1 a Inventario 3; si ya existe, avísame”.
+    // También: “omite esa e importa el resto Inv2 → Inv3”.
+    {
+      const bulkCopy = detectBulkCopyBetweenInventariosAsk(
+        intentText,
+        listExistingOrigens(items),
+      );
+      if (bulkCopy) {
+        try {
+          pendingNewInventarioRef.current = null;
+          const foldOrig = (o: string) =>
+            o
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/\p{M}/gu, "")
+              .replace(/\s+/g, " ")
+              .trim();
+          const sourceFold = foldOrig(bulkCopy.source);
+          const destFold = foldOrig(bulkCopy.dest);
+          const excludeSet = new Set(
+            detectExcludedEtiquetasAsk(
+              intentText,
+              resolvedTurn.threadEtiquetas || [],
+            ).map((e) => e.trim().toLowerCase()),
+          );
+
+          const sourceRows = items.filter(
+            (row) =>
+              foldOrig(String(row.origen ?? "")) === sourceFold &&
+              String(row.etiqueta ?? "").trim(),
+          );
+          if (!sourceRows.length) {
+            const ask =
+              `No hay registros en **${bulkCopy.source}** para pasar a **${bulkCopy.dest}**.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          const destRows = items.filter(
+            (row) => foldOrig(String(row.origen ?? "")) === destFold,
+          );
+          // Solo ETIQUETA es irrepetible dentro del mismo origen.
+          // Serie/marca/etc. sí pueden repetirse (lotes).
+          const destEtq = new Set(
+            destRows
+              .map((row) => String(row.etiqueta ?? "").trim().toLowerCase())
+              .filter(Boolean),
+          );
+          const already: InventarioRow[] = [];
+          const omitted: InventarioRow[] = [];
+          const toCopy: InventarioRow[] = [];
+          const seen = new Set<string>();
+          for (const row of sourceRows) {
+            const key = String(row.etiqueta ?? "").trim().toLowerCase();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            if (excludeSet.has(key)) {
+              omitted.push(row);
+              continue;
+            }
+            if (destEtq.has(key)) {
+              already.push(row);
+            } else {
+              toCopy.push(row);
+            }
+          }
+
+          if (!toCopy.length) {
+            const sample = [...omitted, ...already]
+              .slice(0, 12)
+              .map((r) => {
+                const et = String(r.etiqueta ?? "").trim() || "—";
+                const art = String(r.articulo ?? "").trim() || "—";
+                const why = excludeSet.has(et.toLowerCase())
+                  ? "omitida a pedido"
+                  : `ya estaba en **${bulkCopy.dest}**`;
+                return `• **${et}** · ${art} — ${why}; no se importó`;
+              });
+            const ask =
+              `No importé nada nuevo a **${bulkCopy.dest}**` +
+              (omitted.length
+                ? ` (omití **${omitted.length}** a pedido)`
+                : "") +
+              (already.length
+                ? `; **${already.length}** ya existían (misma etiqueta)`
+                : "") +
+              `.\n\n` +
+              (sample.length ? `${sample.join("\n")}` : "");
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask, {
+              resultItems: [...omitted, ...already]
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+            });
+            return;
+          }
+
+          const payload = toCopy.map((row) =>
+            rowToNewInventarioItem(row, bulkCopy.dest),
+          );
+          // Importa y luego, si hay “ya existían”, el mensaje de import no las lista:
+          // hacemos el import y añadimos nota en un segundo finish… runBulkChatImport
+          // ya cierra el bot. Pasamos detalle vía sourceLabel + después no podemos.
+          // Solución: enriquecer con un reply custom tras import — refactor mínimo:
+          // ejecutar import y construir reply propio.
+          setPendingChatImportSafe(null);
+          const saved: InventarioRow[] = [];
+          let lastError = "";
+          const total = payload.length;
+          for (let i = 0; i < payload.length; i += CHAT_IMPORT_CHUNK) {
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted
+            ) {
+              throw new DOMException("Aborted", "AbortError");
+            }
+            const chunk = payload.slice(i, i + CHAT_IMPORT_CHUNK);
+            const done = Math.min(i + chunk.length, total);
+            const progressing = messagesRef.current.map((m) =>
+              m.id === botId
+                ? {
+                    ...m,
+                    text: `Copiando ${bulkCopy.source} → ${bulkCopy.dest}… ${done}/${total}`,
+                    at: Date.now(),
+                    importProgress: {
+                      label: `${bulkCopy.source} → ${bulkCopy.dest}`,
+                      done,
+                      total,
+                    },
+                  }
+                : m,
+            );
+            messagesRef.current = progressing;
+            setMessages(progressing);
+            const result = await addInventarioBulkAction(chunk);
+            if (result.success && result.data?.length) {
+              saved.push(...result.data);
+            } else if (result.error) {
+              lastError = result.error;
+              // No abortar el lote entero: seguir con el resto (conflictos = saltar).
+            }
+          }
+
+          if (!saved.length) {
+            const failText = lastError
+              ? lastError
+              : `No quedó nada nuevo que importar a **${bulkCopy.dest}**` +
+                (omitted.length
+                  ? ` (omití **${omitted
+                      .map((r) => String(r.etiqueta ?? "").trim())
+                      .filter(Boolean)
+                      .slice(0, 5)
+                      .join(", ")}**)`
+                  : "") +
+                (already.length
+                  ? `; **${already.length}** ya estaban (misma etiqueta)`
+                  : "") +
+                `.`;
+            await ensureTypingPause(failText);
+            finishBotReply(sessionId, botId, failText);
+            return;
+          }
+
+          const totalBefore = items.length;
+          const stamp = new Date().toISOString();
+          setItems((prev) => [
+            ...saved.map((row) => ({ ...row, updated_at: stamp })),
+            ...prev,
+          ]);
+          const totalAfter = totalBefore + saved.length;
+          rememberMutation({
+            kind: "import",
+            summary: `Copié ${saved.length} de ${bulkCopy.source} a ${bulkCopy.dest}`,
+            totalBefore,
+            totalAfter,
+            count: saved.length,
+            ids: saved
+              .map((row) => row.id)
+              .filter((id): id is number => id != null),
+            chatId: sessionId,
+            fact: `Copia ${bulkCopy.source}→${bulkCopy.dest}: +${saved.length}`,
+          });
+
+          const importedSample = saved
+            .slice(0, 10)
+            .map((r) => {
+              const et = String(r.etiqueta ?? "").trim() || "—";
+              const art = String(r.articulo ?? "").trim() || "—";
+              return `• **${et}** · ${art}`;
+            })
+            .join("\n");
+          const importedNote =
+            `\n\n**Importadas a ${bulkCopy.dest} (${saved.length.toLocaleString("es-MX")})**:\n` +
+            importedSample +
+            (saved.length > 10
+              ? `\n…y ${(saved.length - 10).toLocaleString("es-MX")} más.`
+              : "");
+
+          const omittedNote = omitted.length
+            ? `\n\n**Omitidas a pedido (${omitted.length})** — no se importaron:\n` +
+              omitted
+                .slice(0, 10)
+                .map((r) => {
+                  const et = String(r.etiqueta ?? "").trim() || "—";
+                  const art = String(r.articulo ?? "").trim() || "—";
+                  return `• **${et}** · ${art}`;
+                })
+                .join("\n")
+            : "";
+
+          const alreadyNote = already.length
+            ? `\n\n**No se duplicaron (${already.length})** — ya existían en **${bulkCopy.dest}** (misma etiqueta):\n` +
+              already
+                .slice(0, 15)
+                .map((r) => {
+                  const et = String(r.etiqueta ?? "").trim() || "—";
+                  const art = String(r.articulo ?? "").trim() || "—";
+                  return `• **${et}** · ${art} — ya estaba; no se volvió a importar`;
+                })
+                .join("\n") +
+              (already.length > 15
+                ? `\n…y ${already.length - 15} más.`
+                : "")
+            : omitted.length
+              ? ""
+              : `\n\nNinguna etiqueta de **${bulkCopy.source}** estaba ya en **${bulkCopy.dest}**.`;
+
+          const localReply =
+            `Listo: importé **${saved.length.toLocaleString("es-MX")}** etiqueta` +
+            `${saved.length === 1 ? "" : "s"} de **${bulkCopy.source}** a **${bulkCopy.dest}**` +
+            ` (con toda su información).\n` +
+            `Inventario: **${totalBefore.toLocaleString("es-MX")}** → **${totalAfter.toLocaleString("es-MX")}** registros.` +
+            importedNote +
+            omittedNote +
+            alreadyNote;
+
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: saved
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b-dup. Etiquetas duplicadas (antes del relleno de inventario pendiente).
+    {
+      const dupAsk = detectDuplicateEtiquetasAsk(
+        intentText,
+        listExistingOrigens(items),
+      );
+      if (dupAsk) {
+        try {
+          // Si el usuario cambió a una consulta, no seguir pidiendo “qué meter”.
+          pendingNewInventarioRef.current = null;
+          const groups = findDuplicateEtiquetas(items, dupAsk);
+          const localReply = formatDuplicateEtiquetasReply(dupAsk, groups);
+          const sideRows = groups.flatMap((g) => g.rows).slice(0, 80);
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: sideRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b-new. Crear inventario / rellenar el pendiente (antes de “recientes”).
+    {
+      const prompt = intentText;
+      const origensNow = listExistingOrigens(items);
+      const createAsk = detectCreateInventarioAsk(prompt, origensNow);
+      let pending = pendingNewInventarioRef.current;
+
+      // Consultas (duplicados, comparar, listar…) cancelan el pending de relleno.
+      if (pending && looksLikeNonFillInventarioAsk(prompt) && !createAsk) {
+        pendingNewInventarioRef.current = null;
+        pending = null;
+      }
+
+      if (createAsk) {
+        pendingNewInventarioRef.current = {
+          name: createAsk.name,
+          askedAt: Date.now(),
+        };
+        pending = pendingNewInventarioRef.current;
+      }
+
+      // Solo recuperar pending si el bot pidió explícitamente qué meter / preparó inventario.
+      if (!pending) {
+        for (let i = messagesRef.current.length - 1; i >= 0 && i >= messagesRef.current.length - 6; i -= 1) {
+          const msg = messagesRef.current[i];
+          if (msg.from !== "bot") continue;
+          const botText = String(msg.text || "");
+          if (
+            !/preparo\s+\*\*|necesito saber qu[eé] meter|puedo meterle registros|queda preparado/i.test(
+              botText,
+            )
+          ) {
+            continue;
+          }
+          const m = botText.match(/\*\*(Inventario\s+\d+)\*\*/i);
+          if (m?.[1]) {
+            pending = { name: m[1].replace(/\s+/g, " ").trim(), askedAt: Date.now() };
+            pendingNewInventarioRef.current = pending;
+            break;
+          }
+        }
+      }
+
+      // “al nuevo inventario que te pedí” sin número → usar pendiente o el siguiente.
+      if (
+        !pending &&
+        /\b(nuevo\s+inventario|inventario\s+nuevo)\b/.test(
+          normalizeChatIntent(prompt),
+        ) &&
+        /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|agrega|agregar)\b/.test(
+          normalizeChatIntent(prompt),
+        )
+      ) {
+        const named = matchOrigenFromPrompt(prompt, origensNow);
+        pending = {
+          name: named || nextInventarioName(origensNow),
+          askedAt: Date.now(),
+        };
+        pendingNewInventarioRef.current = pending;
+      }
+
+      const fill =
+        pending != null
+          ? detectFillNewInventarioAsk(prompt, pending, origensNow)
+          : undefined;
+
+      // Creación sin contenido en el mismo mensaje → preguntar qué meter.
+      if (createAsk && (!fill || fill.kind === "unclear")) {
+        try {
+          const ask = createAsk.alreadyExists
+            ? `**${createAsk.name}** ya existe. Puedo meterle registros ahora.\n\n` +
+              `Dime etiquetas, **todo** otro inventario, o **vacío** si no quieres agregar nada.`
+            : buildCreateInventarioAskReply(createAsk.name, origensNow);
+          recordTokenConsumption(null, prompt, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+
+      if (pending && fill) {
+        const dest = pending.name;
+        try {
+          if (fill.kind === "empty") {
+            pendingNewInventarioRef.current = {
+              ...pending,
+              emptyOk: true,
+              askedAt: Date.now(),
+            };
+            const ask =
+              `Listo: **${dest}** queda preparado **vacío**. ` +
+              `Cuando quieras, mándame etiquetas o “pasa todo Inventario N” y las meto ahí.`;
+            recordTokenConsumption(null, prompt, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          if (fill.kind === "unclear") {
+            const ask =
+              `Para **${dest}** necesito saber qué meter: etiquetas (ej. \`283586\`), ` +
+              `“pasa todo Inventario 1”, o **vacío**.`;
+            recordTokenConsumption(null, prompt, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          let sourceRows: InventarioRow[] = [];
+          let missing: string[] = [];
+          let alreadyInDest: string[] = [];
+
+          if (fill.kind === "copy_origen") {
+            sourceRows = items.filter(
+              (row) =>
+                String(row.origen ?? "").trim() === fill.source &&
+                String(row.etiqueta ?? "").trim(),
+            );
+            if (!sourceRows.length) {
+              const ask =
+                `No encontré registros en **${fill.source}** para copiar a **${dest}**. ` +
+                `Prueba con otro inventario o con etiquetas sueltas.`;
+              recordTokenConsumption(null, prompt, ask);
+              await ensureTypingPause(ask);
+              finishBotReply(sessionId, botId, ask);
+              return;
+            }
+          } else if (fill.kind === "copy_etiquetas") {
+            const picked = pickSourceRowsForEtiquetas(
+              items,
+              fill.etiquetas,
+              dest,
+            );
+            sourceRows = picked.found;
+            missing = picked.missing;
+            alreadyInDest = picked.alreadyInDest;
+            if (!sourceRows.length) {
+              const bits: string[] = [];
+              if (missing.length) {
+                bits.push(
+                  `no encontré ${missing.map((e) => `**${e}**`).join(", ")}`,
+                );
+              }
+              if (alreadyInDest.length) {
+                bits.push(
+                  `ya estaban en **${dest}**: ${alreadyInDest
+                    .map((e) => `**${e}**`)
+                    .join(", ")}`,
+                );
+              }
+              const ask =
+                `No pude meter nada a **${dest}**` +
+                (bits.length ? ` (${bits.join("; ")})` : "") +
+                `. ¿Otra etiqueta o copiar un inventario completo?`;
+              recordTokenConsumption(null, prompt, ask);
+              await ensureTypingPause(ask);
+              finishBotReply(sessionId, botId, ask);
+              return;
+            }
+          }
+
+          const payload = sourceRows.map((row) =>
+            rowToNewInventarioItem(row, dest),
+          );
+          const fromOrigens = [
+            ...new Set(
+              sourceRows
+                .map((row) => String(row.origen ?? "").trim())
+                .filter((o) => o && o !== dest),
+            ),
+          ];
+          const fromLabel =
+            fromOrigens.length === 1
+              ? fromOrigens[0]
+              : fromOrigens.length > 1
+                ? fromOrigens.join(", ")
+                : String(sourceRows[0]?.origen ?? "").trim() || "inventario origen";
+          await runBulkChatImport(payload, fromLabel, {
+            destLabel: dest,
+            mode: "copy",
+            etiquetas: sourceRows
+              .map((row) => String(row.etiqueta ?? "").trim())
+              .filter(Boolean),
+          });
+          pendingNewInventarioRef.current = {
+            name: dest,
+            askedAt: Date.now(),
+          };
+          if (missing.length || alreadyInDest.length) {
+            // runBulkChatImport already finished the bot reply; append note via soft follow-up is hard.
+            // The import reply is enough; missing handled only when nothing saved above.
+          }
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b0. Último / recientes (global) — antes del follow-up de área/persona.
+    {
+      const recentAsk = detectRecentRecordsAsk(userText || text);
+      if (recentAsk && items.length) {
+        try {
+          const rows = getRecentInventoryRows(
+            items,
+            recentAsk.limit,
+            recentAsk.soloHoy,
+          );
+          const localReply = buildRecentRecordsReply(rows, recentAsk);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: rows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: recentAsk.limit === 1 ? undefined : "recent",
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b1-origen. “etiqueta 283586 de qué inventario venía / antes”.
+    {
+      const origenAsk = detectEtiquetaOrigenAsk(intentText, items);
+      if (origenAsk) {
+        try {
+          const localReply = buildEtiquetaOrigenReply(origenAsk, items);
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          // Una ficha por inventario/origen, ordenadas (Inv 1, Inv 2…).
+          const byOrigen = new Map<string, InventarioRow>();
+          for (const row of origenAsk.rows) {
+            const key = String(row.origen ?? "").trim() || "Sin origen";
+            if (!byOrigen.has(key)) byOrigen.set(key, row);
+          }
+          const sideRows = [...byOrigen.values()].sort(
+            (a, b) =>
+              origenCurrencyRank(String(a.origen ?? "")) -
+              origenCurrencyRank(String(b.origen ?? "")),
+          );
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: sideRows
+              .slice(0, 80)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: undefined,
+            viewerFocus: undefined,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
     // 1b1. Follow-up con contexto del chat (“el área”, “ahí”, “dame los N registros”).
     {
       const ctxAsk = detectContextFollowUpAsk(
@@ -8230,6 +11126,68 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             });
             return;
           }
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b1. Diff real entre inventarios (antes de áreas: “comparar” ≠ “Compras”).
+    {
+      const origens = listExistingOrigens(items);
+      const compare = detectCompareInventariosAsk(intentText, origens);
+      const wantsCompare =
+        /\b(compara|comparar|comparacion|diff|diferencia|diferencias)\b/i.test(
+          intentText,
+        ) || /^comparar\s+inventarios?$/i.test(intentText.trim());
+      if (compare || wantsCompare) {
+        try {
+          if (!compare || origens.length < 1) {
+            const ask =
+              `Para comparar necesito al menos un inventario con datos. ` +
+              `Ahora veo: ${
+                origens.length
+                  ? origens.map((o) => `**${o}**`).join(", ")
+                  : "ningún origen cargado"
+              }. ` +
+              `Importa otro Excel o dime p. ej. **compara Inventario 1 vs Inventario 2**.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const diff = diffInventarios(items, compare.left, compare.right);
+          const localReply = formatInventarioDiffReply(diff);
+          const sideRows = [
+            ...diff.onlyLeft,
+            ...diff.onlyRight,
+            ...diff.same,
+            ...diff.changed
+              .map((c) =>
+                items.find(
+                  (row) =>
+                    Number(row.id) === Number(c.rightId) ||
+                    Number(row.id) === Number(c.leftId),
+                ),
+              )
+              .filter(Boolean),
+          ] as InventarioRow[];
+          const seen = new Set<number | string>();
+          const uniqueSide: InventarioRow[] = [];
+          for (const row of sideRows) {
+            const key = row.id != null ? Number(row.id) : String(row.etiqueta);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniqueSide.push(row);
+            if (uniqueSide.length >= 80) break;
+          }
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: uniqueSide.map((row) => rowToChatApiItem(row)),
+            qr: [],
+          });
+          return;
         } catch {
           /* abort / nuevo mensaje */
         }
@@ -8309,8 +11267,79 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
+    // 2a. Persona ANTES que área: “inventario (general) de Héctor” no es RH.
+    const personQueryEarly =
+      resolvedTurn.topic === "duplicates" ||
+      resolvedTurn.topic === "compare" ||
+      resolvedTurn.topic === "fill_inventario" ||
+      resolvedTurn.topic === "create_inventario" ||
+      resolvedTurn.topic === "etiqueta_origen"
+        ? undefined
+        : findMatchingPeopleForPrompt(intentText, items);
+    if (personQueryEarly) {
+      if (personQueryEarly.candidates.length > 1) {
+        const candidateNames = personQueryEarly.candidates.map((c) => c.name);
+        pendingDisambiguationRef.current = {
+          kind: "person",
+          queryLabel: personQueryEarly.queryLabel,
+          candidates: candidateNames,
+          intent: personQueryEarly.intent,
+          limit: personQueryEarly.limit,
+        };
+        try {
+          const localReply = buildPersonDisambiguationReply(
+            personQueryEarly.queryLabel,
+            personQueryEarly.candidates,
+            personQueryEarly.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: "personMatches",
+            viewerFocus: encodeMatchesFocus(
+              personQueryEarly.queryLabel,
+              candidateNames,
+            ),
+          });
+        } catch {
+          /* abort */
+        }
+        return;
+      }
+      if (personQueryEarly.candidates.length === 1) {
+        const singlePerson = personQueryEarly.candidates[0];
+        try {
+          const { reply: localReply, shownRows } = buildExactPersonReply(
+            singlePerson,
+            personQueryEarly.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "personTotal",
+            viewerFocus: singlePerson.name,
+          });
+        } catch {
+          /* abort */
+        }
+        return;
+      }
+    }
+
     // 2. Consulta de área (segura → visor; dudosa/typo → preguntar sin visor)
-    const areaQuery = findMatchingAreasForPrompt(userText || text, items);
+    // No robar el hilo si estamos en duplicados / comparar / inventario nuevo.
+    const areaQuery =
+      resolvedTurn.topic === "duplicates" ||
+      resolvedTurn.topic === "compare" ||
+      resolvedTurn.topic === "fill_inventario" ||
+      resolvedTurn.topic === "create_inventario" ||
+      resolvedTurn.topic === "etiqueta_origen"
+        ? undefined
+        : findMatchingAreasForPrompt(intentText, items);
     if (areaQuery) {
       const candidateNames = areaQuery.candidates.map((c) => c.name);
       // Typo o ambigüedad: no inventar resultado; confirmar primero.
@@ -8381,7 +11410,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     }
 
     // 3. Consulta de persona (con desambiguación si existen 2 o más personas que coinciden)
-    const personQuery = findMatchingPeopleForPrompt(userText || text, items);
+    const personQuery =
+      resolvedTurn.topic === "duplicates" ||
+      resolvedTurn.topic === "compare" ||
+      resolvedTurn.topic === "fill_inventario" ||
+      resolvedTurn.topic === "create_inventario" ||
+      resolvedTurn.topic === "etiqueta_origen"
+        ? undefined
+        : findMatchingPeopleForPrompt(intentText, items);
     if (personQuery) {
       if (personQuery.candidates.length > 1) {
         const candidateNames = personQuery.candidates.map((c) => c.name);
@@ -8660,27 +11696,55 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
     // 5a0. Excel/CSV descargable con nombre referente a la consulta.
     {
-      const excelAsk = detectExcelExportAsk(userText || text);
+      const excelAsk = detectExcelExportAsk(intentText || userText || text);
       if (excelAsk) {
         try {
-          const prevItems =
-            lastBotResultItems(messagesRef.current).length > 0
-              ? lastBotResultItems(messagesRef.current)
-              : lastConcreteSideRef.current?.resultItems || [];
-          const prevFocus =
-            lastBotViewerFocus(messagesRef.current) ||
-            lastConcreteSideRef.current?.viewerFocus ||
-            null;
-          let sourceRows = chatApiItemsToRows(prevItems, items);
-          let focusName = prevFocus;
+          const foldOrig = (o: string) =>
+            o
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/\p{M}/gu, "")
+              .replace(/\s+/g, " ")
+              .trim();
 
-          // Persona explícita o “esta persona” (usa foco del mensaje anterior).
-          {
+          let sourceRows: InventarioRow[] = [];
+          let focusName: string | null = null;
+
+          // Prioridad 1: “excel del Inventario 3” → TODAS las filas de ese origen.
+          if (excelAsk.origen) {
+            const want = foldOrig(excelAsk.origen);
+            const existing = listExistingOrigens(items);
+            const canon =
+              existing.find((o) => foldOrig(o) === want) ||
+              existing.find((o) => foldOrig(o).includes(want)) ||
+              excelAsk.origen;
+            sourceRows = items.filter(
+              (row) => foldOrig(String(row.origen ?? "")) === foldOrig(canon),
+            );
+            focusName = canon;
+          }
+
+          // Prioridad 2: consulta/persona/área previa (solo si NO pidió Inventario N).
+          if (!sourceRows.length && !excelAsk.origen) {
+            const prevItems =
+              lastBotResultItems(messagesRef.current).length > 0
+                ? lastBotResultItems(messagesRef.current)
+                : lastConcreteSideRef.current?.resultItems || [];
+            const prevFocus =
+              lastBotViewerFocus(messagesRef.current) ||
+              lastConcreteSideRef.current?.viewerFocus ||
+              null;
+            if (excelAsk.fromContext && prevItems.length) {
+              sourceRows = chatApiItemsToRows(prevItems, items);
+              focusName = prevFocus;
+            }
+
             const catalog = getAllPersonCatalog(items);
             const named =
               detectPersonTotalAsk(userText || text, items, chatHistory) ||
               findPersonInText(userText || text, items);
-            const focusCandidate = named || (excelAsk.fromContext ? prevFocus : null);
+            const focusCandidate =
+              named || (excelAsk.fromContext ? prevFocus : null);
             if (focusCandidate) {
               const exact =
                 catalog.find((p) => p.name === focusCandidate) ||
@@ -8699,26 +11763,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 focusName = exact.name;
               }
             }
-          }
 
-          // Área si aplica.
-          if (!sourceRows.length) {
-            const areaHit = matchAreaFromPrompt(userText || text, items);
-            if (areaHit) {
-              sourceRows = items.filter((row) =>
-                areaMatchesNeedle(String(row.area ?? ""), areaHit),
-              );
-              focusName = areaHit;
+            if (!sourceRows.length) {
+              const areaHit = matchAreaFromPrompt(userText || text, items);
+              if (areaHit) {
+                sourceRows = items.filter((row) =>
+                  areaMatchesNeedle(String(row.area ?? ""), areaHit),
+                );
+                focusName = areaHit;
+              }
             }
-          }
 
-          // Sin contexto previo: usar inventario filtrado por tema o general.
-          if (!sourceRows.length) {
-            if (excelAsk.theme) {
+            if (!sourceRows.length && excelAsk.theme) {
               const needle = normalizeChatIntent(excelAsk.theme);
               sourceRows = items.filter((row) =>
                 normalizeChatIntent(String(row.area ?? "")).includes(needle),
               );
+            }
+            if (!sourceRows.length && excelAsk.fromContext && prevItems.length) {
+              sourceRows = chatApiItemsToRows(prevItems, items);
+              focusName = prevFocus;
             }
             if (!sourceRows.length) sourceRows = items.slice(0, 500);
           }
@@ -8792,51 +11856,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 5a2. Diff real entre inventarios (faltan / sobran / cambiaron).
-    {
-      const compare = detectCompareInventariosAsk(
-        userText || text,
-        listExistingOrigens(items),
-      );
-      if (compare && items.length) {
-        try {
-          const diff = diffInventarios(items, compare.left, compare.right);
-          const localReply = formatInventarioDiffReply(diff);
-          const sideRows = [
-            ...diff.onlyLeft,
-            ...diff.onlyRight,
-            ...diff.changed
-              .map((c) =>
-                items.find(
-                  (row) =>
-                    Number(row.id) === Number(c.rightId) ||
-                    Number(row.id) === Number(c.leftId),
-                ),
-              )
-              .filter(Boolean),
-          ] as InventarioRow[];
-          const seen = new Set<number | string>();
-          const uniqueSide: InventarioRow[] = [];
-          for (const row of sideRows) {
-            const key = row.id != null ? Number(row.id) : String(row.etiqueta);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            uniqueSide.push(row);
-            if (uniqueSide.length >= 50) break;
-          }
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
-            resultItems: uniqueSide.map((row) => rowToChatApiItem(row)),
-            qr: [],
-          });
-          return;
-        } catch {
-          /* abort / nuevo mensaje */
-        }
-      }
-    }
-
     // 5b. Marcas acotadas a un área → listado en visor (no overview global).
     {
       const marcasArea = detectMarcasAreaAsk(userText || text, items);
@@ -8870,14 +11889,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     }
 
     // 5. Anáfora: "dame esas etiquetas" / "las de arriba" → resultado anterior.
-    if (looksLikeResultAnaphora(userText || text)) {
+    // Nunca si es multipetición Inv N → Inv M.
+    if (
+      looksLikeResultAnaphora(userText || text) &&
+      !looksLikeInventarioMultiAsk(intentText || userText || text)
+    ) {
       const prevItems =
         lastBotResultItems(messagesRef.current).length > 0
           ? lastBotResultItems(messagesRef.current)
           : lastConcreteSideRef.current?.resultItems || [];
       const n = normalizeChatIntent(userText || text);
       const wantsThose =
-        /\betiquet/.test(n) ||
+        (/\betiquet/.test(n) &&
+          /\b(esas|esos|estas|estos|de arriba|anteriores?)\b/.test(n)) ||
         intentHas(n, "dame", "muestra", "mostrar", "ver", "trae", "lista", "qr") ||
         intentHas(n, "esas", "esos", "estas", "estos");
       if (wantsThose && prevItems.length) {
@@ -8942,12 +11966,23 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
     // 6. Overview local (áreas / totales / personas…) sin depender del LLM.
     // Si ya acotó marcas a un área, no caer al ranking global de marcas.
-    const earlyOverview = detectMarcasAreaAsk(userText || text, items)
-      ? undefined
-      : detectViewerOverview(userText || text);
-    if (earlyOverview && items.length) {
+    // (recientes ya se resolvieron en 1b0)
+    const turnBeforeOverview = analyzeTurnQuick(userText || text, items);
+    const earlyOverview =
+      turnBeforeOverview.isWriteTurn || turnBeforeOverview.discourseOnly
+        ? undefined
+        : detectMarcasAreaAsk(userText || text, items)
+          ? undefined
+          : detectViewerOverview(userText || text);
+    if (earlyOverview && earlyOverview !== "recent" && items.length) {
       try {
-        const localReply = buildLocalOverviewReply(earlyOverview, items);
+        const overviewFocus = resolveOverviewFocus(userText || text, items);
+        const localReply = buildLocalOverviewReply(
+          earlyOverview,
+          items,
+          overviewFocus,
+          userText || text,
+        );
         if (localReply) {
           const openPanel = shouldAttachSidePanel(
             userText || text,
@@ -8965,6 +12000,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   resultItems: [],
                   qr: [],
                   viewerOverview: earlyOverview,
+                  viewerFocus: overviewFocus,
                 }
               : undefined,
           );
@@ -8975,9 +12011,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    const data = await askInventoryChat(userText || text, history, {
+    const data = await askInventoryChat(intentText, history, {
       signal: controller.signal,
-      memory: formatChatMemoryForPrompt(),
+      memory: [formatChatMemoryForPrompt(), resolvedTurn.threadHint]
+        .filter(Boolean)
+        .join("\n\n"),
       model: activeLlmMeta.model,
     });
     if (
@@ -9273,7 +12311,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         ? focusPerson
         : overview === "areaTotal" && focusArea
           ? focusArea
-          : undefined;
+          : overview
+            ? resolveOverviewFocus(userText || text, items)
+            : undefined;
     if (
       overview &&
       overview !== "areaTotal" &&
@@ -9673,6 +12713,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setDebouncedPeopleSearch("");
   };
 
+  const resetAreaFilters = () => {
+    setSelectedId(null);
+    setAreaSearch("");
+    setDebouncedAreaSearch("");
+  };
+
+  const resetEstadoFilters = () => {
+    setEstadoSearch("");
+    setDebouncedEstadoSearch("");
+  };
+
   const showFullInventory = () => {
     setSelectedId(null);
     setQuery("");
@@ -9721,7 +12772,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const title =
     rail === "avisos" ? "Avisos" : (RAIL_ITEMS.find((item) => item.id === rail)?.label ?? "Inventario");
 
-  const selectedFolder = folders.find((folder) => folder.id === selectedId) ?? null;
+  const selectedFolder =
+    (rail === "personas"
+      ? visiblePersonFolders.find((folder) => folder.id === selectedId)
+      : rail === "areas"
+        ? visibleAreaFolders.find((folder) => folder.id === selectedId)
+        : folders.find((folder) => folder.id === selectedId)) ?? null;
 
   return (
     <div
@@ -10101,33 +13157,84 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               <div className="section-heading people-toolbar">
                 <div>
                   <h2>Áreas</h2>
-                  <span>{formatNumber(folders.length)} grupos</span>
+                  <span>{formatNumber(visibleAreaFolders.length)} grupos</span>
                 </div>
               </div>
+
+              <section className="reports-filter-panel people-reports-filter" aria-label="Filtros de áreas">
+                <div className="reports-filter-grid">
+                  <div className="report-filter-item report-filter-search">
+                    <label htmlFor="area-filter-search">Búsqueda rápida</label>
+                    <div className="report-search-wrap">
+                      <Search size={15} />
+                      <input
+                        id="area-filter-search"
+                        placeholder="Ej. Sistemas, OF-0026, Martinez…"
+                        value={areaSearch}
+                        onChange={(e) => setAreaSearch(e.target.value)}
+                      />
+                      {areaSearch ? (
+                        <button
+                          type="button"
+                          className="report-search-clear"
+                          onClick={() => {
+                            setAreaSearch("");
+                            setDebouncedAreaSearch("");
+                          }}
+                        >
+                          ×
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+                <div className="reports-top-actions">
+                  <button
+                    type="button"
+                    className="btn-rep-action"
+                    onClick={resetAreaFilters}
+                    title="Restablecer filtros de áreas"
+                  >
+                    <RotateCcw size={15} />
+                    <span>Restablecer</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-rep-action"
+                    onClick={showFullInventory}
+                    title="Volver al inventario completo"
+                  >
+                    <span>Ver todo el inventario</span>
+                  </button>
+                </div>
+              </section>
 
               {selectedFolder ? (
                 <div className="people-filter-bar" role="status">
                   <div>
                     <strong>Área: {selectedFolder.name}</strong>
                     <small>
-                      {formatNumber(selectedFolder.rows.length)}{" "}
-                      {selectedFolder.rows.length === 1 ? "artículo" : "artículos"}
+                      {formatNumber(
+                        visibleAreaFolders.find((folder) => folder.id === selectedId)?.rows
+                          .length ?? 0,
+                      )}{" "}
+                      {(visibleAreaFolders.find((folder) => folder.id === selectedId)?.rows
+                        .length ?? 0) === 1
+                        ? "artículo"
+                        : "artículos"}
                     </small>
                   </div>
                   <div className="people-filter-actions">
                     <button type="button" className="btn-clear-filter" onClick={() => setSelectedId(null)}>
                       Quitar filtro
                     </button>
-                    <button type="button" className="btn-full-inventory is-solid" onClick={showFullInventory}>
-                      Ver todo el inventario
-                    </button>
                   </div>
                 </div>
               ) : null}
 
-              {folders.length ? (
+              {visibleAreaFolders.length ? (
                 <div className="people-strip" role="list" ref={peopleStripRef}>
-                  {folders.map((folder) => {
+                  {visibleAreaFolders.map((folder) => {
                     const selected = selectedId === folder.id;
                     return (
                       <button
@@ -10155,8 +13262,52 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   })}
                 </div>
               ) : (
-                <p className="empty-groups">No hay grupos para mostrar.</p>
+                <p className="empty-groups">No hay áreas para mostrar con estos filtros.</p>
               )}
+            </section>
+          ) : null}
+
+          {rail === "estado" ? (
+            <section className="quick-access" aria-label="Estado">
+              <section className="reports-filter-panel people-reports-filter" aria-label="Filtros de estado">
+                <div className="reports-filter-grid">
+                  <div className="report-filter-item report-filter-search">
+                    <label htmlFor="estado-filter-search">Búsqueda rápida</label>
+                    <div className="report-search-wrap">
+                      <Search size={15} />
+                      <input
+                        id="estado-filter-search"
+                        placeholder="Ej. Activo, OF-0026, Martinez…"
+                        value={estadoSearch}
+                        onChange={(e) => setEstadoSearch(e.target.value)}
+                      />
+                      {estadoSearch ? (
+                        <button
+                          type="button"
+                          className="report-search-clear"
+                          onClick={() => {
+                            setEstadoSearch("");
+                            setDebouncedEstadoSearch("");
+                          }}
+                        >
+                          ×
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+                <div className="reports-top-actions">
+                  <button
+                    type="button"
+                    className="btn-rep-action"
+                    onClick={resetEstadoFilters}
+                    title="Restablecer filtros de estado"
+                  >
+                    <RotateCcw size={15} />
+                    <span>Restablecer</span>
+                  </button>
+                </div>
+              </section>
             </section>
           ) : null}
 
@@ -11022,9 +14173,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                       : rail === "areas"
                         ? selectedFolder
                           ? `Artículos de ${selectedFolder.name}`
-                          : "Artículos por área"
+                          : areaSearch.trim()
+                            ? "Artículos encontrados"
+                            : "Artículos por área"
                         : rail === "estado"
-                          ? "Estado del artículo"
+                          ? estadoSearch.trim()
+                            ? "Artículos encontrados"
+                            : "Estado del artículo"
                           : "Todos los artículos"}
                   </h2>
                   <p>
@@ -11036,7 +14191,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   </p>
                 </div>
                 <div className="sheet-heading-actions">
-                  {query ? <span className="filter-indicator">Filtrado por búsqueda</span> : null}
+                  {query ||
+                  (rail === "personas" && peopleSearch.trim()) ||
+                  (rail === "areas" && areaSearch.trim()) ||
+                  (rail === "estado" && estadoSearch.trim()) ||
+                  (rail === "inventario" && inventarioSearch.trim()) ? (
+                    <span className="filter-indicator">Filtrado por búsqueda</span>
+                  ) : null}
                   {selectedFolder ? (
                     <button type="button" className="btn-full-inventory is-solid" onClick={showFullInventory}>
                       Ver todo el inventario
@@ -11157,6 +14318,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                           isChecked={hasId && selectedRowIds.includes(rowId)}
                           onToggle={toggleRowSelection}
                           onOpen={openProductRow}
+                          catalogItems={items}
                         />
                       );
                     })}
@@ -11197,6 +14359,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         existingAreas={existingAreas}
         existingPeople={existingPeople}
         existingOrigens={inventarioOptions}
+        catalogItems={items}
       />
 
       {pendingChatDeleteRow ? (

@@ -28,7 +28,11 @@ import {
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import { updateInventarioAction, deleteInventarioAction } from "@/app/actions";
 import ModalPortal from "@/components/modal-portal";
-import { nextInventarioName } from "@/lib/inventario-origen";
+import {
+  displayOrigenLabel,
+  nextInventarioName,
+  resolveFuenteOrigen,
+} from "@/lib/inventario-origen";
 
 const ESTADO_OPTIONS = ["Activo", "Inactivo"] as const;
 
@@ -227,6 +231,7 @@ interface ProductDetailModalProps {
   existingAreas: string[];
   existingPeople: string[];
   existingOrigens: string[];
+  catalogItems?: InventarioRow[];
 }
 
 export default function ProductDetailModal({
@@ -238,10 +243,19 @@ export default function ProductDetailModal({
   existingAreas,
   existingPeople,
   existingOrigens,
+  catalogItems = [],
 }: ProductDetailModalProps) {
   const createOrigenOption = useMemo(
     () => nextInventarioName(existingOrigens),
     [existingOrigens],
+  );
+  const fuenteOrigen = useMemo(
+    () => (product ? resolveFuenteOrigen(product, catalogItems) : null),
+    [product, catalogItems],
+  );
+  const origenDisplay = useMemo(
+    () => (product ? displayOrigenLabel(product, catalogItems) : null),
+    [product, catalogItems],
   );
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -598,8 +612,11 @@ export default function ProductDetailModal({
                 <MapPin size={12} />
                 <span>{product.area || "General"}</span>
               </span>
-              <span className="detail-pill pill-origen">
+              <span className="detail-pill pill-origen" title="Inventario / conteo">
                 <span>{product.origen || "S/O"}</span>
+              </span>
+              <span className="detail-pill pill-fuente" title="Origen de los datos">
+                <span>Origen: {origenDisplay || "nuevo registro"}</span>
               </span>
               {product.cantidad && product.cantidad > 1 ? (
                 <span className="detail-pill pill-qty">
@@ -928,10 +945,18 @@ export default function ProductDetailModal({
                     <strong className="detail-value">{product.cantidad ?? 1} unidades</strong>
                   </div>
 
-                  {/* Origen */}
+                  {/* Inventario del conteo / bucket */}
+                  <div className="detail-card">
+                    <span className="detail-label">Inventario</span>
+                    <strong className="detail-value">{product.origen || "S/O"}</strong>
+                  </div>
+
+                  {/* Origen de los datos (csv/xlsx/Inventario N/nuevo registro) */}
                   <div className="detail-card">
                     <span className="detail-label">Origen</span>
-                    <strong className="detail-value">{product.origen || "S/O"}</strong>
+                    <strong className="detail-value">
+                      {origenDisplay || "nuevo registro"}
+                    </strong>
                   </div>
 
                   {/* Fechas de Sistema */}

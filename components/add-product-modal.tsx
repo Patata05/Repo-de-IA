@@ -33,7 +33,9 @@ import {
   findByEtiquetaCascade,
   latestInventarioName,
   listExistingOrigens,
+  nextFileOrigenFromFileName,
   nextInventarioName,
+  ORIGEN_NUEVO_REGISTRO,
   ORIGEN_SIN_ORIGEN,
   rowToFormFields,
 } from "@/lib/inventario-origen";
@@ -654,9 +656,20 @@ export default function AddProductModal({
     setIsSubmitting(true);
 
     try {
+      const prevObs = String(formData.observaciones || "").trim();
+      const copyNote =
+        fuenteOrigen && !/copiado desde/i.test(prevObs)
+          ? `Copiado desde ${fuenteOrigen}.`
+          : "";
+      const observaciones = copyNote
+        ? prevObs
+          ? `${prevObs}\n${copyNote}`
+          : copyNote
+        : prevObs || null;
       const result = await addInventarioAction({
         ...formData,
         origen: destino,
+        observaciones,
       });
 
       if (!result.success || !result.data) {
@@ -693,7 +706,7 @@ export default function AddProductModal({
     setIsImporting(true);
 
     try {
-      const origen = destinoInventario || defaultOrigen;
+      const origen = nextFileOrigenFromFileName(file.name, existingOrigens);
       const parsed = await parseInventarioImportFile(file, origen);
       if (!parsed.items.length) {
         setErrorMessage(
@@ -1211,7 +1224,7 @@ export default function AddProductModal({
                     }
                     aria-live="polite"
                   >
-                    <span>{fuenteOrigen || "Registro nuevo"}</span>
+                    <span>{fuenteOrigen || ORIGEN_NUEVO_REGISTRO}</span>
                   </div>
                 </div>
                 <div className="form-field">
