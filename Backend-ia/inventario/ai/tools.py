@@ -181,20 +181,29 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "actualizar_campo",
             "description": (
-                "Actualiza campos permitidos de un artículo por id. "
+                "Actualiza campos permitidos de un artículo. "
+                "Prefiere etiqueta (OF-0026, 281367…). El id numérico interno "
+                "NO es lo mismo que los dígitos de una etiqueta (OF-0026 ≠ id 26). "
                 "Campos: etiqueta, articulo, marca, modelo, serie, area, persona, "
                 "cantidad, observaciones, estado, origen."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "integer", "description": "ID del registro"},
+                    "id": {
+                        "type": "integer",
+                        "description": "ID interno numérico (solo si el usuario dio ese id, no dígitos de etiqueta).",
+                    },
+                    "etiqueta": {
+                        "type": "string",
+                        "description": "Etiqueta del artículo (preferida; ej. OF-0026).",
+                    },
                     "campos": {
                         "type": "object",
                         "description": "Mapa campo→valor a actualizar",
                     },
                 },
-                "required": ["id", "campos"],
+                "required": ["campos"],
             },
         },
     },
@@ -252,10 +261,47 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "buscar_inventario":
             query = str(args.get("query") or "").strip()
             limit = int(args.get("limit") or 15)
-            rows, total_matches, error = db.search_inventario_with_total(query, limit=limit)
+            limit = max(1, min(50, limit))
+            origen = str(args.get("origen") or "").strip() or None
+
+            # BM25 (ligero)
+            hybrid_items: list[dict] = []
+            engines: dict = {}
+            try:
+                from inventario.ai.rag_engine import hybrid_search, rebuild_index, status
+
+                all_rows, err_all, _used = db.read_inventario()
+                if not err_all and all_rows:
+                    rebuild_index(all_rows)
+                    hybrid_items = hybrid_search(
+                        query, all_rows, top_k=limit, origen=origen
+                    )
+                    engines = status()
+            except Exception as rag_exc:  # noqa: BLE001
+                hybrid_items = []
+                engines = {"error": str(rag_exc)}
+
+            if hybrid_items:
+                areas: dict[str, int] = {}
+                for row in hybrid_items:
+                    area = str(row.get("area") or "Sin área").strip() or "Sin área"
+                    areas[area] = areas.get(area, 0) + 1
+                return {
+                    "ok": True,
+                    "total": len(hybrid_items),
+                    "count": len(hybrid_items),
+                    "areas": areas,
+                    "items": [_compact_row(r) for r in hybrid_items],
+                    "search_mode": "bm25",
+                    "engines": engines,
+                }
+
+            rows, total_matches, error = db.search_inventario_with_total(
+                query, limit=limit
+            )
             if error:
                 return {"ok": False, "error": error}
-            areas: dict[str, int] = {}
+            areas = {}
             for row in rows:
                 area = str(row.get("area") or "Sin área").strip() or "Sin área"
                 areas[area] = areas.get(area, 0) + 1
@@ -265,6 +311,8 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "count": len(rows),
                 "areas": areas,
                 "items": [_compact_row(r) for r in rows],
+                "search_mode": "supabase_fallback",
+                "engines": engines,
             }
 
         if name == "resumen_inventario":
@@ -442,10 +490,40 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
 
         if name == "actualizar_campo":
-            row_id = int(args.get("id"))
             campos = args.get("campos") or {}
             if not isinstance(campos, dict):
                 return {"ok": False, "error": "campos debe ser un objeto"}
+            row_id = None
+            if args.get("id") is not None and str(args.get("id")).strip() != "":
+                try:
+                    row_id = int(args.get("id"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "id inválido", "mutated": False}
+            etiqueta = str(args.get("etiqueta") or "").strip()
+            if row_id is None and etiqueta:
+                found, error = db.get_by_etiqueta(etiqueta)
+                if error:
+                    return {"ok": False, "error": error, "mutated": False}
+                if not found:
+                    return {
+                        "ok": False,
+                        "error": f"No encontré la etiqueta {etiqueta}.",
+                        "mutated": False,
+                    }
+                try:
+                    row_id = int(found[0].get("id"))
+                except (TypeError, ValueError):
+                    return {
+                        "ok": False,
+                        "error": "La etiqueta no tiene id interno válido.",
+                        "mutated": False,
+                    }
+            if row_id is None:
+                return {
+                    "ok": False,
+                    "error": "Indica etiqueta (preferido) o id interno.",
+                    "mutated": False,
+                }
             row, error = db.update_inventario_row(row_id, campos)
             if error:
                 return {"ok": False, "error": error, "mutated": False}

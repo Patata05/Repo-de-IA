@@ -7,6 +7,7 @@ from django.views.decorators.http import require_GET, require_POST
 from inventario.ai.agent import run_chat_agent
 from inventario.ai.client import describe_llm_setup, get_llm_model
 from inventario.ai.local_fallback import local_chat_answer
+from inventario.ai.spell_normalize import normalize_chat_spelling
 from inventario.supabase_client import get_env, read_inventario
 
 
@@ -21,13 +22,22 @@ def health(request):
     env = get_env()
     setup = describe_llm_setup()
     rows, db_error, used = read_inventario()
+    rag_engines = {}
+    try:
+        # Solo status: NUNCA rebuild_index aquí (carga Torch/ST y calienta la CPU).
+        from inventario.ai.rag_engine import status
+
+        rag_engines = status()
+    except Exception as exc:  # noqa: BLE001
+        rag_engines = {"error": str(exc)}
     return JsonResponse(
         {
             "ok": setup.get("configured") and db_error is None,
             "llm": {
                 **setup,
                 "preferred_model": get_llm_model(),
-                "order": env.get("LLM_PROVIDERS") or "nvidia,muse,deepseek,groq,ollama,gemini",
+                "order": env.get("LLM_PROVIDERS") or "deepseek",
+                "temperature": 0,
             },
             "supabase": {
                 "configured": bool(env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")),
@@ -35,8 +45,26 @@ def health(request):
                 "rows_sample": len(rows) if not db_error else 0,
                 "error": db_error,
             },
+            "rag": {
+                "engines": rag_engines,
+                "stack": ["instructor", "bm25", "rapidfuzz", "pyspellchecker"],
+            },
         }
     )
+
+
+@csrf_exempt
+@require_POST
+def chat_normalize(request):
+    """Corrige typos con RapidFuzz + TheFuzz + pyspellchecker + Autocorrect."""
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "El mensaje no es JSON valido."}, status=400)
+
+    text = str(payload.get("text") or payload.get("message") or "").strip()
+    result = normalize_chat_spelling(text)
+    return JsonResponse(result)
 
 
 @csrf_exempt
@@ -50,6 +78,11 @@ def chat(request):
     message = str(payload.get("message") or "").strip()
     if not message:
         return JsonResponse({"error": "Escribe un mensaje."}, status=400)
+
+    # Ortografía antes del agente (RapidFuzz / TheFuzz / pyspellchecker / Autocorrect).
+    spell = normalize_chat_spelling(message)
+    if spell.get("normalized"):
+        message = str(spell["normalized"])
 
     history = payload.get("history")
     if history is not None and not isinstance(history, list):

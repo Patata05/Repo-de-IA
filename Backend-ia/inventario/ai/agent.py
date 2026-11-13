@@ -17,11 +17,23 @@ SYSTEM_PROMPT = """Eres el asistente experto de inventario de oficina (español 
 Eres ágil, proactivo y preciso: das contexto claro, cifras exactas y siguientes pasos útiles,
 sin inventar datos.
 
+MODO DETERMINISTA (temperatura 0):
+- No improvises inventarios, áreas ni etiquetas que no vengan de herramientas o del CONTEXTO RAG.
+- Si el CONTEXTO RAG / Instructor trae intención o filas, priorízalos.
+- Ante ambigüedad: una sola pregunta concreta. No cambies de tema a Contabilidad u otra área
+  si el usuario habla de Inventario N, etiquetas u omitir/importar.
+
+STACK DE BÚSQUEDA (ya integrado en herramientas):
+- BM25 léxico + herramientas Supabase.
+- Usa buscar_inventario / obtener_por_etiqueta / contar_por_campo; no inventes listados.
+
 REGLA DE ALCANCE ESTRICTA:
 - Respondes TODO lo relacionado con el inventario (totales, áreas, personas, etiquetas, series, marcas, modelos, estados activo/inactivo, observaciones, orígenes, recientes, códigos QR, altas, bajas, modificaciones e importación de archivos Excel/CSV).
 - Si preguntan algo ajeno al inventario, indícalo con amabilidad en 1 línea y ofrece opciones de consulta del inventario.
 - Responde SIEMPRE con datos reales de las herramientas. NUNCA inventes totales ni redondees a 1000.
 - Cuando una herramienta devuelve `"total"` y `"count"`, `"total"` es el total real de coincidencias en el inventario y `"count"` es la muestra cargada en el visor derecho. Reporta siempre `"total"` como la cifra principal.
+- Continuidad: «esa/ese» = etiqueta o foco del mensaje de arriba. «omite esa e importa el resto» = excluir esa etiqueta y copiar las demás entre inventarios.
+- Unicidad: solo la ETIQUETA es irrepetible dentro del mismo origen (Inventario N). Serie, marca, modelo, área, persona, etc. SÍ se pueden repetir (p. ej. lote con la misma serie). No digas que la serie es única.
 
 Ortografía:
 - El usuario puede escribir con errores (ej. "generla", "inventaro", "codigos", "bbliteca").
@@ -49,6 +61,10 @@ Cambios (actualizar / crear / eliminar):
 - Si piden cambiar datos: primero busca el registro y PROPÓN el cambio.
 - Formato OBLIGATORIO de la propuesta (una línea por cambio):
   • **ETIQUETA** · **campo** · “valor actual” → “valor nuevo”
+- Etiqueta ≠ id interno: OF-0026 / 281367 / RH-15 son etiquetas. NUNCA uses
+  dígitos parciales (26 de OF-0026) como id. Prefiere etiqueta= en actualizar_campo.
+- Si el cambio cayó en el registro equivocado: restaura el mal tocado y aplica
+  en la etiqueta correcta (cualquier par, no un caso fijo).
 - NUNCA llames actualizar_campo ni crear_articulo hasta que el usuario confirme (sí / confirma / adelante / ok / dale).
 - Eliminar registros: pide la etiqueta si falta y aclara que debe confirmar en el aviso modal.
 - Comparar inventarios (Inventario N vs S/O): resume faltan X / sobran Y / cambiaron Z; no digas solo “hay duplicados”.
@@ -72,7 +88,7 @@ Estilo de respuesta (importante):
   "previousTotal", úsalo con naturalidad cuando pregunten por eso.
 """
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 5
 MAX_SIDE_ITEMS = 50
 MAX_HISTORY_TURNS = 8
 MAX_HISTORY_CHARS = 550
@@ -246,7 +262,7 @@ def _chat_with_failover(
                     messages=messages,
                     tools=OPENAI_TOOLS,
                     tool_choice="auto",
-                    temperature=0.15,
+                    temperature=0,
                     max_tokens=MAX_COMPLETION_TOKENS,
                 )
                 label = f"{endpoint.provider}:{model}"
@@ -1215,6 +1231,16 @@ def run_chat_agent(
     memory: str | None = None,
     preferred_model: str | None = None,
 ) -> tuple[str, str | None, str | None, list[dict], bool, list[dict], dict]:
+    # Defensa extra: normalizar ortografía si el caller no lo hizo.
+    try:
+        from inventario.ai.spell_normalize import normalize_chat_spelling
+
+        spelled = normalize_chat_spelling(message or "")
+        if spelled.get("normalized"):
+            message = str(spelled["normalized"])
+    except Exception:
+        pass
+
     endpoints = get_llm_endpoints()
     primary_ep, default_model = _resolve_preferred_target(endpoints, preferred_model)
     default_provider = primary_ep.provider if primary_ep else "local"
@@ -1222,7 +1248,7 @@ def run_chat_agent(
 
     if not endpoints:
         return (
-            "No hay proveedores de IA listos. Configura NVIDIA_API_KEY, MODEL_API_KEY, GROQ_API_KEY o GEMINI_API_KEY.",
+            "No hay proveedores de IA listos. Configura DEEPSEEK_API_KEY.",
             "missing_key",
             None,
             [],
@@ -1373,6 +1399,49 @@ def run_chat_agent(
                 "content": memory_text,
             }
         )
+
+    # Instructor (temp=0) + RAG BM25 para coordinar inventarios
+    try:
+        from inventario.ai.intent_router import (
+            classify_intent_with_instructor,
+            intent_to_hint,
+        )
+        from inventario.ai.rag_engine import (
+            format_rag_context,
+            hybrid_search,
+            rebuild_index,
+        )
+        from inventario.supabase_client import read_inventario
+
+        thread_bits = []
+        for item in (history or [])[-4:]:
+            t = str(item.get("content") or item.get("text") or "").strip()
+            if t:
+                thread_bits.append(t[:160])
+        thread_hint = " | ".join(thread_bits)
+
+        if primary_ep is not None:
+            intent = classify_intent_with_instructor(
+                primary_ep.client,
+                model=default_model,
+                user_text=message,
+                thread_hint=thread_hint,
+            )
+            hint = intent_to_hint(intent)
+            if hint:
+                messages.append({"role": "system", "content": hint})
+
+        rows, err, _u = read_inventario()
+        if not err and rows:
+            rebuild_index(rows)
+            rag_q = message
+            hits = hybrid_search(rag_q, rows, top_k=12)
+            ctx = format_rag_context(hits)
+            if ctx:
+                messages.append({"role": "system", "content": ctx})
+    except Exception:
+        pass
+
     recent_history = (history or [])[-MAX_HISTORY_TURNS:]
     for item in recent_history:
         role = str(item.get("role") or "").strip().lower()
@@ -1510,6 +1579,22 @@ def run_chat_agent(
                 None,
                 used_label,
                 side,
+                mutated,
+                qr_payloads,
+                usage_info,
+            )
+        # Evitar el mensaje genérico “demasiados pasos” en copias Inv N→M.
+        low = (message or "").lower()
+        if "inventario" in low and any(
+            w in low for w in ("pasa", "mete", "copia", "importa", "intenta", "omit")
+        ):
+            return (
+                "Para copiar entre inventarios usa una frase clara, por ejemplo: "
+                "«pasa todo Inventario 1 a Inventario 3 omitiendo las que ya existan». "
+                "Solo la **etiqueta** es única por inventario; la **serie** sí se puede repetir.",
+                None,
+                used_label or "local:hint",
+                [],
                 mutated,
                 qr_payloads,
                 usage_info,
