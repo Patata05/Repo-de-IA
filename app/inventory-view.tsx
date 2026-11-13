@@ -59,6 +59,7 @@ import {
   deleteInventarioManyAction,
   restoreInventarioManyAction,
   updateInventarioAction,
+  updateInventarioManyAction,
 } from "@/app/actions";
 import AddProductModal from "@/components/add-product-modal";
 import ChatViewer from "@/components/chat-viewer";
@@ -78,6 +79,8 @@ import {
   formatInventarioDiffReply,
   listExistingOrigens,
   matchOrigenFromPrompt,
+  normalizeOrigenLabel,
+  planImportOrigen,
   ORIGEN_SIN_ORIGEN,
 } from "@/lib/inventario-origen";
 import { formatInventarioQrCompact } from "@/lib/inventario-qr";
@@ -109,6 +112,14 @@ import {
   detectExcelExportAsk,
   type ChatExportFile,
 } from "@/lib/export-inventario-excel";
+import {
+  buildBulkTransferConfirmReply,
+  buildBulkTransferDoneReply,
+  detectBulkTransferAsk,
+  isNegativeChat,
+  type BulkTransferField,
+  type PendingBulkTransfer,
+} from "@/lib/bulk-transfer";
 const ReportsView = lazy(() => import("@/components/reports-view"));
 
 const CHAT_QUICK_ACTIONS = [
@@ -500,6 +511,274 @@ function looksLikeResultAnaphora(userText: string) {
   return false;
 }
 
+/** Refiere al área/persona del chat anterior sin volver a nombrarla. */
+function looksLikeContextAnaphora(userText: string) {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /\b(el|la|esa|este|esta|ese)\s+areas?\b/.test(n) ||
+    /\bdel\s+areas?\b/.test(n) ||
+    /\b(esa|esta)\s+areas?\b/.test(n) ||
+    /\bmisma\s+areas?\b/.test(n) ||
+    /\b(en|de)\s+(esa|esta|la)\s+areas?\b/.test(n) ||
+    /\b(ahi|alla|alli|aqui)\b/.test(n) ||
+    /\bde\s+que\s+tiene\b/.test(n) ||
+    /\bque\s+tiene\s+(el|la|esa|esta)\b/.test(n) ||
+    /\b(esa|este|esta|ese)\s+persona\b/.test(n) ||
+    /\b(su|sus)\s+(inventario|registros?|etiquetas?|equipos?)\b/.test(n)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Follow-up genérico: usa el foco del mensaje anterior (área/persona)
+ * cuando el usuario dice “el área”, “ahí”, “dame los N registros”, etc.
+ */
+function detectContextFollowUpAsk(
+  userText: string,
+  inventory: InventarioRow[],
+  recentMessages: Array<{
+    from: string;
+    text: string;
+    viewerFocus?: string;
+    viewerOverview?: ViewerOverview;
+  }>,
+):
+  | {
+      kind: "area";
+      area: AreaCandidateSummary;
+      intent: "list" | "total" | "people";
+      limit: number | null;
+    }
+  | {
+      kind: "person";
+      person: PersonCandidateSummary;
+      intent: "list" | "total";
+      limit: number | null;
+    }
+  | undefined {
+  if (!inventory.length || !recentMessages.length) return undefined;
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
+    return undefined;
+  }
+  if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
+    return undefined;
+  }
+
+  // Si ya nombró un área/persona de forma clara, no usar solo el contexto.
+  const namedArea = findMatchingAreasForPrompt(userText, inventory);
+  if (
+    namedArea &&
+    !namedArea.uncertain &&
+    namedArea.candidates.length === 1 &&
+    !looksLikeContextAnaphora(userText)
+  ) {
+    return undefined;
+  }
+  const namedPerson = findMatchingPeopleForPrompt(userText, inventory);
+  if (
+    namedPerson &&
+    namedPerson.candidates.length === 1 &&
+    !looksLikeContextAnaphora(userText) &&
+    !looksLikePersonAnaphora(userText)
+  ) {
+    return undefined;
+  }
+
+  const wantsData = intentHas(
+    n,
+    "dame",
+    "muestra",
+    "mostrar",
+    "ver",
+    "trae",
+    "lista",
+    "listar",
+    "cuantos",
+    "cuantas",
+    "cuanto",
+    "cuanta",
+    "total",
+    "totales",
+    "hay",
+    "tiene",
+    "tienen",
+    "registro",
+    "registros",
+    "etiqueta",
+    "etiquetas",
+    "equipo",
+    "equipos",
+    "articulo",
+    "articulos",
+    "persona",
+    "personas",
+    "detalle",
+    "info",
+  );
+  if (!wantsData && !looksLikeContextAnaphora(userText)) return undefined;
+
+  const useContext =
+    looksLikeContextAnaphora(userText) ||
+    // “dame los 32 registros” sin nombrar área nueva → del foco previo
+    (wantsData &&
+      intentHas(
+        n,
+        "registro",
+        "registros",
+        "etiqueta",
+        "etiquetas",
+        "equipo",
+        "equipos",
+        "articulo",
+        "articulos",
+        "persona",
+        "personas",
+        "total",
+        "totales",
+      ) &&
+      !(namedArea && !namedArea.uncertain && namedArea.candidates.length === 1));
+
+  if (!useContext) return undefined;
+
+  let focusName = "";
+  let focusKind: "area" | "person" | "" = "";
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const message = recentMessages[i];
+    if (message.from !== "bot") continue;
+    const focus = String(message.viewerFocus || "").trim();
+    if (!focus) continue;
+    if (
+      message.viewerOverview === "areaTotal" ||
+      message.viewerOverview === "areaMatches"
+    ) {
+      focusName = focus.includes("::")
+        ? focus.slice(0, focus.indexOf("::")).trim() || focus
+        : focus;
+      // areaMatches focus is query label; prefer candidate from encode
+      if (focus.includes("::")) {
+        const parsed = parseMatchesFocusFromMessage(focus);
+        focusName = parsed?.candidates[0] || focusName;
+      }
+      focusKind = "area";
+      break;
+    }
+    if (
+      message.viewerOverview === "personTotal" ||
+      message.viewerOverview === "personMatches"
+    ) {
+      focusName = focus.includes("::")
+        ? (() => {
+            const parsed = parseMatchesFocusFromMessage(focus);
+            return parsed?.candidates[0] || focus;
+          })()
+        : focus;
+      focusKind = "person";
+      break;
+    }
+    // Bot habló de un área en texto aunque no haya overview
+    focusName = focus;
+    const areaHit = getAllAreaCatalog(inventory).find(
+      (c) => c.name === focus || areaMatchesNeedle(c.name, focus),
+    );
+    if (areaHit) {
+      focusKind = "area";
+      focusName = areaHit.name;
+      break;
+    }
+    const personHit = getAllPersonCatalog(inventory).find(
+      (c) => c.name === focus || normalizePlain(c.name).includes(normalizePlain(focus)),
+    );
+    if (personHit) {
+      focusKind = "person";
+      focusName = personHit.name;
+      break;
+    }
+  }
+
+  // También del lastConcreteSide si no hubo viewerFocus
+  if (!focusKind) {
+    // Buscar en el último bot mención de área conocida en el reply
+    for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+      const message = recentMessages[i];
+      if (message.from !== "bot" || !message.text) continue;
+      const catalog = getAllAreaCatalog(inventory);
+      for (const area of catalog) {
+        if (
+          message.text.includes(area.name) ||
+          normalizePlain(message.text).includes(area.norm)
+        ) {
+          focusKind = "area";
+          focusName = area.name;
+          break;
+        }
+      }
+      if (focusKind) break;
+    }
+  }
+
+  if (!focusKind || !focusName) return undefined;
+
+  const limit = parseRequestedCount(userText);
+  const wantsPeople =
+    intentHas(n, "persona", "personas", "quien", "quienes") &&
+    !intentHas(n, "registro", "registros", "etiqueta", "etiquetas", "equipo", "equipos");
+  const wantsTotalOnly =
+    intentHas(n, "total", "totales", "cuantos", "cuantas") &&
+    !intentHas(
+      n,
+      "dame",
+      "muestra",
+      "mostrar",
+      "ver",
+      "lista",
+      "listar",
+      "etiqueta",
+      "etiquetas",
+      "registro",
+      "registros",
+    );
+
+  if (focusKind === "area") {
+    const area =
+      getAllAreaCatalog(inventory).find((c) => c.name === focusName) ||
+      getAllAreaCatalog(inventory).find((c) =>
+        areaMatchesNeedle(c.name, focusName),
+      );
+    if (!area) return undefined;
+    if (wantsPeople) {
+      return { kind: "area", area, intent: "people", limit: null };
+    }
+    return {
+      kind: "area",
+      area,
+      intent: wantsTotalOnly ? "total" : "list",
+      limit:
+        limit != null
+          ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, limit))
+          : null,
+    };
+  }
+
+  const person =
+    getAllPersonCatalog(inventory).find((c) => c.name === focusName) ||
+    getAllPersonCatalog(inventory).find((c) =>
+      normalizePlain(c.name).includes(normalizePlain(focusName)),
+    );
+  if (!person) return undefined;
+  return {
+    kind: "person",
+    person,
+    intent: wantsTotalOnly ? "total" : "list",
+    limit:
+      limit != null ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, limit)) : null,
+  };
+}
+
 /** "dame sus etiquetas/registros" de la persona del mensaje anterior. */
 function looksLikePersonEtiquetasAsk(userText: string) {
   const n = normalizeChatIntent(userText);
@@ -623,16 +902,13 @@ function buildVagueFollowUpReply(prevCount: number) {
   if (prevCount > 0) {
     return (
       `Del mensaje anterior tengo **${prevCount.toLocaleString("es-MX")}** registro` +
-      `${prevCount === 1 ? "" : "s"}, pero no capté bien la acción.\n\n` +
-      `¿Qué quieres hacer?\n` +
-      `• Abrir ese listado en el visor\n` +
-      `• Filtrar por área / marca / persona\n` +
-      `• Comparar inventarios (faltan / sobran / cambiaron)\n` +
-      `• Cambiar un campo (te pediré confirmación)`
+      `${prevCount === 1 ? "" : "s"}, pero no capté bien la acción. ` +
+      `¿Quieres que abra ese listado en el visor, filtre por área/marca/persona, ` +
+      `compare inventarios o cambie un dato (con confirmación)?`
     );
   }
   return (
-    `No capté bien la acción y prefiero no inventar una búsqueda.\n\n` +
+    `No capté bien la acción y prefiero no inventar una búsqueda. ` +
     `Dime qué necesitas: buscar, comparar inventarios, cambiar un dato o ver un listado.`
   );
 }
@@ -682,6 +958,64 @@ function lastBotViewerFocus(messages: ChatMessage[]): string | null {
   return null;
 }
 
+function resolveCanonicalPerson(
+  raw: string,
+  inventory: InventarioRow[],
+): { name: string; rows: InventarioRow[] } | null {
+  const catalog = getAllPersonCatalog(inventory);
+  const n = normalizePlain(raw);
+  if (!n) return null;
+  let best: PersonCandidateSummary | null = null;
+  let bestScore = 0;
+  for (const person of catalog) {
+    let score = 0;
+    if (person.norm === n) score = 1000;
+    else if (person.norm.includes(n) || n.includes(person.norm)) {
+      score = 700 + Math.min(person.norm.length, n.length);
+    } else {
+      const toks = n.split(" ").filter(Boolean);
+      if (toks.length && toks.every((t) => person.tokens.includes(t))) {
+        score = 500 + toks.length * 20;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = person;
+    }
+  }
+  if (!best || bestScore < 80) return null;
+  return { name: best.name, rows: best.rows };
+}
+
+function resolveCanonicalArea(
+  raw: string,
+  inventory: InventarioRow[],
+): string | null {
+  const building = matchBuildingFromPrompt(raw, inventory);
+  if (building) return building;
+  const n = normalizePlain(raw);
+  if (!n) return null;
+  const areas = [
+    ...new Set(
+      inventory.map((row) => String(row.area ?? "").trim()).filter(Boolean),
+    ),
+  ];
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const area of areas) {
+    const a = normalizePlain(area);
+    let score = 0;
+    if (a === n) score = 1000;
+    else if (a.includes(n) || n.includes(a)) score = 700;
+    else if (areaMatchesNeedle(area, n)) score = 400;
+    if (score > bestScore) {
+      bestScore = score;
+      best = area;
+    }
+  }
+  return bestScore >= 400 ? best : null;
+}
+
 function buildExcelExportReply(files: ChatExportFile[]): string {
   if (!files.length) {
     return "No pude armar el Excel: no hay registros para esa consulta.";
@@ -707,6 +1041,147 @@ function buildExcelExportReply(files: ChatExportFile[]): string {
     `Aquí tienes tus archivos:\n\n` +
     `${lines.join("\n")}\n\n` +
     `Cada libro usa las columnas: ${cols}.`
+  );
+}
+
+function pickOne<T>(options: T[]): T {
+  return options[Math.floor(Math.random() * options.length)]!;
+}
+
+/** Vista previa de import: mismo dato, prosa distinta cada vez. */
+function buildChatImportPreviewReply(input: {
+  fileName: string;
+  sheetName?: string;
+  origen: string;
+  source:
+    | "prompt"
+    | "column"
+    | "sheet"
+    | "file"
+    | "filter"
+    | "default";
+  count: number;
+  rawValid: number;
+  dups: number;
+  sample: string;
+  more: string;
+}): string {
+  const n = formatNumber(input.count);
+  const sheetBit = input.sheetName ? ` (hoja “${input.sheetName}”)` : "";
+  const origen = input.origen;
+
+  const sourcePhrase =
+    input.source === "sheet"
+      ? pickOne([
+          `la hoja “${input.sheetName}”`,
+          "el nombre de la hoja",
+          "cómo se llama la hoja del Excel",
+        ])
+      : input.source === "file"
+        ? pickOne([
+            "el nombre del archivo",
+            "cómo se llama el Excel",
+            "el título del archivo",
+          ])
+        : input.source === "column"
+          ? pickOne([
+              "la columna Origen",
+              "el origen que viene en cada fila",
+              "lo que marca la columna de origen",
+            ])
+          : input.source === "prompt"
+            ? pickOne([
+                "lo que me pediste",
+                "tu indicación",
+                "el destino que escribiste",
+              ])
+            : input.source === "filter"
+              ? pickOne([
+                  "el inventario que tienes seleccionado",
+                  "el filtro activo",
+                ])
+              : pickOne([
+                  "que no traía origen claro",
+                  "que el Excel no dejaba claro el origen",
+                ]);
+
+  const open = pickOne(
+    origen === "S/O" || origen === ORIGEN_SIN_ORIGEN
+      ? [
+          `Listo, ya leí “${input.fileName}”${sheetBit}. Como no había origen claro (${sourcePhrase}), lo dejaré en **${ORIGEN_SIN_ORIGEN}**.`,
+          `Revisé “${input.fileName}”${sheetBit}. Sin un origen explícito (${sourcePhrase}), el destino será **${ORIGEN_SIN_ORIGEN}**.`,
+          `Archivo cargado: “${input.fileName}”${sheetBit}. Voy con **${ORIGEN_SIN_ORIGEN}** porque ${sourcePhrase}.`,
+        ]
+      : [
+          `Perfecto, ya leí “${input.fileName}”${sheetBit}. El destino queda en **${origen}** (según ${sourcePhrase}).`,
+          `Listo con “${input.fileName}”${sheetBit}. Voy a meterlo en **${origen}**, tomando ${sourcePhrase}.`,
+          `Ya revisé el Excel${sheetBit}. Origen: **${origen}** (${sourcePhrase}).`,
+          `“${input.fileName}”${sheetBit} listo. Lo asociaré a **${origen}**.`,
+          `Claro. Para este archivo el origen es **${origen}** (${sourcePhrase}).`,
+        ],
+  );
+
+  const countLine =
+    input.dups > 0
+      ? pickOne([
+          `Hay **${formatNumber(input.rawValid)}** filas con etiqueta y artículo; **${formatNumber(input.dups)}** etiqueta${input.dups === 1 ? "" : "s"} se repite${input.dups === 1 ? "" : "n"}, así que importaré **${n}** únicos.`,
+          `Detecté **${formatNumber(input.rawValid)}** filas útiles y **${formatNumber(input.dups)}** duplicado${input.dups === 1 ? "" : "s"} de etiqueta → quedarán **${n}**.`,
+          `En total **${n}** registros únicos para importar (había ${formatNumber(input.dups)} etiqueta${input.dups === 1 ? "" : "s"} repetida${input.dups === 1 ? "" : "s"}).`,
+        ])
+      : pickOne([
+          `Encontré **${n}** registro${input.count === 1 ? "" : "s"} con etiqueta y artículo.`,
+          `Son **${n}** registros listos (etiqueta + artículo).`,
+          `Sale un total de **${n}** filas válidas.`,
+          `Van **${n}** artículos con código legible.`,
+        ]);
+
+  const sampleIntro = pickOne([
+    "Un vistazo:",
+    "Por ejemplo:",
+    "Algunos de ellos:",
+    "Muestra rápida:",
+  ]);
+
+  const ask = pickOne([
+    `¿Los importo ahora a **${origen}**? Responde **sí** o **importalos**.`,
+    `¿Sigo y los cargo en **${origen}**? Dime **sí** o **importalos**.`,
+    `Si te late, confirmo la carga a **${origen}** con **sí** / **importalos**.`,
+    `¿Arranco la importación a **${origen}**? **sí** o **importalos**.`,
+  ]);
+
+  return (
+    `${open}\n\n` +
+    `${countLine}\n` +
+    `${sampleIntro}\n${input.sample}${input.more}\n\n` +
+    ask
+  );
+}
+
+function buildChatImportMixedReply(input: {
+  fileName: string;
+  sheetName?: string;
+  mixLines: string;
+  dupNote: string;
+  sample: string;
+  more: string;
+}): string {
+  const sheetBit = input.sheetName ? ` (hoja “${input.sheetName}”)` : "";
+  const open = pickOne([
+    `Leí “${input.fileName}”${sheetBit}, pero el origen viene **mezclado** entre los registros.`,
+    `El Excel “${input.fileName}”${sheetBit} trae **varios orígenes** a la vez.`,
+    `Revisé “${input.fileName}”${sheetBit} y no es un solo inventario: hay orígenes distintos.`,
+  ]);
+  const pending = pickOne([
+    `Dejé **todos** pendientes. Puedes responder **sí** para respetar el origen de cada fila, o decir un solo destino («importar a Inventario 1» / «a S/O»).`,
+    `No los meto todavía. **sí** = importar respetando cada origen; o indícame un destino único.`,
+    `Quedan en espera: confirma con **sí** (origen por fila) o elige un solo destino.`,
+  ]);
+  return (
+    `${open}\n\n` +
+    `${input.mixLines}\n` +
+    `${input.dupNote}\n\n` +
+    `${pending}\n\n` +
+    `${input.sample}${input.more}`
   );
 }
 
@@ -851,6 +1326,14 @@ const AREA_STOP_WORDS = new Set([
   "solamente",
   "persona",
   "personas",
+  "des",
+  "ahi",
+  "alla",
+  "alli",
+  "aqui",
+  "ahora",
+  "quiero",
+  "me",
 ]);
 
 function looksLikeAreaQuery(plain: string) {
@@ -887,11 +1370,38 @@ function matchBuildingFromPrompt(
   return hits[0];
 }
 
+const AREA_ACRONYM_SKIP = new Set([
+  "de",
+  "del",
+  "la",
+  "el",
+  "los",
+  "las",
+  "y",
+  "e",
+  "en",
+  "a",
+  "al",
+  "un",
+  "una",
+]);
+
+/** Siglas de un área: "recursos humanos" → "rh", "sistemas y ti" → "sti". */
+function areaAcronym(normArea: string) {
+  return normArea
+    .split(" ")
+    .filter((t) => t && !AREA_ACRONYM_SKIP.has(t))
+    .map((t) => t[0] || "")
+    .join("");
+}
+
 function areaMatchesNeedle(area: string, needle: string) {
   const a = normalizePlain(area);
   const n = normalizePlain(needle);
   if (!a || !n) return false;
   if (a === n || a.includes(n) || n.includes(a)) return true;
+  const acro = areaAcronym(a);
+  if (acro && (acro === n || (n.length >= 2 && acro.startsWith(n)))) return true;
   const aToks = a.split(" ").filter(Boolean);
   const nToks = n.split(" ").filter(Boolean);
   if (nToks.length && nToks.every((tok) => aToks.includes(tok))) return true;
@@ -923,40 +1433,40 @@ function extractAreaNeedle(
   const raw = (afterArea?.[1] || user)
     .split(/\s+/)
     .filter((t, i, toks) => {
-      if (t.length <= 2 || AREA_STOP_WORDS.has(t)) return false;
+      if (AREA_STOP_WORDS.has(t)) return false;
+      // Abreviaturas cortas (RH, TI, TICs…) sí cuentan.
+      if (t.length <= 1) return false;
+      if (t.length === 2 && !/^[a-z]{2}$/.test(t)) return false;
       // "inventario general" no es el área llamada "general".
       if (t === "general" && toks[i - 1] === "inventario") return false;
       return true;
     });
   if (!raw.length) return undefined;
 
-  const { tokens: areaTokens } = getAreaSearchIndex(inventory);
-  let best: { token: string; score: number } | null = null;
+  // Siglas: "RH" → área cuyo acrónimo coincida.
+  const catalog = getAllAreaCatalog(inventory);
   for (const cand of raw) {
-    // Exacto / substring primero (barato).
-    for (const tok of areaTokens) {
-      if (cand === tok) {
-        return tok;
-      }
-      if (tok.includes(cand) || cand.includes(tok)) {
-        const score = Math.min(tok.length, cand.length) + 20;
-        if (!best || score > best.score) best = { token: tok, score };
-      }
-    }
-    if (best && best.score >= 24) continue;
-    const budget = typoBudget(cand);
-    if (budget <= 0) continue;
-    for (const tok of areaTokens) {
-      if (Math.abs(tok.length - cand.length) > budget) continue;
-      const dist = levenshtein(cand, tok);
-      if (dist <= budget) {
-        const score = tok.length + 10 - dist;
-        if (!best || score > best.score) best = { token: tok, score };
-        if (dist === 1) break;
-      }
-    }
+    if (cand.length > 6) continue;
+    const hits = catalog.filter((area) => {
+      const acro = areaAcronym(area.norm);
+      return acro === cand || (cand.length >= 2 && acro.startsWith(cand));
+    });
+    if (hits.length === 1) return hits[0].name;
   }
-  return best?.token;
+
+  const { tokens: areaTokens } = getAreaSearchIndex(inventory);
+  // Solo matches seguros aquí (exacto / prefijo único). Los typos los confirma
+  // findMatchingAreasForPrompt preguntando “¿te referías a…?”.
+  for (const cand of raw) {
+    for (const tok of areaTokens) {
+      if (cand === tok) return tok;
+    }
+    const prefixHits = areaTokens.filter(
+      (tok) => tok.length >= 4 && cand.length >= 3 && tok.startsWith(cand),
+    );
+    if (prefixHits.length === 1) return prefixHits[0];
+  }
+  return undefined;
 }
 
 /** Área mencionada en el pedido (nombre canónico o aguja de filtro). */
@@ -1175,6 +1685,12 @@ const AREA_QUERY_STOP_WORDS = new Set([
   "existen",
   "ubicado",
   "ubicados",
+  "des",
+  "ahi",
+  "alla",
+  "alli",
+  "aqui",
+  "ahora",
   "ubicada",
   "ubicadas",
   "pertenece",
@@ -1343,37 +1859,81 @@ function getAllPersonCatalog(inventory: InventarioRow[]): PersonCandidateSummary
   return out;
 }
 
+type AreaTokenMatch = { token: string; confidence: "exact" | "fuzzy" };
+
 function matchSingleAreaVocabularyToken(
   rawTok: string,
   allAreaTokens: Set<string>,
-): string | null {
+): AreaTokenMatch | null {
   if (!rawTok) return null;
-  if (allAreaTokens.has(rawTok)) return rawTok;
+  if (allAreaTokens.has(rawTok)) return { token: rawTok, confidence: "exact" };
   // Prefijo o singular/plural simple (ej. "cubiculos" -> "cubiculo", "salas" -> "sala")
   if (rawTok.endsWith("s") && rawTok.length > 3) {
     const sing = rawTok.slice(0, -1);
-    if (allAreaTokens.has(sing)) return sing;
+    if (allAreaTokens.has(sing)) return { token: sing, confidence: "exact" };
   }
-  const budget = typoBudget(rawTok);
-  if (budget <= 0) return null;
+  // Prefijo exacto: "mark" → "marketing" (seguro si el usuario escribió bien el inicio)
+  let prefixHit: string | null = null;
+  let prefixCount = 0;
+  for (const vocabTok of allAreaTokens) {
+    if (vocabTok.length < 4) continue;
+    if (vocabTok.startsWith(rawTok) && rawTok.length >= 3) {
+      prefixCount += 1;
+      if (!prefixHit || vocabTok.length < prefixHit.length) prefixHit = vocabTok;
+    }
+  }
+  if (prefixHit && prefixCount === 1) {
+    return { token: prefixHit, confidence: "exact" };
+  }
+  if (prefixHit && prefixCount > 1) {
+    // Varias áreas comparten el prefijo → no auto-elegir; el caller desambigua.
+    return { token: prefixHit, confidence: "fuzzy" };
+  }
+
+  // Typos difíciles (venbtas, merke, contablidad…) → fuzzy; el caller pregunta si duda.
+  const fuzzyBudget =
+    rawTok.length >= 4 ? Math.max(1, typoBudget(rawTok)) : typoBudget(rawTok);
+  if (fuzzyBudget <= 0) return null;
+  const variants = spellingVariants(rawTok);
   let best: { tok: string; dist: number } | null = null;
   for (const vocabTok of allAreaTokens) {
     if (vocabTok.length <= 2) continue;
-    if (Math.abs(vocabTok.length - rawTok.length) > budget) continue;
-    const dist = levenshtein(rawTok, vocabTok);
-    if (dist <= budget && (!best || dist < best.dist)) {
-      best = { tok: vocabTok, dist };
-      if (dist === 1) break;
+    for (const cand of variants) {
+      if (allAreaTokens.has(cand)) {
+        return { token: cand, confidence: "fuzzy" };
+      }
+      if (vocabTok.startsWith(cand) && cand.length >= 3) {
+        const dist = Math.abs(vocabTok.length - cand.length) > 0 ? 1 : 0;
+        if (!best || dist < best.dist) best = { tok: vocabTok, dist };
+      }
+      if (Math.abs(vocabTok.length - cand.length) <= fuzzyBudget + 1) {
+        const dist = levenshtein(cand, vocabTok);
+        if (dist <= fuzzyBudget && (!best || dist < best.dist)) {
+          best = { tok: vocabTok, dist };
+        }
+      }
+      if (cand.length >= 4 && vocabTok.length > cand.length) {
+        const dist = levenshtein(cand, vocabTok.slice(0, cand.length));
+        if (dist <= fuzzyBudget && (!best || dist < best.dist)) {
+          best = { tok: vocabTok, dist };
+        }
+      }
     }
   }
-  return best?.tok ?? null;
+  return best ? { token: best.tok, confidence: "fuzzy" } : null;
 }
 
 function extractAreaQueryTokens(
   userText: string,
   catalog: AreaCandidateSummary[],
-): { rawLabel: string; matchedTokens: string[] } | null {
-  const plain0 = normalizePlain(userText);
+): {
+  rawLabel: string;
+  matchedTokens: string[];
+  confidence: "exact" | "fuzzy";
+  rawNeedles: string[];
+} | null {
+  // normalizeChatIntent aplica aliases (venbtas→ventas, peronas→personas).
+  const plain0 = normalizeChatIntent(userText) || normalizePlain(userText);
   if (!plain0 || /\b\d{4,}\b/.test(plain0)) return null;
   const stripped = stripRequestedCountPhrases(plain0).replace(
     /\b(?:edificios?|edifs)\b/g,
@@ -1397,6 +1957,8 @@ function extractAreaQueryTokens(
     return {
       rawLabel: "biblioteca vieja (Edif. B Biblioteca)",
       matchedTokens: ["edif", "b", "biblioteca"],
+      confidence: "exact",
+      rawNeedles: rawTokens,
     };
   }
 
@@ -1406,22 +1968,86 @@ function extractAreaQueryTokens(
   }
 
   const matchedTokens: string[] = [];
+  let confidence: "exact" | "fuzzy" = "exact";
+  let skippedNoise = 0;
   for (const rt of rawTokens) {
     const matched = matchSingleAreaVocabularyToken(rt, allAreaTokens);
-    if (!matched) {
-      // Contiene un término que no pertenece a ningún área (ej. "laptops", "dell")
-      return null;
+    if (matched) {
+      if (matched.confidence === "fuzzy") confidence = "fuzzy";
+      if (!matchedTokens.includes(matched.token)) matchedTokens.push(matched.token);
+      continue;
     }
-    if (!matchedTokens.includes(matched)) {
-      matchedTokens.push(matched);
+    // Abreviatura / siglas (RH, TI): una sola área clara → seguro.
+    if (/^[a-z]{2,6}$/.test(rt)) {
+      const byAcro = catalog.filter((c) => {
+        const acro = areaAcronym(c.norm);
+        return acro === rt || (rt.length >= 2 && acro.startsWith(rt));
+      });
+      if (byAcro.length === 1) {
+        for (const t of byAcro[0].tokens) {
+          if (!matchedTokens.includes(t)) matchedTokens.push(t);
+        }
+        continue;
+      }
+      if (byAcro.length > 1) {
+        confidence = "fuzzy";
+        for (const t of byAcro[0].tokens) {
+          if (!matchedTokens.includes(t)) matchedTokens.push(t);
+        }
+        continue;
+      }
+      // Prefijo exacto único ("cont" → Contabilidad)
+      if (rt.length >= 3) {
+        const byPrefix = catalog.filter((c) =>
+          c.tokens.some((t) => t.startsWith(rt)),
+        );
+        if (byPrefix.length === 1) {
+          for (const t of byPrefix[0].tokens) {
+            if (!matchedTokens.includes(t)) matchedTokens.push(t);
+          }
+          continue;
+        }
+        if (byPrefix.length > 1) {
+          confidence = "fuzzy";
+          for (const t of byPrefix[0].tokens) {
+            if (!matchedTokens.includes(t)) matchedTokens.push(t);
+          }
+          continue;
+        }
+      }
     }
+    // Ruido de la frase (“equipos”, “raros”, “dell”…): no tumbar el match del área.
+    skippedNoise += 1;
+    if (skippedNoise > 4) return null;
   }
 
   if (!matchedTokens.length) return null;
   return {
     rawLabel: matchedTokens.join(" "),
     matchedTokens,
+    confidence,
+    rawNeedles: rawTokens,
   };
+}
+
+function buildAreaConfirmAskReply(
+  rawNeedle: string,
+  candidates: AreaCandidateSummary[],
+): string {
+  if (candidates.length === 1) {
+    return (
+      `No estoy seguro de “${rawNeedle}”. ¿Te referías al área **${candidates[0].name}**? ` +
+      `Responde **sí** o escribe el nombre correcto.`
+    );
+  }
+  const names = candidates
+    .slice(0, 5)
+    .map((c, i) => `**${i + 1}. ${c.name}**`)
+    .join(", ");
+  return (
+    `No estoy seguro de “${rawNeedle}”. ¿Te referías a alguna de estas áreas: ${names}? ` +
+    `Dime el **número**, el nombre, o reformula.`
+  );
 }
 
 function areaCandidateMatchesTokens(
@@ -1445,6 +2071,9 @@ function findMatchingAreasForPrompt(
   candidates: AreaCandidateSummary[];
   intent: "list" | "total";
   limit: number | null;
+  /** Typo / ambigüedad: preguntar antes de abrir visor. */
+  uncertain: boolean;
+  rawNeedle: string;
 } | undefined {
   if (!inventory.length) return undefined;
   if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
@@ -1494,9 +2123,41 @@ function findMatchingAreasForPrompt(
   const extracted = extractAreaQueryTokens(userText, catalog);
   if (!extracted) return undefined;
 
-  const candidates = catalog.filter((cand) =>
+  let candidates = catalog.filter((cand) =>
     areaCandidateMatchesTokens(cand, extracted.matchedTokens),
   );
+
+  // Si el match fue fuzzy, ampliar a todas las áreas cercanas al needle crudo.
+  if (extracted.confidence === "fuzzy" && extracted.rawNeedles.length) {
+    const needle = extracted.rawNeedles[extracted.rawNeedles.length - 1];
+    const allAreaTokens = new Set<string>();
+    for (const item of catalog) {
+      for (const t of item.tokens) allAreaTokens.add(t);
+    }
+    const near = new Set<string>();
+    for (const tok of allAreaTokens) {
+      if (tok.length < 3) continue;
+      if (tok.startsWith(needle) || needle.startsWith(tok)) {
+        near.add(tok);
+        continue;
+      }
+      if (needle.length >= 4 && tok.length >= needle.length) {
+        if (levenshtein(needle, tok.slice(0, needle.length)) <= 1) near.add(tok);
+      }
+      if (
+        Math.abs(tok.length - needle.length) <= 1 &&
+        levenshtein(needle, tok) <= 1
+      ) {
+        near.add(tok);
+      }
+    }
+    if (near.size) {
+      candidates = catalog.filter((cand) =>
+        cand.tokens.some((t) => near.has(t)),
+      );
+    }
+  }
+
   if (!candidates.length) return undefined;
 
   const requestedCount = parseRequestedCount(userText);
@@ -1515,6 +2176,9 @@ function findMatchingAreasForPrompt(
       )) &&
     requestedCount == null;
 
+  const rawNeedle =
+    extracted.rawNeedles[extracted.rawNeedles.length - 1] || extracted.rawLabel;
+
   return {
     queryLabel: extracted.rawLabel,
     queryTokens: extracted.matchedTokens,
@@ -1524,6 +2188,8 @@ function findMatchingAreasForPrompt(
       requestedCount != null
         ? Math.max(1, Math.min(MAX_ETIQUETA_LIST, requestedCount))
         : null,
+    uncertain: extracted.confidence === "fuzzy",
+    rawNeedle,
   };
 }
 
@@ -1595,8 +2261,8 @@ function findMatchingPeopleForPrompt(
   const matchedPersonTokens: string[] = [];
   for (const rt of rawTokens) {
     const m = matchSingleAreaVocabularyToken(rt, allPersonTokens);
-    if (!m) return undefined;
-    if (!matchedPersonTokens.includes(m)) matchedPersonTokens.push(m);
+    if (!m || m.confidence === "fuzzy") return undefined;
+    if (!matchedPersonTokens.includes(m.token)) matchedPersonTokens.push(m.token);
   }
   if (!matchedPersonTokens.length) return undefined;
 
@@ -1684,26 +2350,33 @@ function buildExactAreaReply(
       ? Math.min(total, Math.max(1, limit))
       : Math.min(total, MAX_ETIQUETA_LIST);
   const shownRows = areaSummary.rows.slice(0, effectiveLimit);
-  const sampleLines = shownRows.slice(0, 5).map((row) => {
+  const samples = shownRows.slice(0, 5).map((row) => {
     const tag = String(row.etiqueta ?? "").trim() || "S/E";
     const art = String(row.articulo ?? "").trim() || "Artículo";
     const per = String(row.persona ?? "").trim() || "Sin asignar";
-    return `• **${tag}** — ${art} (${per})`;
+    return `**${tag}** (${art}, ${per})`;
   });
+  let sampleProse = "";
+  if (samples.length === 1) {
+    sampleProse = ` Por ejemplo: ${samples[0]}.`;
+  } else if (samples.length > 1) {
+    const head = samples.slice(0, -1).join(", ");
+    sampleProse = ` Algunos ejemplos: ${head} y ${samples[samples.length - 1]}.`;
+  }
 
-  const showingNote =
+  const scopeNote =
     limit != null && limit < total
-      ? `Mostrando los **${shownRows.length}** registros solicitados (de **${total}** en total en esta área):\n\n`
+      ? ` Te muestro los **${shownRows.length}** que pediste (de **${total}** en el área).`
       : shownRows.length < total
-        ? `Mostrando los primeros **${shownRows.length}** de **${total}** registros del área:\n\n`
-        : `Registros de **${areaSummary.name}**:\n\n`;
+        ? ` El detalle completo de los **${total}** está en el panel derecho.`
+        : ` El detalle está en el panel derecho.`;
 
   const reply =
     `En el área **${areaSummary.name}** hay **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} en total ` +
-    `(**${areaSummary.personas}** persona${areaSummary.personas === 1 ? "" : "s"} · **${areaSummary.activos}** activo${areaSummary.activos === 1 ? "" : "s"}).\n\n` +
-    (sampleLines.length ? `${showingNote}${sampleLines.join("\n")}\n\n` : "") +
-    `En el panel derecho se muestra tanto el **total exacto de ${areaSummary.name} (${total})** como sus **${shownRows.length} registros**. ` +
-    `¿Quieres filtrar por persona, consultar otra área o generar códigos QR?`;
+    `(**${areaSummary.personas}** persona${areaSummary.personas === 1 ? "" : "s"} · **${areaSummary.activos}** activo${areaSummary.activos === 1 ? "" : "s"}).` +
+    sampleProse +
+    scopeNote +
+    ` ¿Quieres filtrar por persona, consultar otra área o generar códigos QR?`;
 
   return { reply, shownRows };
 }
@@ -1735,23 +2408,25 @@ function buildExactPersonReply(
         ? areas.join(", ")
         : `${areas.slice(0, 3).join(", ")} y ${areas.length - 3} más`;
 
-  const sampleLines = shownRows.slice(0, 5).map((row) => {
+  const samples = shownRows.slice(0, 5).map((row) => {
     const tag = String(row.etiqueta ?? "").trim() || "S/E";
     const art = String(row.articulo ?? "").trim() || "Artículo";
     const ar = String(row.area ?? "").trim() || "Sin área";
-    return `• **${tag}** — ${art} (${ar})`;
+    return `**${tag}** (${art}, ${ar})`;
   });
-
-  const showingNote =
-    limit != null && limit < total
-      ? `Mostrando **${shownRows.length}** de **${total}** registros solicitados:\n\n`
-      : `Ejemplos de su resguardo:\n\n`;
+  let sampleProse = "";
+  if (samples.length === 1) {
+    sampleProse = ` Por ejemplo: ${samples[0]}.`;
+  } else if (samples.length > 1) {
+    const head = samples.slice(0, -1).join(", ");
+    sampleProse = ` Algunos ejemplos: ${head} y ${samples[samples.length - 1]}.`;
+  }
 
   const reply =
     `**${personSummary.name}** tiene **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} ` +
-    `(**${personSummary.activos}** activo${personSummary.activos === 1 ? "" : "s"}) en **${areas.length}** área${areas.length === 1 ? "" : "s"} (${areaLine}).\n\n` +
-    (sampleLines.length ? `${showingNote}${sampleLines.join("\n")}\n\n` : "") +
-    `En el panel derecho puedes revisar sus totales por área y sus registros. ¿Quieres generar QR o filtrar por un área?`;
+    `(**${personSummary.activos}** activo${personSummary.activos === 1 ? "" : "s"}) en **${areas.length}** área${areas.length === 1 ? "" : "s"} (${areaLine}).` +
+    sampleProse +
+    ` El detalle está en el panel derecho. ¿Quieres generar QR o filtrar por un área?`;
 
   return { reply, shownRows };
 }
@@ -1847,6 +2522,20 @@ function resolvePendingDisambiguation(
       };
     }
 
+    // Confirmación corta (“sí”, “dale”) cuando solo hay una opción sugerida.
+    if (
+      pendingCatalog.length === 1 &&
+      /^(si|sip|sep|dale|ok|okay|okey|vale|claro|correcto|esa|ese|eso|afirmativo)$/.test(
+        strippedPlain,
+      )
+    ) {
+      return {
+        status: "resolved_area",
+        area: pendingCatalog[0],
+        limit: effectiveLimit,
+      };
+    }
+
     // 2. Coincidencia exacta por nombre de área completo (ej. clic en "BIBLIOTECA NUEVA" o escribir "biblioteca nueva")
     const fullNorm = plain.replace(/\b(?:edificios?|edifs)\b/g, "edif");
     const exactFull = pendingCatalog.find((c) => c.norm === fullNorm);
@@ -1859,8 +2548,22 @@ function resolvePendingDisambiguation(
     }
 
     // 3. Extraer tokens de área del mensaje de seguimiento
-    const extracted = extractAreaQueryTokens(userText, catalog);
+    let extracted = extractAreaQueryTokens(userText, catalog);
+    // Abreviatura corta suelta ("RH", "TI") si el extractor no armó tokens.
     if (!extracted || !extracted.matchedTokens.length) {
+      const abbrHit = matchAreaFromPrompt(userText, inventory);
+      if (abbrHit) {
+        const hitCand =
+          pendingCatalog.find((c) => c.name === abbrHit) ||
+          pendingCatalog.find((c) => areaMatchesNeedle(c.name, abbrHit));
+        if (hitCand) {
+          return {
+            status: "resolved_area",
+            area: hitCand,
+            limit: effectiveLimit,
+          };
+        }
+      }
       return { status: "unrelated" };
     }
     const qPhrase = extracted.matchedTokens.join(" ");
@@ -2011,7 +2714,8 @@ function levenshtein(a: string, b: string) {
   if (a === b) return 0;
   if (!a.length) return b.length;
   if (!b.length) return a.length;
-  if (Math.abs(a.length - b.length) > 2) return 99;
+  // Typos difíciles: permitir hasta 4 letras de diferencia de largo.
+  if (Math.abs(a.length - b.length) > 4) return 99;
   const row = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 1; i <= a.length; i += 1) {
     let prev = i - 1;
@@ -2029,7 +2733,32 @@ function levenshtein(a: string, b: string) {
 function typoBudget(word: string) {
   if (word.length <= 3) return 0;
   if (word.length <= 5) return 1;
-  return 2;
+  if (word.length <= 8) return 2;
+  return 3;
+}
+
+/** Variantes típicas ES: b/v, s/z/c, g/j, h muda, dobles. */
+function spellingVariants(token: string): string[] {
+  const out = new Set<string>([token]);
+  const push = (s: string) => {
+    if (s && s !== token) out.add(s);
+  };
+  push(token.replace(/v/g, "b"));
+  push(token.replace(/b/g, "v"));
+  push(token.replace(/z/g, "s"));
+  push(token.replace(/s(?=[aeiou])/g, "z"));
+  push(token.replace(/c(?=[ei])/g, "s"));
+  push(token.replace(/g(?=[ei])/g, "j"));
+  push(token.replace(/j(?=[aeiou])/g, "g"));
+  push(token.replace(/h/g, ""));
+  push(token.replace(/(.)\1+/g, "$1"));
+  // Inserción/omisión simple de una vocal repetida frecuente
+  if (token.length >= 5) {
+    for (let i = 0; i < token.length; i += 1) {
+      push(token.slice(0, i) + token.slice(i + 1));
+    }
+  }
+  return [...out];
 }
 
 /** Solo minúsculas/acentos — NO corre ortografía (rápido para áreas del inventario). */
@@ -2076,13 +2805,23 @@ function getAreaSearchIndex(inventory: InventarioRow[]): AreaSearchIndex {
     const norm = normalizePlain(area);
     if (!norm) continue;
     for (const tok of norm.split(" ")) {
-      if (tok.length <= 2) continue;
+      if (tok.length < 2) continue;
       tokenSet.add(tok);
       const list = byToken.get(tok);
       if (list) {
         if (list.length < 8 && !list.includes(area)) list.push(area);
       } else {
         byToken.set(tok, [area]);
+      }
+    }
+    const acro = areaAcronym(norm);
+    if (acro.length >= 2) {
+      tokenSet.add(acro);
+      const list = byToken.get(acro);
+      if (list) {
+        if (list.length < 8 && !list.includes(area)) list.push(area);
+      } else {
+        byToken.set(acro, [area]);
       }
     }
   }
@@ -2466,6 +3205,20 @@ const INTENT_ALIAS: Record<string, string> = {
   persnas: "personas",
   perssonas: "personas",
   personsa: "personas",
+  peronas: "personas",
+  peronasas: "personas",
+  personass: "personas",
+  perosnas: "personas",
+  venbtas: "ventas",
+  ventass: "ventas",
+  ventasa: "ventas",
+  evantas: "ventas",
+  ventaas: "ventas",
+  marketin: "marketing",
+  marketng: "marketing",
+  merke: "marketing",
+  markering: "marketing",
+  cuandtas: "cuantas",
   marcaa: "marca",
   marcass: "marcas",
   inventaro: "inventario",
@@ -3007,6 +3760,332 @@ function buildAreaTotalReply(area: string, inventory: InventarioRow[]) {
   );
 }
 
+/**
+ * "cuántas personas hay en ventas / en la de venbtas / ahí"
+ * Usa typo + foco del visor anterior; si duda, pregunta sin abrir panel.
+ */
+function detectAreaPersonasAsk(
+  userText: string,
+  inventory: InventarioRow[],
+  recentFocus?: string | null,
+): {
+  status: "ok" | "ask";
+  area?: AreaCandidateSummary;
+  candidates?: AreaCandidateSummary[];
+  rawNeedle: string;
+} | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n || !inventory.length) return undefined;
+  if (
+    !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
+  ) {
+    return undefined;
+  }
+  if (
+    !intentHas(
+      n,
+      "cuantas",
+      "cuantos",
+      "cuanta",
+      "cuanto",
+      "tiene",
+      "tienen",
+      "hay",
+      "dame",
+      "muestra",
+      "lista",
+      "ver",
+      "dime",
+      "quien",
+      "quienes",
+    ) &&
+    !/\bquien(es)?\b/.test(n)
+  ) {
+    return undefined;
+  }
+  // Inventario N lo maneja detectOrigenPersonasAsk.
+  if (/\binventarios?\s*\d+\b/.test(n) || matchOrigenFromPrompt(userText, listExistingOrigens(inventory))) {
+    return undefined;
+  }
+
+  const catalog = getAllAreaCatalog(inventory);
+  const areaQuery = findMatchingAreasForPrompt(userText, inventory);
+  const usesContext =
+    /\b(ahi|alla|alli|aqui|esa|ese|eso|la de|del area|de esa)\b/.test(n) ||
+    intentHas(n, "ahi", "alla", "alli", "aqui");
+
+  if (areaQuery?.uncertain) {
+    return {
+      status: "ask",
+      candidates: areaQuery.candidates,
+      rawNeedle: areaQuery.rawNeedle,
+    };
+  }
+  if (areaQuery && areaQuery.candidates.length === 1 && !areaQuery.uncertain) {
+    return {
+      status: "ok",
+      area: areaQuery.candidates[0],
+      rawNeedle: areaQuery.rawNeedle,
+    };
+  }
+  if (areaQuery && areaQuery.candidates.length > 1) {
+    return {
+      status: "ask",
+      candidates: areaQuery.candidates,
+      rawNeedle: areaQuery.rawNeedle,
+    };
+  }
+
+  // Anáfora: "cuántas personas hay ahí" tras haber visto Ventas.
+  if (usesContext && recentFocus) {
+    const hit =
+      catalog.find((c) => c.name === recentFocus) ||
+      catalog.find((c) => areaMatchesNeedle(c.name, recentFocus));
+    if (hit) {
+      return { status: "ok", area: hit, rawNeedle: recentFocus };
+    }
+  }
+
+  // Needle suelto con typo aunque findMatchingAreas falló por tokens basura.
+  const plain = normalizePlain(userText);
+  const toks = plain
+    .split(" ")
+    .filter((t) => t.length >= 3 && !AREA_QUERY_STOP_WORDS.has(t) && !PERSON_STOP_WORDS.has(t));
+  const allAreaTokens = new Set<string>();
+  for (const c of catalog) for (const t of c.tokens) allAreaTokens.add(t);
+  const fuzzyHits: AreaCandidateSummary[] = [];
+  let rawNeedle = "";
+  for (const tok of toks) {
+    const m = matchSingleAreaVocabularyToken(tok, allAreaTokens);
+    if (!m) continue;
+    rawNeedle = tok;
+    const areas = catalog.filter((c) => c.tokens.includes(m.token));
+    for (const a of areas) {
+      if (!fuzzyHits.some((x) => x.name === a.name)) fuzzyHits.push(a);
+    }
+    if (m.confidence === "fuzzy" || fuzzyHits.length > 1) {
+      return {
+        status: "ask",
+        candidates: fuzzyHits.length ? fuzzyHits : areas,
+        rawNeedle: tok,
+      };
+    }
+    if (fuzzyHits.length === 1) {
+      return { status: "ok", area: fuzzyHits[0], rawNeedle: tok };
+    }
+  }
+
+  if (usesContext && recentFocus) {
+    const hit =
+      catalog.find((c) => c.name === recentFocus) ||
+      catalog.find((c) => areaMatchesNeedle(c.name, recentFocus));
+    if (hit) return { status: "ok", area: hit, rawNeedle: recentFocus };
+  }
+
+  return undefined;
+}
+
+function buildAreaPersonasReply(area: AreaCandidateSummary): string {
+  const people = [
+    ...new Set(
+      area.rows
+        .map((row) => String(row.persona ?? "").trim())
+        .filter((p) => {
+          if (!p) return false;
+          const np = normalizePlain(p);
+          return (
+            np &&
+            np !== "sin asignar" &&
+            np !== "no asignado" &&
+            np !== "n a" &&
+            np !== "na"
+          );
+        }),
+    ),
+  ].sort((a, b) => a.localeCompare(b, "es"));
+  const fmt = (x: number) => x.toLocaleString("es-MX");
+  if (!people.length) {
+    return (
+      `En **${area.name}** hay **${fmt(area.rows.length)}** registro` +
+      `${area.rows.length === 1 ? "" : "s"}, pero sin personas asignadas.`
+    );
+  }
+  const showAll = people.length <= 40;
+  const shown = showAll ? people : people.slice(0, 30);
+  const namesProse =
+    shown.length === 1
+      ? `**${shown[0]}**`
+      : `${shown
+          .slice(0, -1)
+          .map((name) => `**${name}**`)
+          .join(", ")} y **${shown[shown.length - 1]}**`;
+  return (
+    `En **${area.name}** hay **${fmt(people.length)}** persona` +
+    `${people.length === 1 ? "" : "s"} ` +
+    `(en **${fmt(area.rows.length)}** registro${area.rows.length === 1 ? "" : "s"}): ${namesProse}` +
+    (showAll ? "" : `, y **${fmt(people.length - shown.length)}** más`) +
+    `. ¿Quieres el inventario de alguna?`
+  );
+}
+
+/** "cuántas personas tiene el Inventario 1" / "quiénes hay en inventario 2". */
+function detectOrigenPersonasAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): string | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n || !inventory.length) return undefined;
+  if (
+    !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
+  ) {
+    return undefined;
+  }
+  if (
+    !intentHas(
+      n,
+      "cuantas",
+      "cuantos",
+      "cuanta",
+      "cuanto",
+      "tiene",
+      "tienen",
+      "hay",
+      "dame",
+      "muestra",
+      "lista",
+      "listar",
+      "ver",
+      "dime",
+      "quien",
+      "quienes",
+    ) &&
+    !/\bquien(es)?\b/.test(n)
+  ) {
+    return undefined;
+  }
+  // Ranking global de personas (sin inventario concreto).
+  if (
+    intentHas(n, "todas", "todos", "ranking", "top") &&
+    !/\binventarios?\s*\d+\b/.test(n)
+  ) {
+    return undefined;
+  }
+  const existing = listExistingOrigens(inventory);
+  return matchOrigenFromPrompt(userText, existing);
+}
+
+function buildOrigenPersonasReply(
+  origen: string,
+  inventory: InventarioRow[],
+): string {
+  const rows = inventory.filter(
+    (row) => String(row.origen ?? "").trim() === origen,
+  );
+  if (!rows.length) {
+    return (
+      `No encontré registros en **${origen}**. ` +
+      `¿Quieres probar con otro inventario (Inventario 1, Inventario 2…) o con S/O?`
+    );
+  }
+  const people = [
+    ...new Set(
+      rows
+        .map((row) => String(row.persona ?? "").trim())
+        .filter((p) => {
+          if (!p) return false;
+          const np = normalizePlain(p);
+          return (
+            np &&
+            np !== "sin asignar" &&
+            np !== "no asignado" &&
+            np !== "n a" &&
+            np !== "na"
+          );
+        }),
+    ),
+  ].sort((a, b) => a.localeCompare(b, "es"));
+  const fmt = (x: number) => x.toLocaleString("es-MX");
+  if (!people.length) {
+    return (
+      `En **${origen}** hay **${fmt(rows.length)}** registro` +
+      `${rows.length === 1 ? "" : "s"}, pero ninguno tiene persona asignada.`
+    );
+  }
+  const showAll = people.length <= 40;
+  const shown = showAll ? people : people.slice(0, 30);
+  const namesProse =
+    shown.length === 1
+      ? `**${shown[0]}**`
+      : `${shown
+          .slice(0, -1)
+          .map((n) => `**${n}**`)
+          .join(", ")} y **${shown[shown.length - 1]}**`;
+  return (
+    `En **${origen}** hay **${fmt(people.length)}** persona` +
+    `${people.length === 1 ? "" : "s"} ` +
+    `(sobre **${fmt(rows.length)}** registro${rows.length === 1 ? "" : "s"}): ${namesProse}` +
+    (showAll ? "" : `, y **${fmt(people.length - shown.length)}** más`) +
+    `. Si quieres el inventario de alguna, dime su nombre.`
+  );
+}
+
+/** "dame el total de solo una área" sin nombrar cuál → preguntar. */
+function detectUnspecifiedAreaAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n || !inventory.length) return false;
+  if (!intentHas(n, "area", "areas")) return false;
+  if (intentHas(n, "todas", "todos", "ranking", "por", "distribucion")) {
+    return false;
+  }
+  if (matchAreaFromPrompt(userText, inventory)) return false;
+  if (findMatchingAreasForPrompt(userText, inventory)) return false;
+  const wantsOne = intentHas(
+    n,
+    "una",
+    "un",
+    "solo",
+    "solamente",
+    "alguna",
+    "cualquier",
+    "especifica",
+    "especifico",
+  );
+  const wantsInfo = intentHas(
+    n,
+    "total",
+    "totales",
+    "dame",
+    "muestra",
+    "ver",
+    "cuantos",
+    "cuantas",
+    "detalle",
+    "registros",
+  );
+  return wantsOne && wantsInfo;
+}
+
+function buildUnspecifiedAreaAskReply(inventory: InventarioRow[]) {
+  const areas = getAllAreaCatalog(inventory)
+    .slice(0, 8)
+    .map((a) => a.name);
+  const hint =
+    areas.length > 0
+      ? ` Por ejemplo: ${areas
+          .slice(0, 4)
+          .map((a) => `**${a}**`)
+          .join(", ")}… o una abreviatura como **RH** / **TI**.`
+      : "";
+  return (
+    `Claro. ¿De **qué área** quieres el total?` +
+    ` Puedes escribir el nombre completo o algo corto (siglas).` +
+    hint
+  );
+}
+
 /** Respuestas locales exactas para overview (áreas, totales, etc.). */
 function buildLocalOverviewReply(
   overview: ViewerOverview,
@@ -3036,43 +4115,49 @@ function buildLocalOverviewReply(
   const fmt = (n: number) => n.toLocaleString("es-MX");
 
   if (overview === "areas") {
-    const lines = topAreas.map(
-      ([area, count]) =>
-        `• **${area}:** **${fmt(count)}** registro${count === 1 ? "" : "s"}`,
-    );
+    const topProse =
+      topAreas.length === 0
+        ? ""
+        : topAreas.length === 1
+          ? ` La de mayor concentración es **${topAreas[0][0]}** con **${fmt(topAreas[0][1])}** registro${topAreas[0][1] === 1 ? "" : "s"}.`
+          : ` Las de mayor concentración son ${topAreas
+              .slice(0, -1)
+              .map(
+                ([area, count]) =>
+                  `**${area}** (${fmt(count)})`,
+              )
+              .join(", ")} y **${topAreas[topAreas.length - 1][0]}** (${fmt(topAreas[topAreas.length - 1][1])}).`;
     return (
       `Este inventario tiene **${fmt(areaCounts.size)}** área` +
       `${areaCounts.size === 1 ? "" : "s"} distintas ` +
-      `(**${fmt(total)}** registros en total).\n\n` +
-      (lines.length
-        ? `Las de mayor concentración son:\n\n${lines.join("\n")}\n\n`
-        : "") +
-      `Si quieres el detalle de un área, dime su nombre. ` +
-      `También puedo filtrar por persona o generar QR.`
+      `(**${fmt(total)}** registros en total).` +
+      topProse +
+      ` Si quieres el detalle de un área, dime su nombre. También puedo filtrar por persona o generar QR.`
     );
   }
 
   if (overview === "stats" || overview === "full") {
+    const topFull =
+      overview === "full" && topAreas.length
+        ? ` Las áreas con más equipo: ${topAreas
+            .slice(0, 3)
+            .map(([a, c]) => `**${a}** (${fmt(c)})`)
+            .join(", ")}.`
+        : "";
     return (
       `Inventario general: **${fmt(total)}** registros, ` +
       `**${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} y ` +
-      `**${fmt(areaCounts.size)}** área${areaCounts.size === 1 ? "" : "s"}.\n\n` +
-      `• Activos: **${fmt(activos)}**\n` +
-      `• Inactivos: **${fmt(inactivos)}**\n\n` +
-      (overview === "full" && topAreas.length
-        ? `Áreas con más equipo:\n${topAreas
-            .slice(0, 3)
-            .map(([a, c]) => `• **${a}** (${fmt(c)})`)
-            .join("\n")}\n\n`
-        : "") +
-      `¿Seguimos con un área, una persona, últimos registros o códigos QR?`
+      `**${fmt(areaCounts.size)}** área${areaCounts.size === 1 ? "" : "s"}. ` +
+      `Hay **${fmt(activos)}** activos y **${fmt(inactivos)}** inactivos.` +
+      topFull +
+      ` ¿Seguimos con un área, una persona, últimos registros o códigos QR?`
     );
   }
 
   if (overview === "personas") {
     return (
       `Hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
-      `con equipo asignado (**${fmt(total)}** registros).\n\n` +
+      `con equipo asignado (**${fmt(total)}** registros). ` +
       `Dime un nombre para ver su inventario, o pide «dame las personas» para el ranking.`
     );
   }
@@ -3080,9 +4165,8 @@ function buildLocalOverviewReply(
   if (overview === "estado") {
     const pct = total ? Math.round((activos / total) * 100) : 0;
     return (
-      `Salud del inventario (**${fmt(total)}** registros):\n\n` +
-      `• **Activos:** **${fmt(activos)}** (${pct}%)\n` +
-      `• **Inactivos:** **${fmt(inactivos)}** (${100 - pct}%)\n\n` +
+      `Salud del inventario (**${fmt(total)}** registros): ` +
+      `**${fmt(activos)}** activos (${pct}%) y **${fmt(inactivos)}** inactivos. ` +
       `¿Quieres listar los inactivos o revisar un área?`
     );
   }
@@ -3206,6 +4290,13 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
       intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
       /^(areas?|por\s+areas?)$/.test(user))
   ) {
+    // "total de solo una área" → preguntar cuál (no ranking).
+    if (
+      intentHas(user, "una", "un", "solo", "solamente", "alguna") &&
+      !intentHas(user, "todas", "todos", "ranking", "por")
+    ) {
+      return undefined;
+    }
     return "areas";
   }
 
@@ -3216,6 +4307,10 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
       intentHas(user, "por", "top", "desglose", "cuantas", "cuantos", "todas", "todos") ||
       /^(personas?|por\s+personas?)$/.test(user))
   ) {
+    // "personas del inventario 1" lo resuelve el detector de origen, no el ranking.
+    if (/\binventarios?\s*\d+\b/.test(user) || /\binventario\b/.test(user)) {
+      return undefined;
+    }
     return "personas";
   }
 
@@ -3778,25 +4873,24 @@ function renderChatRichText(text: string) {
       continue;
     }
 
-    // 3. Unordered list (•, -, *)
+    // 3. Unordered list (•, -, *) → prosa (sin bolitas verdes)
     if (/^[•\-\*]\s+/.test(trimmed)) {
       const items: string[] = [];
       while (i < lines.length && /^[•\-\*]\s+/.test(lines[i].trim())) {
         items.push(lines[i].trim().replace(/^[•\-\*]\s+/, ""));
         i += 1;
       }
-      blocks.push(
-        <ul key={`ul-${keyCounter++}`} className="chat-rich-list">
-          {items.map((item, idx) => (
-            <li key={idx} className="chat-rich-list-item">
-              <span className="chat-rich-bullet" aria-hidden="true" />
-              <span className="chat-rich-list-content">
-                {renderChatInlineText(item)}
-              </span>
-            </li>
-          ))}
-        </ul>,
-      );
+      const prose =
+        items.length <= 1
+          ? items[0] || ""
+          : `${items.slice(0, -1).join("; ")}; y ${items[items.length - 1]}`;
+      if (prose) {
+        blocks.push(
+          <p key={`p-${keyCounter++}`} className="chat-rich-paragraph">
+            {renderChatInlineText(prose)}
+          </p>,
+        );
+      }
       continue;
     }
 
@@ -4840,6 +5934,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [pendingFieldRevert, setPendingFieldRevert] = useState<ChatFieldChange | null>(
     null,
   );
+  const [pendingBulkTransfer, setPendingBulkTransfer] =
+    useState<PendingBulkTransfer | null>(null);
   const [pendingChatDeleteRow, setPendingChatDeleteRow] =
     useState<InventarioRow | null>(null);
   const [chatDeleteBusy, setChatDeleteBusy] = useState(false);
@@ -4882,6 +5978,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const chatRequestGenRef = useRef(0);
   const pendingChatImportRef = useRef<NewInventarioItem[] | null>(null);
   const pendingFieldRevertRef = useRef<ChatFieldChange | null>(null);
+  const pendingBulkTransferRef = useRef<PendingBulkTransfer | null>(null);
   const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
   /** Último listado concreto (aunque el visor no se haya abierto) para follow-ups tipo "no se ven". */
   const lastConcreteSideRef = useRef<{
@@ -5727,54 +6824,56 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     };
   }, [rail, folders.length]);
 
-  // Pin del último mensaje arriba; sin scroll vacío hacia abajo.
+  // Pin 1 sola vez en layout (sin RAF/timeout → sin parpadeo).
   useLayoutEffect(() => {
     if (rail !== "archivos") return;
-    const log = chatLogRef.current;
-    if (log) {
-      log.querySelectorAll<HTMLElement>("[data-side-msg]").forEach((el) => {
+    const logEl = chatLogRef.current;
+    const scrollRoot = chatStageRef.current || logEl;
+    if (logEl) {
+      logEl.querySelectorAll<HTMLElement>("[data-side-msg]").forEach((el) => {
         el.style.minHeight = "";
       });
     }
+    if (!scrollRoot || !logEl) return;
 
-    const getScrollRoot = () => {
-      const stage = chatStageRef.current;
-      const logEl = chatLogRef.current;
-      if (stage && stage.scrollHeight > stage.clientHeight + 2) return stage;
-      if (logEl && logEl.scrollHeight > logEl.clientHeight + 2) return logEl;
-      return stage || logEl;
-    };
+    const PIN_GAP = 28;
+    const anchor = logEl.querySelector<HTMLElement>(
+      "[data-chat-latest='true']",
+    );
+    const spacer = logEl.querySelector<HTMLElement>(".chat-log-spacer");
+    if (!anchor) return;
 
-    const fitSpacerAndPin = () => {
-      const logEl = chatLogRef.current;
-      const scrollRoot = getScrollRoot();
-      const anchor = logEl?.querySelector<HTMLElement>(
-        "[data-chat-latest='true']",
-      );
-      const spacer = logEl?.querySelector<HTMLElement>(".chat-log-spacer");
-      if (!anchor || !scrollRoot) return;
+    const topbar = document.querySelector<HTMLElement>(".topbar");
+    const rootRect = scrollRoot.getBoundingClientRect();
+    const topbarBottom = topbar?.getBoundingClientRect().bottom ?? 0;
+    const ceilingInset = Math.max(0, topbarBottom - rootRect.top) + PIN_GAP;
 
-      // Spacer = lo justo para subir el último msg al tope, sin hueco extra.
-      if (spacer) {
-        const rootH = scrollRoot.clientHeight;
-        const anchorH = Math.ceil(anchor.getBoundingClientRect().height);
-        const needed = Math.max(24, rootH - anchorH - 28);
-        spacer.style.height = `${needed}px`;
-        spacer.style.minHeight = `${needed}px`;
-      }
+    if (spacer) {
+      const usableH = Math.max(160, rootRect.height - ceilingInset);
+      const anchorH = Math.ceil(anchor.getBoundingClientRect().height);
+      const needed = Math.max(32, Math.round(usableH - anchorH - 24));
+      spacer.style.height = `${needed}px`;
+      spacer.style.minHeight = `${needed}px`;
+      void spacer.offsetHeight; // reflow antes del scroll
+    }
 
-      const rootRect = scrollRoot.getBoundingClientRect();
-      const anchorRect = anchor.getBoundingClientRect();
-      const delta = anchorRect.top - rootRect.top - 12;
-      const next = Math.max(0, scrollRoot.scrollTop + delta);
-      scrollRoot.scrollTop = next;
-      // Tope: no bajar más allá del pin (evita scroll en vacío).
-      (scrollRoot as HTMLElement).dataset.chatScrollMax = String(next);
-    };
+    const rootRect2 = scrollRoot.getBoundingClientRect();
+    const anchorOffset =
+      anchor.getBoundingClientRect().top -
+      rootRect2.top +
+      scrollRoot.scrollTop;
+    let target = Math.max(0, Math.round(anchorOffset - ceilingInset));
+    scrollRoot.scrollTop = target;
+
+    const afterTop = anchor.getBoundingClientRect().top;
+    const ceilingY = rootRect2.top + ceilingInset;
+    if (afterTop < ceilingY - 1) {
+      target = Math.max(0, scrollRoot.scrollTop - Math.ceil(ceilingY - afterTop));
+      scrollRoot.scrollTop = target;
+    }
+    scrollRoot.dataset.chatScrollMax = String(target);
 
     const clampScroll = () => {
-      const scrollRoot = getScrollRoot();
-      if (!scrollRoot) return;
       const maxRaw = Number(scrollRoot.dataset.chatScrollMax || "");
       if (!Number.isFinite(maxRaw)) return;
       if (scrollRoot.scrollTop > maxRaw + 1) {
@@ -5782,26 +6881,33 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     };
 
-    fitSpacerAndPin();
-    const raf1 = window.requestAnimationFrame(fitSpacerAndPin);
-    const raf2 = window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(fitSpacerAndPin);
-    });
-    const timer = window.setTimeout(fitSpacerAndPin, 80);
+    const onResize = () => {
+      // Resize: un solo re-pin (sin cascada).
+      const rect = scrollRoot.getBoundingClientRect();
+      const tb = topbar?.getBoundingClientRect().bottom ?? 0;
+      const inset = Math.max(0, tb - rect.top) + PIN_GAP;
+      if (spacer) {
+        const usableH = Math.max(160, rect.height - inset);
+        const ah = Math.ceil(anchor.getBoundingClientRect().height);
+        spacer.style.height = `${Math.max(32, Math.round(usableH - ah - 24))}px`;
+        spacer.style.minHeight = spacer.style.height;
+        void spacer.offsetHeight;
+      }
+      const off =
+        anchor.getBoundingClientRect().top -
+        scrollRoot.getBoundingClientRect().top +
+        scrollRoot.scrollTop;
+      const next = Math.max(0, Math.round(off - inset));
+      scrollRoot.scrollTop = next;
+      scrollRoot.dataset.chatScrollMax = String(next);
+    };
 
-    const stage = chatStageRef.current;
-    const logEl = chatLogRef.current;
-    stage?.addEventListener("scroll", clampScroll, { passive: true });
-    logEl?.addEventListener("scroll", clampScroll, { passive: true });
-    window.addEventListener("resize", fitSpacerAndPin);
+    scrollRoot.addEventListener("scroll", clampScroll, { passive: true });
+    window.addEventListener("resize", onResize);
 
     return () => {
-      window.cancelAnimationFrame(raf1);
-      window.cancelAnimationFrame(raf2);
-      window.clearTimeout(timer);
-      stage?.removeEventListener("scroll", clampScroll);
-      logEl?.removeEventListener("scroll", clampScroll);
-      window.removeEventListener("resize", fitSpacerAndPin);
+      scrollRoot.removeEventListener("scroll", clampScroll);
+      window.removeEventListener("resize", onResize);
     };
   }, [
     messages,
@@ -6025,9 +7131,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     /\.(xlsx|xls|csv|txt)$/i.test(name);
 
   const isAffirmativeChat = (value: string) =>
-    /^(sí|si|yes|confirma|confirmo|adelante|ok|okay|okey|vale|dale|claro|listo|de acuerdo|importar|hazlo|procede|proceder)\b/i.test(
+    /^(sí|si|yes|confirma|confirmo|adelante|ok|okay|okey|vale|dale|claro|listo|de acuerdo|hazlo|procede|proceder)\b/i.test(
       value.trim(),
     );
+
+  /** “sí”, “importar”, “importalos”, “cárgalos”, etc. → sigue el import del chat. */
+  const isChatImportConfirm = (value: string) => {
+    const t = value.trim();
+    if (!t) return false;
+    if (isAffirmativeChat(t)) return true;
+    return /^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?)\b/i.test(
+      t,
+    );
+  };
 
   const asksChatFileImport = (value: string) =>
     /\b(importar|subir|cargar|pasa(?:rme)?|adjunt(?:ar|a)?)\b[\s\S]{0,40}\b(excel|csv|archivo|xlsx|xls)\b|\b(excel|csv|xlsx|xls)\b[\s\S]{0,40}\b(importar|subir|cargar|pasar|adjunt)/i.test(
@@ -6044,6 +7160,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const setPendingFieldRevertSafe = (change: ChatFieldChange | null) => {
     pendingFieldRevertRef.current = change;
     setPendingFieldRevert(change);
+  };
+
+  const setPendingBulkTransferSafe = (transfer: PendingBulkTransfer | null) => {
+    pendingBulkTransferRef.current = transfer;
+    setPendingBulkTransfer(transfer);
   };
 
   const confirmChatDeleteRecord = async () => {
@@ -6421,6 +7542,97 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       finishBotReply(sessionId, botId, finalReply);
     };
 
+    // Confirmar / cancelar traspaso masivo pendiente
+    {
+      const pendingTransfer =
+        pendingBulkTransferRef.current || pendingBulkTransfer;
+      if (pendingTransfer) {
+        if (isNegativeChat(text)) {
+          setPendingBulkTransferSafe(null);
+          const cancelReply = "Listo, cancelé el traspaso. No toqué ningún registro.";
+          try {
+            await ensureTypingPause(cancelReply);
+            finishBotReply(sessionId, botId, cancelReply);
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        if (isAffirmativeChat(text)) {
+          try {
+            const patch: Partial<NewInventarioItem> =
+              pendingTransfer.field === "persona"
+                ? { persona: pendingTransfer.toValue }
+                : { area: pendingTransfer.toValue };
+            const result = await updateInventarioManyAction(
+              pendingTransfer.ids,
+              patch,
+            );
+            setPendingBulkTransferSafe(null);
+            if (!result.success || !result.data?.length) {
+              finishBotReply(
+                sessionId,
+                botId,
+                result.error || "No se pudo aplicar el traspaso masivo.",
+              );
+              return;
+            }
+            const updated = result.data;
+            const byId = new Map(
+              updated.map((row) => [Number(row.id), row] as const),
+            );
+            const stamp = new Date().toISOString();
+            setItems((prev) =>
+              prev.map((row) => {
+                const next = byId.get(Number(row.id));
+                return next ? { ...row, ...next, updated_at: stamp } : row;
+              }),
+            );
+            const total = items.length;
+            rememberMutation({
+              kind: "update",
+              summary: `Traspaso ${pendingTransfer.field}: ${pendingTransfer.fromLabel} → ${pendingTransfer.toValue}`,
+              totalBefore: total,
+              totalAfter: total,
+              count: updated.length,
+              ids: updated
+                .map((row) => Number(row.id))
+                .filter((id) => Number.isFinite(id)),
+              chatId: sessionId,
+              fact: `Traspaso ${pendingTransfer.field} ${pendingTransfer.fromLabel} → ${pendingTransfer.toValue} (${updated.length})`,
+            });
+            const finalReply = buildBulkTransferDoneReply({
+              field: pendingTransfer.field,
+              fromLabel: pendingTransfer.fromLabel,
+              toValue: pendingTransfer.toValue,
+              count: updated.length,
+            });
+            await ensureTypingPause(finalReply);
+            finishBotReply(sessionId, botId, finalReply, {
+              resultItems: updated.map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview:
+                pendingTransfer.field === "persona"
+                  ? "personTotal"
+                  : "areaTotal",
+              viewerFocus: pendingTransfer.toValue,
+            });
+          } catch (err: unknown) {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            setPendingBulkTransferSafe(null);
+            finishBotReply(
+              sessionId,
+              botId,
+              err instanceof Error
+                ? err.message
+                : "Error al aplicar el traspaso masivo.",
+            );
+          }
+          return;
+        }
+      }
+    }
+
     // Confirmar restauración del valor anterior de un campo
     const pendingRevert =
       pendingFieldRevertRef.current || pendingFieldRevert;
@@ -6566,7 +7778,39 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     const pendingRows = pendingChatImportRef.current?.length
       ? pendingChatImportRef.current
       : pendingChatImport;
-    if (pendingRows?.length && isAffirmativeChat(text)) {
+    // Pendiente + destino explícito (“importar a Inventario 1” / “a S/O”).
+    if (pendingRows?.length) {
+      const existingOrigens = [
+        ...new Set(
+          items.map((row) => String(row.origen ?? "").trim()).filter(Boolean),
+        ),
+      ];
+      const forceOrigen = matchOrigenFromPrompt(
+        text || userText,
+        existingOrigens,
+      );
+      const forcesDest =
+        Boolean(forceOrigen) &&
+        /\b(importa(?:r|los|las)?|pasa|poner|pon|deja|dejar|a|en)\b/i.test(
+          text || userText,
+        ) &&
+        !isChatImportConfirm(text);
+      if (forcesDest && forceOrigen) {
+        const remapped = pendingRows.map((row) => ({
+          ...row,
+          origen: forceOrigen,
+        }));
+        setPendingChatImportSafe(remapped);
+        finishBotReply(
+          sessionId,
+          botId,
+          `Listo: reasigné los **${formatNumber(remapped.length)}** registros pendientes a **${forceOrigen}**.\n\n` +
+            `¿Confirmas la importación? Responde **sí** o **importalos**.`,
+        );
+        return;
+      }
+    }
+    if (pendingRows?.length && isChatImportConfirm(text)) {
       try {
         await runBulkChatImport(pendingRows, "archivo pendiente");
       } catch (err: unknown) {
@@ -6589,13 +7833,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             items.map((row) => String(row.origen ?? "").trim()).filter(Boolean),
           ),
         ];
-        const askedOrigen = matchOrigenFromPrompt(text || userText, existingOrigens);
-        const origen =
-          askedOrigen ||
-          (selectedInventarios[0] && selectedInventarios[0] !== "ALL"
-            ? selectedInventarios[0]
-            : ORIGEN_SIN_ORIGEN);
-        const parsed = await parseInventarioImportFile(attach.file, origen);
+        const parsed = await parseInventarioImportFile(
+          attach.file,
+          ORIGEN_SIN_ORIGEN,
+        );
         if (!parsed.items.length) {
           setPendingChatImportSafe(null);
           finishBotReply(
@@ -6605,24 +7846,123 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           );
           return;
         }
-        setPendingChatImportSafe(parsed.items);
-        const n = parsed.items.length;
-        const sample = parsed.items
+
+        const plan = planImportOrigen({
+          promptText: text || userText,
+          fileName: attach.name,
+          sheetName: parsed.sheetName,
+          columnOrigens: parsed.hasOrigenColumn
+            ? parsed.columnOrigens
+            : undefined,
+          selectedFilter:
+            selectedInventarios[0] && selectedInventarios[0] !== "ALL"
+              ? selectedInventarios[0]
+              : null,
+          existing: existingOrigens,
+        });
+
+        const nBase = parsed.items.length;
+        const rawValid = parsed.rawValid || nBase;
+        const dups = parsed.skippedDupEtiqueta || 0;
+        const sheetNote = parsed.sheetName
+          ? ` (hoja “${parsed.sheetName}”)`
+          : "";
+        const dupNote =
+          dups > 0
+            ? `\nVi **${formatNumber(rawValid)}** filas con etiqueta y artículo; **${formatNumber(dups)}** etiqueta${dups === 1 ? "" : "s"} repetida${dups === 1 ? "" : "s"} → **${formatNumber(nBase)}** únicos.`
+            : `\nEncontré **${formatNumber(nBase)}** registro${nBase === 1 ? "" : "s"} con etiqueta y artículo.`;
+
+        // Orígenes mezclados en columna → pendiente, sin forzar un solo destino.
+        if (plan.kind === "mixed") {
+          const mixedItems = parsed.items.map((item) => {
+            const fromCol = normalizeOrigenLabel(
+              String(item.origen ?? ""),
+              existingOrigens,
+            );
+            return {
+              ...item,
+              origen: fromCol || ORIGEN_SIN_ORIGEN,
+            };
+          });
+          setPendingChatImportSafe(mixedItems);
+          const mixLines = plan.counts
+            .slice(0, 8)
+            .map(
+              (c) =>
+                `• **${c.origen}:** ${formatNumber(c.count)} registro${c.count === 1 ? "" : "s"}`,
+            )
+            .join("\n");
+          const sample = mixedItems
+            .slice(0, 5)
+            .map(
+              (item) =>
+                `• ${item.etiqueta} — ${item.articulo} (${item.origen})`,
+            )
+            .join("\n");
+          const more =
+            nBase > 5 ? `\n…y ${formatNumber(nBase - 5)} más.` : "";
+          finishBotReply(
+            sessionId,
+            botId,
+            buildChatImportMixedReply({
+              fileName: attach.name,
+              sheetName: parsed.sheetName,
+              mixLines,
+              dupNote,
+              sample,
+              more,
+            }),
+          );
+          return;
+        }
+
+        const origen = plan.origen;
+        const wantsNew =
+          /\b(crear|nuevo|nueva|abre|abrir)\b/i.test(text || userText) &&
+          /\b(inventario)\b/i.test(text || userText);
+        if (
+          wantsNew &&
+          plan.alreadyExists &&
+          origen !== ORIGEN_SIN_ORIGEN
+        ) {
+          setPendingChatImportSafe(null);
+          finishBotReply(
+            sessionId,
+            botId,
+            pickOne([
+              `**${origen}** ya existe. No creo otro igual.\n\nSi quieres cargar “${attach.name}” ahí, escribe «importar a ${origen}».`,
+              `Ese inventario (**${origen}**) ya está en la app.\n\nPuedo importar “${attach.name}” sobre ese origen si me dices «importar a ${origen}», o elige otro nombre nuevo.`,
+              `No duplico **${origen}**: ya lo tienes.\n\n¿Lo importamos a ese mismo? Dime «importar a ${origen}».`,
+            ]),
+          );
+          return;
+        }
+
+        const itemsForImport = parsed.items.map((item) => ({
+          ...item,
+          origen,
+        }));
+        setPendingChatImportSafe(itemsForImport);
+        const sample = itemsForImport
           .slice(0, 5)
           .map((item) => `• ${item.etiqueta} — ${item.articulo}`)
           .join("\n");
         const more =
-          n > 5 ? `\n…y ${formatNumber(n - 5)} más.` : "";
-        const destNote = askedOrigen
-          ? `Claro: **sí haré eso**. Voy a agregar este archivo a **${origen}**, no a ${ORIGEN_SIN_ORIGEN}.`
-          : `Claro: leí el archivo y lo dejaré listo para importar en **${origen}**.`;
+          nBase > 5 ? `\n…y ${formatNumber(nBase - 5)} más.` : "";
         finishBotReply(
           sessionId,
           botId,
-          `${destNote}\n\n` +
-            `“${attach.name}” tiene **${formatNumber(n)}** registro${n === 1 ? "" : "s"} con etiqueta y artículo.\n` +
-            `${sample}${more}\n\n` +
-            `¿Quieres que empiece a importarlos ahora a **${origen}**? Responde **sí** (o escribe importar).`,
+          buildChatImportPreviewReply({
+            fileName: attach.name,
+            sheetName: parsed.sheetName,
+            origen,
+            source: plan.source,
+            count: nBase,
+            rawValid,
+            dups,
+            sample,
+            more,
+          }),
         );
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -6823,36 +8163,196 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       pendingDisambiguationRef.current = null;
     }
 
-    // 2. Consulta de área (con desambiguación automática si existen 2 o más incidencias de área)
+    // 1b. Personas de un inventario concreto (Inventario 1…) — texto, sin visor.
+    {
+      const origenPeople = detectOrigenPersonasAsk(userText || text, items);
+      if (origenPeople) {
+        try {
+          const localReply = buildOrigenPersonasReply(origenPeople, items);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply);
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b1. Follow-up con contexto del chat (“el área”, “ahí”, “dame los N registros”).
+    {
+      const ctxAsk = detectContextFollowUpAsk(
+        userText || text,
+        items,
+        chatHistory,
+      );
+      if (ctxAsk) {
+        try {
+          if (ctxAsk.kind === "area" && ctxAsk.intent === "people") {
+            const localReply = buildAreaPersonasReply(ctxAsk.area);
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: [],
+              qr: [],
+              viewerOverview: "areaTotal",
+              viewerFocus: ctxAsk.area.name,
+            });
+            return;
+          }
+          if (ctxAsk.kind === "area") {
+            const { reply: localReply, shownRows } = buildExactAreaReply(
+              ctxAsk.area,
+              ctxAsk.intent === "total" ? null : ctxAsk.limit,
+            );
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview: "areaTotal",
+              viewerFocus: ctxAsk.area.name,
+            });
+            return;
+          }
+          if (ctxAsk.kind === "person") {
+            const { reply: localReply, shownRows } = buildExactPersonReply(
+              ctxAsk.person,
+              ctxAsk.intent === "total" ? null : ctxAsk.limit,
+            );
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview: "personTotal",
+              viewerFocus: ctxAsk.person.name,
+            });
+            return;
+          }
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b2. Personas de un área (typos + “ahí” / foco previo).
+    {
+      const recentFocus =
+        lastBotViewerFocus(messagesRef.current) ||
+        lastConcreteSideRef.current?.viewerFocus ||
+        null;
+      const areaPeople = detectAreaPersonasAsk(
+        userText || text,
+        items,
+        recentFocus,
+      );
+      if (areaPeople) {
+        if (areaPeople.status === "ask" && areaPeople.candidates?.length) {
+          pendingDisambiguationRef.current = {
+            kind: "area",
+            queryLabel: areaPeople.rawNeedle,
+            candidates: areaPeople.candidates.map((c) => c.name),
+            intent: "total",
+            limit: null,
+          };
+          try {
+            const localReply = buildAreaConfirmAskReply(
+              areaPeople.rawNeedle,
+              areaPeople.candidates,
+            );
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply);
+            return;
+          } catch {
+            /* abort */
+          }
+        }
+        if (areaPeople.status === "ok" && areaPeople.area) {
+          try {
+            const localReply = buildAreaPersonasReply(areaPeople.area);
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: [],
+              qr: [],
+              viewerOverview: "areaTotal",
+              viewerFocus: areaPeople.area.name,
+            });
+            return;
+          } catch {
+            /* abort */
+          }
+        }
+      }
+    }
+
+    // 1c. "Total de solo una área" sin nombre → preguntar (abreviado vale: RH, TI…).
+    if (detectUnspecifiedAreaAsk(userText || text, items)) {
+      const catalog = getAllAreaCatalog(items);
+      pendingDisambiguationRef.current = {
+        kind: "area",
+        queryLabel: "área",
+        candidates: catalog.map((c) => c.name),
+        intent: "total",
+        limit: null,
+      };
+      try {
+        const localReply = buildUnspecifiedAreaAskReply(items);
+        recordTokenConsumption(null, userText || text, localReply);
+        await ensureTypingPause(localReply);
+        finishBotReply(sessionId, botId, localReply);
+        return;
+      } catch {
+        /* abort / nuevo mensaje */
+      }
+    }
+
+    // 2. Consulta de área (segura → visor; dudosa/typo → preguntar sin visor)
     const areaQuery = findMatchingAreasForPrompt(userText || text, items);
     if (areaQuery) {
-      if (areaQuery.candidates.length > 1) {
-        const candidateNames = areaQuery.candidates.map((c) => c.name);
+      const candidateNames = areaQuery.candidates.map((c) => c.name);
+      // Typo o ambigüedad: no inventar resultado; confirmar primero.
+      if (areaQuery.uncertain || areaQuery.candidates.length > 1) {
         pendingDisambiguationRef.current = {
           kind: "area",
-          queryLabel: areaQuery.queryLabel,
+          queryLabel: areaQuery.rawNeedle || areaQuery.queryLabel,
           candidates: candidateNames,
           intent: areaQuery.intent,
           limit: areaQuery.limit,
         };
         try {
-          const localReply = buildAreaDisambiguationReply(
-            areaQuery.queryLabel,
-            areaQuery.candidates,
-            areaQuery.intent,
-            areaQuery.limit,
-          );
+          const localReply = areaQuery.uncertain
+            ? buildAreaConfirmAskReply(
+                areaQuery.rawNeedle || areaQuery.queryLabel,
+                areaQuery.candidates,
+              )
+            : buildAreaDisambiguationReply(
+                areaQuery.queryLabel,
+                areaQuery.candidates,
+                areaQuery.intent,
+                areaQuery.limit,
+              );
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
-            resultItems: [],
-            qr: [],
-            viewerOverview: "areaMatches",
-            viewerFocus: encodeMatchesFocus(
-              areaQuery.queryLabel,
-              candidateNames,
-            ),
-          });
+          // Solo abre visor de opciones si hay varias y el match era exacto.
+          finishBotReply(
+            sessionId,
+            botId,
+            localReply,
+            !areaQuery.uncertain && areaQuery.candidates.length > 1
+              ? {
+                  resultItems: [],
+                  qr: [],
+                  viewerOverview: "areaMatches",
+                  viewerFocus: encodeMatchesFocus(
+                    areaQuery.queryLabel,
+                    candidateNames,
+                  ),
+                }
+              : undefined,
+          );
         } catch {
           /* abort / nuevo mensaje */
         }
@@ -7008,6 +8508,156 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
+    // 5a0-. Traspaso masivo persona/área (propuesta + confirmación).
+    {
+      const transferAsk = detectBulkTransferAsk(userText || text);
+      if (transferAsk) {
+        try {
+          const toPerson = resolveCanonicalPerson(transferAsk.toRaw, items);
+          const toArea = resolveCanonicalArea(transferAsk.toRaw, items);
+          let field: BulkTransferField | null = null;
+          let toValue = "";
+
+          if (toPerson && toArea) {
+            const n = normalizeChatIntent(userText || text);
+            if (/\b(area|areas)\b/.test(n)) {
+              field = "area";
+              toValue = toArea;
+            } else {
+              field = "persona";
+              toValue = toPerson.name;
+            }
+          } else if (toPerson) {
+            field = "persona";
+            toValue = toPerson.name;
+          } else if (toArea) {
+            field = "area";
+            toValue = toArea;
+          }
+
+          if (!field || !toValue) {
+            const ask =
+              `No identifiqué el destino “${transferAsk.toRaw}”. ` +
+              `Dime la persona o el área exacta (ej. «pasa estos a María» o «mueve todo de Sistemas a Biblioteca»).`;
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          let sourceRows: InventarioRow[] = [];
+          let fromLabel = "selección";
+
+          if (transferAsk.fromRaw) {
+            if (field === "persona") {
+              const fromPerson = resolveCanonicalPerson(
+                transferAsk.fromRaw,
+                items,
+              );
+              if (fromPerson?.rows.length) {
+                sourceRows = fromPerson.rows;
+                fromLabel = fromPerson.name;
+              }
+            } else {
+              const fromArea =
+                resolveCanonicalArea(transferAsk.fromRaw, items) ||
+                transferAsk.fromRaw;
+              sourceRows = items.filter((row) =>
+                areaMatchesNeedle(String(row.area ?? ""), fromArea),
+              );
+              fromLabel =
+                resolveCanonicalArea(transferAsk.fromRaw, items) ||
+                transferAsk.fromRaw;
+            }
+          }
+
+          if (!sourceRows.length && transferAsk.fromContext) {
+            const prevItems =
+              lastBotResultItems(messagesRef.current).length > 0
+                ? lastBotResultItems(messagesRef.current)
+                : lastConcreteSideRef.current?.resultItems || [];
+            sourceRows = chatApiItemsToRows(prevItems, items);
+            fromLabel =
+              lastBotViewerFocus(messagesRef.current) ||
+              lastConcreteSideRef.current?.viewerFocus ||
+              "listado actual";
+          }
+
+          if (!sourceRows.length && transferAsk.fromRaw) {
+            // Reintento cruzado: origen persona aunque el destino sea área (o al revés).
+            const fromPerson = resolveCanonicalPerson(
+              transferAsk.fromRaw,
+              items,
+            );
+            const fromArea = resolveCanonicalArea(transferAsk.fromRaw, items);
+            if (fromPerson?.rows.length) {
+              sourceRows = fromPerson.rows;
+              fromLabel = fromPerson.name;
+            } else if (fromArea) {
+              sourceRows = items.filter((row) =>
+                areaMatchesNeedle(String(row.area ?? ""), fromArea),
+              );
+              fromLabel = fromArea;
+            }
+          }
+
+          // Solo filas que realmente cambian.
+          sourceRows = sourceRows.filter((row) => {
+            const current =
+              field === "persona"
+                ? String(row.persona ?? "").trim()
+                : String(row.area ?? "").trim();
+            return normalizePlain(current) !== normalizePlain(toValue);
+          });
+
+          const ids = [
+            ...new Set(
+              sourceRows
+                .map((row) => Number(row.id))
+                .filter((id) => Number.isFinite(id)),
+            ),
+          ];
+
+          if (!ids.length) {
+            const ask = transferAsk.fromContext
+              ? "No hay registros en el listado actual para traspasar (o ya tienen ese destino). Consulta primero una persona/área o dime «mueve todo de X a Y»."
+              : `No encontré registros de **${fromLabel}** que deban pasar a **${toValue}**.`;
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          const sampleEtiquetas = sourceRows
+            .map((row) => String(row.etiqueta ?? "").trim())
+            .filter(Boolean)
+            .slice(0, 6);
+
+          const pending: PendingBulkTransfer = {
+            ids,
+            field,
+            fromLabel,
+            toValue,
+            sampleEtiquetas,
+          };
+          setPendingBulkTransferSafe(pending);
+          const localReply = buildBulkTransferConfirmReply({
+            field,
+            fromLabel,
+            toValue,
+            count: ids.length,
+            sampleEtiquetas,
+          });
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply);
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
     // 5a0. Excel/CSV descargable con nombre referente a la consulta.
     {
       const excelAsk = detectExcelExportAsk(userText || text);
@@ -7114,10 +8764,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           const localReply = buildExcelExportReply(files);
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
+          // Solo tarjeta Excel: no abrir/actualizar el visor derecho.
           finishBotReply(sessionId, botId, localReply, {
-            resultItems: sourceRows.slice(0, 50).map((row) => rowToChatApiItem(row)),
-            qr: [],
-            viewerFocus: focusName || undefined,
             exportFiles: files,
           });
           return;
@@ -7369,23 +9017,46 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       hasConcreteInventoryAsk(userText || text, items, chatHistory) ||
       forceSidePanel;
 
-    // Sin resultados en una búsqueda concreta → “¿quisiste decir…?”
+    const replySaysNotFound =
+      /no se encontraron|no encontr[eé]|sin coincidencias|no hay registros para/i.test(
+        reply,
+      );
+
+    // Sin resultados en una búsqueda concreta → “¿quisiste decir…?” (sin visor)
     if (
       !sideItems.length &&
       !qrPayloads.length &&
       !mutated &&
       concreteAsk &&
       items.length &&
-      !/quisiste decir/i.test(reply)
+      !/quisiste decir|te refer[ií]as/i.test(reply)
     ) {
       const suggestions = suggestDidYouMean(userText || text, items);
       if (suggestions.length) {
         reply = formatDidYouMeanReply(userText || text, suggestions);
+        const areaCatalog = getAllAreaCatalog(items);
+        const areaHits = suggestions
+          .map(
+            (s) =>
+              areaCatalog.find((c) => c.name === s) ||
+              areaCatalog.find((c) => areaMatchesNeedle(c.name, s)),
+          )
+          .filter((c): c is AreaCandidateSummary => Boolean(c));
+        if (areaHits.length) {
+          pendingDisambiguationRef.current = {
+            kind: "area",
+            queryLabel: normalizePlain(userText || text).slice(0, 40) || "consulta",
+            candidates: areaHits.map((c) => c.name),
+            intent: "list",
+            limit: null,
+          };
+        }
       }
     }
     const exploratoryAsk =
       !concreteAsk && !mutated && isExploratoryChatAsk(userText || text);
-    if (!openSidePanel) {
+    if (!openSidePanel || replySaysNotFound) {
+      // “No encontrado” → no reusar etiquetas del mensaje anterior en el visor.
       sideItems = [];
       qrPayloads = [];
     } else if (
@@ -7396,21 +9067,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         mutated) &&
       items.length
     ) {
-      // Recuperar ficha en el visor (prompt, reply o contexto reciente).
-      let recovered = resolveRecordRowsFromPrompt(
+      // Recuperar ficha en el visor (prompt o reply). Nunca el lote previo ajeno.
+      const recovered = resolveRecordRowsFromPrompt(
         userText || text,
         reply,
         items,
       );
-      if (!recovered.length) {
-        recovered = resolveContextualRecordRows(
-          items,
-          messagesRef.current.map((m) => ({
-            from: m.from,
-            text: m.text || "",
-          })),
-        );
-      }
       sideItems = recovered.map((row) => rowToChatApiItem(row));
     }
 
@@ -7837,6 +9499,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setChatQrByMsg({});
     setPendingChatImport(null);
     setPendingChatImportSafe(null);
+    setPendingBulkTransferSafe(null);
     changeRail("archivos");
   }, [changeRail]);
 
@@ -8510,9 +10173,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 <div className="chat-main">
                   {!chatStarted ? (
                     <div className="chat-home">
-                      <h2 className="chat-home-title">
-                        Hola. ¿Qué quieres consultar del inventario?
-                      </h2>
+                      <div className="chat-home-hero">
+                        <h2 className="chat-home-title">
+                          Hola. ¿Qué quieres consultar del inventario?
+                        </h2>
+                        <p className="chat-home-sub">
+                          Elige una idea o escribe tu pregunta abajo
+                        </p>
+                      </div>
                       <div className="chat-quick-actions">
                         {CHAT_QUICK_ACTIONS.map(({ label, hint, prompt, icon: Icon }) => (
                           <button
@@ -8520,14 +10188,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             type="button"
                             className="chat-quick-action"
                             onClick={() => sendChat(prompt)}
+                            title={hint}
                           >
                             <span className="chat-quick-action-head">
                               <span className="chat-quick-action-icon" aria-hidden="true">
-                                <Icon size={15} strokeWidth={1.9} />
+                                <Icon size={13} strokeWidth={1.9} />
                               </span>
                               <strong>{label}</strong>
                             </span>
-                            <span className="chat-quick-action-hint">{hint}</span>
                           </button>
                         ))}
                       </div>
@@ -8650,7 +10318,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                           const isTyping = /^consultando el inventario/i.test(
                             String(message.text || "").trim(),
                           );
-                          const hasSide = messageHasSideData(message);
                           if (isTyping) {
                             return (
                               <div className="chat-response-block is-typing">
@@ -8724,13 +10391,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                   />
                                   <span>Asistente de Inventario</span>
                                 </span>
-                                {hasSide ? (
-                                  <span className="chat-response-meta">
-                                    <span className="chat-response-sync-pill">
-                                      Visor activo
-                                    </span>
-                                  </span>
-                                ) : null}
                               </div>
                               <div className="chat-response">
                                 {renderChatRichText(message.text)}

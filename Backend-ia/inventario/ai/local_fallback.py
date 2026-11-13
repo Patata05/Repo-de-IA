@@ -16,95 +16,62 @@ from inventario.supabase_client import (
 
 _GREETING_REPLIES = (
     (
-        "¡Hola! ¿En qué te puedo ayudar con el inventario?\n\n"
-        "Puedo consultar datos reales, ayudarte a registrar artículos "
-        "o importar un archivo. Si quieres empezar, dime por ejemplo:\n"
-        "• ¿Consultamos el inventario general, por área o por persona?\n"
-        "• ¿Buscamos por etiqueta/artículo o vemos los últimos registros?\n"
-        "• ¿Quieres dar de alta un artículo nuevo (+ Nuevo artículo)?\n"
-        "• ¿Prefieres importar un Excel o CSV con + → Excel/CSV?\n"
-        "• ¿Generamos códigos QR de algún grupo?\n\n"
-        "Dime qué camino prefieres y lo hacemos."
+        "¡Hola! Estoy listo para ayudarte con el inventario: consultas por "
+        "persona o área, etiquetas, QR, altas o importar un Excel/CSV. "
+        "¿Qué te gustaría hacer primero?"
     ),
     (
-        "¡Qué tal! Estoy listo para el inventario.\n\n"
-        "Puedo ayudarte con:\n"
-        "• Totales, áreas y personas\n"
-        "• Buscar una etiqueta o artículo concreto\n"
-        "• Últimos registros o códigos QR\n"
-        "• Alta de artículos o importar Excel/CSV\n\n"
-        "¿Por dónde empezamos?"
+        "¡Qué tal! Puedo buscar registros, ver totales, generar códigos QR "
+        "o ayudarte a pasar datos entre personas y áreas. ¿Por dónde empezamos?"
     ),
     (
-        "¡Hola! Cuéntame qué necesitas del inventario.\n\n"
-        "Algunas ideas rápidas:\n"
-        "• «cuántas áreas hay» o «dame el inventario general»\n"
-        "• «qué tiene [persona]» o «equipos de [área]»\n"
-        "• «dame los últimos registros» o «genera QR de…»\n"
-        "• Importar un Excel/CSV desde el clip 📎\n\n"
-        "Escribe tu consulta y lo resolvemos."
+        "¡Hola! Cuéntame qué necesitas del inventario y lo vemos juntos. "
+        "Si quieres, prueba con algo como «qué tiene Juan» o «equipos de Biblioteca»."
     ),
     (
-        "¡Bienvenido! Soy tu asistente de inventario.\n\n"
-        "Sirvo para consultar, filtrar, generar QR y orientar altas o importaciones.\n"
-        "Prueba con:\n"
-        "• Inventario general / por área / por persona\n"
-        "• Buscar por etiqueta, marca o artículo\n"
-        "• Ver recientes o crear códigos QR\n\n"
-        "¿Qué te gustaría revisar primero?"
+        "¡Bienvenido! Soy tu asistente de inventario. Dime qué quieres "
+        "revisar o cambiar y te guío en lenguaje natural."
     ),
 )
 
 _HELP_REPLIES = (
     (
-        "Puedo trabajar contigo el inventario así:\n"
-        "• Consultar totales, áreas, personas y artículos\n"
-        "• Buscar por etiqueta, persona o área\n"
-        "• Ver últimos registros o generar códigos QR\n"
-        "• Orientarte para dar de alta un artículo (+ Nuevo artículo)\n"
-        "• Importar Excel/CSV con el clip 📎\n"
-        "• Resumen general del inventario\n\n"
-        "Dime qué quieres hacer y te guío paso a paso."
+        "Puedo consultar el inventario con datos reales, filtrar por persona "
+        "o área, mostrar listados en el visor, generar QR, importar Excel/CSV "
+        "y ayudarte con cambios o traspasos (siempre con confirmación). "
+        "¿Qué quieres hacer ahora?"
     ),
     (
-        "Estas son mis funciones principales:\n"
-        "• Conteos exactos (áreas, personas, activos/inactivos)\n"
-        "• Listados y fichas en el visor derecho\n"
-        "• QR de una o varias etiquetas\n"
-        "• Apoyo para altas y carga masiva Excel/CSV\n\n"
-        "Ejemplo: «dame lo que tiene Juan Pérez» o «cuántas tarjas hay»."
+        "Piénsame como un chat del inventario: me pides algo en español "
+        "normal y te respondo con cifras y contexto. Por ejemplo, "
+        "«dame lo que tiene Juan Pérez» o «mueve todo de Juan a María». "
+        "¿Con qué empezamos?"
     ),
     (
-        "Piensa en mí como un atajo al inventario:\n"
-        "pregunto poco, respondo con datos reales y te dejo opciones claras.\n\n"
-        "Puedo: buscar, contar, mostrar en el panel, generar QR e importar archivos.\n"
-        "¿Qué tarea quieres hacer ahora?"
+        "Sirvo para buscar, contar, mostrar en el panel, armar QR e importar "
+        "archivos. Dime la tarea en una frase y lo resolvemos."
     ),
 )
 
 _ACK_REPLIES = (
     (
-        "Perfecto. Cuando quieras, dime qué hacemos: ver artículos, filtrar "
-        "por persona o área, consultar estados/marcas, generar QR, registrar uno nuevo o importar Excel/CSV."
+        "Perfecto. Cuando quieras seguimos: puedo revisar a alguien, un área, "
+        "una etiqueta, armar QR o importar un archivo. ¿Qué hacemos?"
     ),
     (
-        "Va. Si quieres seguir, puedo:\n"
-        "• Mostrar un área o persona\n"
-        "• Buscar por etiqueta/artículo\n"
-        "• Traer últimos registros o QR\n"
-        "• Ayudarte a importar Excel/CSV\n\n"
-        "¿Qué te late?"
+        "Va. Si quieres, vemos un área o una persona, buscamos una etiqueta, "
+        "traemos lo reciente o te ayudo a importar un Excel. ¿Qué te late?"
     ),
     (
-        "Listo. Estoy aquí para consultas del inventario.\n"
-        "Prueba con «dame el inventario general», «equipos de [área]» o «cuántas áreas hay»."
+        "Listo. Estoy aquí para lo que necesites del inventario; "
+        "dime la siguiente consulta cuando quieras."
     ),
     (
         "De acuerdo. ¿Seguimos con una búsqueda, un total, QR o una importación?"
     ),
     (
-        "¡Hecho! Dime la siguiente consulta cuando quieras "
-        "(persona, área, etiqueta, recientes o QR)."
+        "¡Hecho! Cuando quieras, dime persona, área, etiqueta o lo que "
+        "necesites y lo vemos."
     ),
 )
 
@@ -135,227 +102,171 @@ STOPWORDS = {
     "para",
     "que",
     "qué",
-    "quien",
-    "quién",
-    "tiene",
-    "hay",
-    "donde",
-    "dónde",
     "como",
     "cómo",
-    "dime",
-    "buscar",
-    "busca",
-    "ver",
-    "no",
+    "cual",
+    "cuál",
+    "cuales",
+    "cuáles",
+    "me",
+    "te",
     "se",
-    "ven",
-    "veo",
-    "aparecen",
-    "aparece",
-    "visor",
-    "panel",
+    "le",
+    "les",
+    "mi",
+    "tu",
+    "su",
+    "al",
+    "lo",
+    "ya",
+    "si",
+    "sí",
+    "no",
+    "o",
+    "y",
+    "a",
+    "es",
+    "son",
+    "hay",
+    "tiene",
+    "tienen",
+    "dame",
+    "muestra",
+    "mostrar",
+    "ver",
+    "busca",
+    "buscar",
+    "lista",
+    "listar",
+    "quiero",
+    "necesito",
+    "puedes",
+    "puede",
+    "puedo",
+    "hola",
+    "buenas",
+    "gracias",
 }
 
 
-def _clean_tokens(text: str) -> list[str]:
-    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
-    return [t for t in cleaned.split() if len(t) > 1 and t not in STOPWORDS]
+def _fold(text: str) -> str:
+    t = str(text or "").lower()
+    for a, b in (
+        ("á", "a"),
+        ("é", "e"),
+        ("í", "i"),
+        ("ó", "o"),
+        ("ú", "u"),
+        ("ü", "u"),
+        ("ñ", "n"),
+    ):
+        t = t.replace(a, b)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def local_chat_answer(message: str) -> tuple[str, list[dict]]:
-    msg = message.lower().strip()
-    items: list[dict] = []
+def _clean_tokens(message: str) -> list[str]:
+    return [t for t in _fold(message).split() if t and t not in STOPWORDS]
 
-    greetings = (
-        "hola",
-        "buen dia",
-        "buenos dias",
-        "buenas tardes",
-        "buenas noches",
-        "saludos",
-        "hey",
-        "que tal",
-        "qué tal",
-    )
-    # Solo saludo puro (evita "hola dame el último registro…")
-    if any(msg == g or msg == f"{g}!" for g in greetings):
-        return (pick_greeting_reply(), [])
 
-    if any(k in msg for k in ("ayuda", "qué puedes", "que puedes")):
-        return (pick_help_reply(), [])
+def local_chat_answer(message: str) -> tuple[str, list]:
+    msg = _fold(message)
+    if not msg:
+        return pick_greeting_reply(), []
 
     if any(
         k in msg
         for k in (
-            "ultimo",
-            "último",
-            "reciente",
-            "recien",
-            "recién",
-            "hoy",
-            "nuevo",
-            "nueva",
-            "acabe",
-            "acabo",
-            "agregue",
-            "agregué",
-            "registre",
-            "registré",
+            "hola",
+            "buenas",
+            "buen dia",
+            "buenos dias",
+            "buenas tardes",
+            "buenas noches",
+            "hey",
+            "saludos",
         )
-    ) and any(
+    ) and len(msg.split()) <= 6:
+        return pick_greeting_reply(), []
+
+    if any(
         k in msg
         for k in (
-            "registro",
-            "articulo",
-            "artículo",
-            "equipo",
-            "alta",
-            "entrada",
-            "hice",
-            "agreg",
-            "cre",
+            "que se puede",
+            "que puedes",
+            "que puedo",
+            "que hacemos",
+            "que podemos",
+            "opciones",
+            "ayuda",
+            "ayudame",
+            "para que sirves",
+            "como te uso",
+            "como funciona",
+            "en que me ayudas",
         )
     ):
-        solo_hoy = "hoy" in msg
-        limit = 1 if any(k in msg for k in ("ultimo", "último")) and not solo_hoy else 5
-        if solo_hoy and any(k in msg for k in ("ultimo", "último")):
-            limit = 5
-        rows, error = listar_recientes(limit=limit, solo_hoy=solo_hoy)
-        if error:
-            return f"No pude leer registros recientes: {error}", []
-        if not rows:
-            return (
-                "No encontré registros recientes"
-                + (" de hoy." if solo_hoy else ".")
-                + " Revisa en Inventario o importa de nuevo.",
-                [],
-            )
-        items = rows
-        lines = []
-        for r in rows[:8]:
-            et = r.get("etiqueta") or "S/E"
-            art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-            lines.append(
-                f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} ({r.get('area') or 'General'})"
-            )
-        titulo = "Registros de hoy" if solo_hoy else "Último(s) registro(s)"
-        return f"{titulo} (modo local):\n" + "\n".join(lines), items
+        return pick_help_reply(), []
 
-    # "dame 5/trece etiquetas" → lista (sin QR)
-    if "etiqueta" in msg and "qr" not in msg:
-        words = {
-            "un": 1,
-            "uno": 1,
-            "dos": 2,
-            "tres": 3,
-            "cuatro": 4,
-            "cinco": 5,
-            "seis": 6,
-            "siete": 7,
-            "ocho": 8,
-            "nueve": 9,
-            "diez": 10,
-            "once": 11,
-            "doce": 12,
-            "trece": 13,
-            "catorce": 14,
-            "quince": 15,
-            "veinte": 20,
-        }
-        m = re.search(r"(\d{1,3})\s*etiqueta", msg) or re.search(
-            r"etiqueta\w*\s*(\d{1,3})", msg
-        )
-        if m:
-            limit = max(1, min(50, int(m.group(1))))
-        else:
-            wm = re.search(
-                r"\b(" + "|".join(words.keys()) + r")\s+etiqueta",
-                msg,
-            )
-            limit = max(1, min(50, words[wm.group(1)])) if wm else 50
-        rows, error = listar_recientes(limit=limit, solo_hoy=False)
-        if error:
-            return f"No pude listar etiquetas: {error}", []
-        if not rows:
-            return "No hay etiquetas para mostrar en el inventario.", []
-        items = rows
-        lines = []
-        for r in rows[:8]:
-            et = r.get("etiqueta") or "S/E"
-            art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-            lines.append(
-                f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} "
-                f"({r.get('area') or 'General'})"
-            )
-        more = f"\n… y {len(rows) - 8} más." if len(rows) > 8 else ""
+    if re.fullmatch(
+        r"(ok|okay|okey|vale|va|sale|bueno|bien|gracias|thanks|perfecto|"
+        r"listo|entendido|claro|dale|de acuerdo|sip|si)",
+        msg,
+    ):
+        return pick_ack_reply(), []
+
+    if "traspaso" in msg or (
+        any(k in msg for k in ("mueve", "pasar", "pasa", "transfer"))
+        and any(k in msg for k in ("todo", "todos", "estos", "estas", "lote"))
+    ):
         return (
-            f"Aquí tienes {len(rows)} etiqueta(s). El detalle está en el visor "
-            f"derecho.\n\n" + "\n".join(lines) + more,
-            items,
+            "Para traspasos masivos el chat te pide confirmación y luego "
+            "aplica el cambio en lote. Prueba con frases como "
+            "«mueve todo de Juan a María», «pasa todo de Sistemas a Biblioteca» "
+            "o «pasa estos a María» (usando el listado del visor). "
+            "¿Quieres armar uno?",
+            [],
         )
 
-    if "biblioteca" in msg and any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto", "hay")):
-        total, error = count_por_campo("area", "Biblioteca")
+    if any(k in msg for k in ("reciente", "recientes", "ultimo", "ultimos", "hoy")):
+        rows, error = listar_recientes(limit=8, solo_hoy="hoy" in msg)
         if error:
-            return f"No pude contar Biblioteca: {error}", []
-        return f"En Biblioteca hay {total} artículos registrados.", []
+            return f"No pude leer los recientes: {error}", []
+        if not rows:
+            return "No hay registros recientes para mostrar.", []
+        n = len(rows)
+        sample = rows[0]
+        et = sample.get("etiqueta") or "S/E"
+        art = sample.get("articulo") or "artículo"
+        return (
+            f"Hay {n} registro{'s' if n != 1 else ''} reciente{'s' if n != 1 else ''}. "
+            f"El más nuevo es {et} ({art}). El detalle está en el visor. "
+            "¿Quieres filtrar por persona, un área o generar QR?",
+            rows,
+        )
 
-    # "cuántos registros tiene GARCIA AVILA MARTIN"
-    if any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto")) and (
-        "tiene" in msg or "tienen" in msg
-    ):
-        from inventario.supabase_client import list_por_campo
+    if any(k in msg for k in ("cuantas areas", "cuantas area", "areas hay", "areas en total")):
+        data, error = resumen_inventario()
+        if error:
+            rows, err2, _ = read_inventario()
+            if err2:
+                return f"No pude leer el inventario: {error or err2}", []
+            areas = {
+                str(r.get("area") or "").strip()
+                for r in (rows or [])
+                if str(r.get("area") or "").strip()
+            }
+            areas_n = len(areas)
+        else:
+            areas_n = data.get("areas", 0)
+        return (
+            f"Este inventario tiene {areas_n} área{'s' if areas_n != 1 else ''} distintas. "
+            "Si quieres el detalle de una, dime su nombre.",
+            [],
+        )
 
-        stop = {
-            "cuantos",
-            "cuántos",
-            "cuanto",
-            "cuánto",
-            "cuantas",
-            "cuántas",
-            "registros",
-            "registro",
-            "articulos",
-            "artículos",
-            "equipos",
-            "tiene",
-            "tienen",
-            "hay",
-            "de",
-            "del",
-            "la",
-            "el",
-            "los",
-            "las",
-            "un",
-            "una",
-            "me",
-            "dame",
-            "persona",
-        }
-        tokens = [
-            t
-            for t in _clean_tokens(message)
-            if t not in stop and len(t) > 1
-        ]
-        persona = " ".join(tokens).strip()
-        if persona:
-            total, error = count_por_campo("persona", persona)
-            rows, _ = list_por_campo("persona", persona, limit=12)
-            if error:
-                return f"No pude contar registros de {persona}: {error}", []
-            items = rows
-            return (
-                f"{persona} tiene {total} registro(s) en el inventario. "
-                "El detalle está en el visor derecho.\n\n"
-                "¿Quieres ver solo los más recientes, generar QR de un lote "
-                "o filtrar por un área?",
-                items,
-            )
-
-    if any(k in msg for k in ("resumen", "estadistica", "estadística")) or (
-        any(k in msg for k in ("cuantos", "cuántos", "cuanto", "cuánto", "total"))
+    if any(k in msg for k in ("resumen", "estadistica", "estadistica")) or (
+        any(k in msg for k in ("cuantos", "cuanto", "total"))
         and any(k in msg for k in ("inventario", "todo", "todos", "hay"))
     ):
         total, err_t = count_inventario()
@@ -368,14 +279,32 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
         return (
             f"Inventario general: {real_total} artículos, "
             f"{data.get('personas', '—')} personas y {data.get('areas', '—')} áreas"
-            f"{obs_txt}. El desglose está en el visor derecho.\n\n"
-            "Si quieres seguir, dime por ejemplo:\n"
-            "• Filtrar por un área o persona\n"
-            "• Ver los últimos registros o generar QR\n"
-            "• Dar de alta un artículo (+ Nuevo artículo)\n"
-            "• Importar un Excel o CSV con el clip 📎",
+            f"{obs_txt}. "
+            "Si quieres seguir, dime un área, una persona, los últimos registros, "
+            "QR o importar un Excel/CSV.",
             [],
         )
+
+    # Persona: "cuantos tiene X"
+    m_person = re.search(
+        r"(?:cuantos|cuantas|que tiene|tiene)\s+(.+)$",
+        msg,
+    )
+    if m_person and "area" not in msg:
+        persona = m_person.group(1).strip()
+        if persona and persona not in STOPWORDS:
+            total, error = count_por_campo("persona", persona)
+            if not error and total is not None:
+                from inventario.supabase_client import list_por_campo
+
+                rows, _ = list_por_campo("persona", persona, limit=12)
+                return (
+                    f"{persona} tiene {total} registro(s) en el inventario. "
+                    "El detalle está en el visor derecho. "
+                    "¿Quieres ver solo los más recientes, generar QR de un lote "
+                    "o filtrar por un área?",
+                    rows or [],
+                )
 
     tokens = _clean_tokens(message)
     query = " ".join(tokens) if tokens else message
@@ -383,7 +312,6 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
     if error:
         return f"No pude leer el inventario: {error}", []
     if not rows:
-        # si search vacío, intenta leer todo y avisar
         _, err2, _ = read_inventario()
         if err2:
             return f"No pude leer el inventario: {err2}", []
@@ -392,18 +320,13 @@ def local_chat_answer(message: str) -> tuple[str, list[dict]]:
             [],
         )
 
-    items = rows
-    lines = []
-    for r in rows[:8]:
-        et = r.get("etiqueta") or "S/E"
-        art = f"{r.get('articulo') or ''} {r.get('marca') or ''}".strip()
-        lines.append(
-            f"• {et}: {art} — {r.get('persona') or 'Sin asignar'} ({r.get('area') or 'General'})"
-        )
-    more = f"\n… y {len(rows) - 8} más." if len(rows) > 8 else ""
+    sample = rows[0]
+    et = sample.get("etiqueta") or "S/E"
+    art = f"{sample.get('articulo') or ''} {sample.get('marca') or ''}".strip() or "artículo"
+    more = f" (y {len(rows) - 1} más)" if len(rows) > 1 else ""
     return (
-        f"Encontré {len(rows)} registro(s) (modo local):\n"
-        + "\n".join(lines)
-        + more,
-        items,
+        f"Encontré {len(rows)} registro(s){more}. "
+        f"Por ejemplo {et}: {art} — {sample.get('persona') or 'Sin asignar'} "
+        f"({sample.get('area') or 'General'}). El detalle está en el visor.",
+        rows,
     )

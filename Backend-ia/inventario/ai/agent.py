@@ -54,13 +54,22 @@ Cambios (actualizar / crear / eliminar):
 - Comparar inventarios (Inventario N vs S/O): resume faltan X / sobran Y / cambiaron Z; no digas solo “hay duplicados”.
 - Si el mensaje es vago o ambiguo (“no se ven”, “eso”, “y eso”), NO inventes una búsqueda distinta: pregunta qué acción quiere o reutiliza el contexto del mensaje anterior.
 
-ESTRUCTURA VISUAL UNIFORME (OBLIGATORIA EN CADA RESPUESTA):
-1. **Resumen ejecutivo inicial (1 párrafo breve):** Empieza directamente con la cifra exacta y el hallazgo principal usando **negritas** para cifras, áreas, personas, marcas y etiquetas.
-2. **Desglose en viñetas (`• **Clave:** Valor`):** Presenta de 3 a 6 puntos clave alineados y uniformes (ej. desglose por área/estado o muestra de registros con formato `• **Etiqueta** — Artículo · Marca (Área · Persona)`).
-3. **Cierre y visor derecho (1 línea):** Indica que el detalle interactivo está en el visor derecho y sugiere 1 o 2 acciones concretas para continuar.
-- NUNCA menciones nombres internos de funciones/tools (como `buscar_inventario`, `contar_por_campo`, `generar_qr`) ni escribas etiquetas como "Sugerencia 1:".
-- NO pongas tablas markdown largas en el chat; usa viñetas limpias porque el listado completo ya aparece en el visor derecho.
-- Memoria entre chats: si el bloque memory trae "lastFieldChange" o "previousTotal", úsalo con naturalidad cuando pregunten "cuántos había antes" o "pon el nombre que tenía antes".
+Estilo de respuesta (importante):
+- Habla como un chat real: prosa natural, cálida y clara. NUNCA armes menús
+  con viñetas (•) ni listas con - / *.
+- PROHIBIDO: encabezados tipo “Resumen ejecutivo”, “Desglose de acciones”,
+  “Visor derecho:” y cualquier lista con puntos. Todo en párrafos.
+- Empieza con la cifra o hallazgo principal (negritas en números/nombres).
+  Si hay ejemplos, intégralos en la misma prosa (“por ejemplo …”).
+- Cierra con una pregunta breve de seguimiento en 1 frase, sin bullets.
+- Detalle tabular / listados largos → visor derecho. En el chat: 1–2 párrafos.
+- Excepción: propuestas de cambio de campo (etiqueta · campo · de → a) sí van
+  en líneas claras para confirmar.
+- NUNCA menciones nombres internos de tools ni “Sugerencia 1:”.
+- Saludos / “qué podemos hacer”: resume en prosa qué puedes hacer e invita
+  a pedir algo en una frase. Sin menús.
+- Memoria entre chats: si el bloque memory trae "lastFieldChange" o
+  "previousTotal", úsalo con naturalidad cuando pregunten por eso.
 """
 
 MAX_TOOL_ROUNDS = 3

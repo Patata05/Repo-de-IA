@@ -55,6 +55,167 @@ function foldOrigenText(raw: string) {
     .trim();
 }
 
+/** Normaliza un valor de origen de celda/hoja/archivo. */
+export function normalizeOrigenLabel(
+  raw: string,
+  existing: string[] = [],
+): string | null {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+  const n = foldOrigenText(trimmed);
+  if (!n) return null;
+  if (/^(s o|so|s\/o|sin origen|sinorigen)$/.test(n)) {
+    return ORIGEN_SIN_ORIGEN;
+  }
+  const inv = n.match(/\binventarios?\s*(\d+)\b/);
+  if (inv) {
+    const num = Number(inv[1]);
+    if (Number.isFinite(num) && num > 0) {
+      const hit = existing.find((origen) => inventarioNumber(origen) === num);
+      return hit || `Inventario ${num}`;
+    }
+  }
+  for (const origen of existing) {
+    if (foldOrigenText(origen) === n) return origen;
+  }
+  // Conservar etiqueta libre (p. ej. “Biblioteca”) si viene en columna.
+  return trimmed;
+}
+
+/**
+ * Destino desde nombre de archivo/hoja:
+ * “Inventario 1.xlsx”, “inventario_oficina_1-v3.xlsx”, hoja “Inventario 1”.
+ */
+export function matchOrigenFromFileName(
+  fileName: string,
+  existing: string[] = [],
+): string | undefined {
+  const base = String(fileName || "")
+    .replace(/\.[^.]+$/i, "")
+    .trim();
+  if (!base) return undefined;
+  const n = foldOrigenText(base);
+
+  // “inventario 1” / “inventarios 2”
+  const direct = n.match(/\binventarios?\s*(\d+)\b/);
+  if (direct) {
+    const num = Number(direct[1]);
+    if (Number.isFinite(num) && num > 0) {
+      const hit = existing.find((origen) => inventarioNumber(origen) === num);
+      return hit || `Inventario ${num}`;
+    }
+  }
+
+  // “inventario_oficina_1-v3” → primer número tras “inventario” (ignora v3)
+  const afterInv = n.match(/\binventario(?:s)?\b(.+)$/);
+  if (afterInv) {
+    const rest = afterInv[1].replace(/\bv\s*\d+\b/g, " ");
+    const numMatch = rest.match(/\b(\d+)\b/);
+    if (numMatch) {
+      const num = Number(numMatch[1]);
+      if (Number.isFinite(num) && num > 0) {
+        const hit = existing.find((origen) => inventarioNumber(origen) === num);
+        return hit || `Inventario ${num}`;
+      }
+    }
+  }
+
+  return normalizeOrigenLabel(base, existing) || undefined;
+}
+
+export type ImportOrigenPlan =
+  | {
+      kind: "uniform";
+      origen: string;
+      source: "prompt" | "column" | "sheet" | "file" | "filter" | "default";
+      alreadyExists: boolean;
+    }
+  | {
+      kind: "mixed";
+      /** Conteos por origen detectado en columna (≥1 origen distinto y con filas). */
+      counts: Array<{ origen: string; count: number }>;
+    };
+
+/**
+ * Decide destino de importación:
+ * columna uniforme → hoja → archivo → prompt → filtro → S/O.
+ * Si la columna trae varios orígenes con datos → mixed (pendiente).
+ */
+export function planImportOrigen(input: {
+  promptText?: string;
+  fileName?: string;
+  sheetName?: string;
+  columnOrigens?: string[];
+  selectedFilter?: string | null;
+  existing: string[];
+}): ImportOrigenPlan {
+  const existing = input.existing || [];
+  const asked = matchOrigenFromPrompt(input.promptText || "", existing);
+  const sheet = input.sheetName
+    ? matchOrigenFromFileName(input.sheetName, existing)
+    : undefined;
+  const file = input.fileName
+    ? matchOrigenFromFileName(input.fileName, existing)
+    : undefined;
+
+  const colNorm = (input.columnOrigens || [])
+    .map((v) => normalizeOrigenLabel(v, existing))
+    .filter((v): v is string => Boolean(v));
+
+  if (colNorm.length > 0) {
+    const countsMap = new Map<string, number>();
+    for (const o of colNorm) {
+      countsMap.set(o, (countsMap.get(o) || 0) + 1);
+    }
+    const counts = [...countsMap.entries()]
+      .map(([origen, count]) => ({ origen, count }))
+      .sort((a, b) => b.count - a.count);
+    // Mezclado solo si hay ≥2 orígenes con al menos 1 registro cada uno
+    // y el archivo tiene “varios” (umbral práctico: ≥2 orígenes y ≥2 filas).
+    if (counts.length >= 2 && colNorm.length >= 2) {
+      return { kind: "mixed", counts };
+    }
+    if (counts.length === 1) {
+      const origen = counts[0].origen;
+      return {
+        kind: "uniform",
+        origen,
+        source: "column",
+        alreadyExists: existing.some(
+          (e) => foldOrigenText(e) === foldOrigenText(origen),
+        ),
+      };
+    }
+  }
+
+  const filter =
+    input.selectedFilter &&
+    input.selectedFilter !== "ALL" &&
+    String(input.selectedFilter).trim()
+      ? String(input.selectedFilter).trim()
+      : undefined;
+
+  const picked =
+    (asked
+      ? { origen: asked, source: "prompt" as const }
+      : null) ||
+    (sheet ? { origen: sheet, source: "sheet" as const } : null) ||
+    (file ? { origen: file, source: "file" as const } : null) ||
+    (filter ? { origen: filter, source: "filter" as const } : null) || {
+      origen: ORIGEN_SIN_ORIGEN,
+      source: "default" as const,
+    };
+
+  return {
+    kind: "uniform",
+    origen: picked.origen,
+    source: picked.source,
+    alreadyExists: existing.some(
+      (e) => foldOrigenText(e) === foldOrigenText(picked.origen),
+    ),
+  };
+}
+
 /**
  * Destino de importación desde el chat: “Inventario 1”, “en vez de S/O”, etc.
  * Si pide un número que aún no existe, devuelve “Inventario N”.

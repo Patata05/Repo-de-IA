@@ -4,6 +4,7 @@ import {
   createInventario,
   createInventarioMany,
   updateInventario,
+  updateInventarioMany,
   deleteInventario,
   deleteInventarioMany,
   restoreInventarioMany,
@@ -109,6 +110,36 @@ export async function updateInventarioAction(
     return {
       success: false,
       error: error || "No se pudo actualizar el artículo en la base de datos.",
+    };
+  }
+
+  revalidatePath("/");
+  return { success: true, data };
+}
+
+export async function updateInventarioManyAction(
+  ids: number[],
+  item: Partial<NewInventarioItem>,
+): Promise<{ success: boolean; data?: InventarioRow[]; error?: string }> {
+  if (!ids.length) {
+    return { success: false, error: "No hay registros para actualizar." };
+  }
+  if (item.etiqueta !== undefined && !item.etiqueta.trim()) {
+    return { success: false, error: "La etiqueta no puede estar vacía." };
+  }
+  if (item.articulo !== undefined && !item.articulo.trim()) {
+    return { success: false, error: "El nombre del artículo no puede estar vacío." };
+  }
+  if (item.area !== undefined && !item.area.trim()) {
+    return { success: false, error: "El área no puede estar vacía." };
+  }
+
+  const { data, error } = await updateInventarioMany(ids, item);
+
+  if (error || !data.length) {
+    return {
+      success: false,
+      error: error || "No se pudieron actualizar los artículos.",
     };
   }
 

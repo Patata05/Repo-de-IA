@@ -428,6 +428,31 @@ async function logInventarioAuditoriaFromUpdate(
   await insertAuditoriaRows(entries);
 }
 
+function buildInventarioUpdatePayload(
+  item: Partial<NewInventarioItem>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (item.etiqueta !== undefined) payload.etiqueta = item.etiqueta.trim();
+  if (item.articulo !== undefined) payload.articulo = item.articulo.trim();
+  if (item.marca !== undefined) payload.marca = item.marca?.trim() || null;
+  if (item.modelo !== undefined) payload.modelo = item.modelo?.trim() || null;
+  if (item.serie !== undefined) payload.serie = item.serie?.trim() || null;
+  if (item.area !== undefined) payload.area = item.area.trim();
+  if (item.persona !== undefined) payload.persona = item.persona?.trim() || null;
+  if (item.cantidad !== undefined) {
+    payload.cantidad =
+      typeof item.cantidad === "number" && !isNaN(item.cantidad)
+        ? item.cantidad
+        : 1;
+  }
+  if (item.observaciones !== undefined) {
+    payload.observaciones = item.observaciones?.trim() || null;
+  }
+  if (item.estado !== undefined) payload.estado = normalizeEstado(item.estado);
+  if (item.origen !== undefined) payload.origen = item.origen || "S/O";
+  return payload;
+}
+
 export async function updateInventario(
   id: number,
   item: Partial<NewInventarioItem>
@@ -437,20 +462,10 @@ export async function updateInventario(
   }
 
   try {
-    const payload: Record<string, unknown> = {};
-    if (item.etiqueta !== undefined) payload.etiqueta = item.etiqueta.trim();
-    if (item.articulo !== undefined) payload.articulo = item.articulo.trim();
-    if (item.marca !== undefined) payload.marca = item.marca?.trim() || null;
-    if (item.modelo !== undefined) payload.modelo = item.modelo?.trim() || null;
-    if (item.serie !== undefined) payload.serie = item.serie?.trim() || null;
-    if (item.area !== undefined) payload.area = item.area.trim();
-    if (item.persona !== undefined) payload.persona = item.persona?.trim() || null;
-    if (item.cantidad !== undefined) {
-      payload.cantidad = typeof item.cantidad === "number" && !isNaN(item.cantidad) ? item.cantidad : 1;
+    const payload = buildInventarioUpdatePayload(item);
+    if (!Object.keys(payload).length) {
+      return { data: null, error: "No hay campos para actualizar." };
     }
-    if (item.observaciones !== undefined) payload.observaciones = item.observaciones?.trim() || null;
-    if (item.estado !== undefined) payload.estado = normalizeEstado(item.estado);
-    if (item.origen !== undefined) payload.origen = item.origen || "S/O";
 
     const table = await inventarioTable();
     const { data: beforeRow } = await table.select("*").eq("id", id).maybeSingle();
@@ -485,6 +500,93 @@ export async function updateInventario(
     const message = err instanceof Error ? err.message : "Error inesperado al actualizar.";
     console.error("Error en updateInventario:", err);
     return { data: null, error: message };
+  }
+}
+
+export async function updateInventarioMany(
+  ids: number[],
+  item: Partial<NewInventarioItem>,
+): Promise<{ data: InventarioRow[]; error: string | null }> {
+  if (!supabase) {
+    return { data: [], error: "El cliente de Supabase no está configurado." };
+  }
+
+  const uniqueIds = [
+    ...new Set(ids.map(Number).filter((id) => Number.isFinite(id))),
+  ];
+  if (!uniqueIds.length) {
+    return { data: [], error: "No hay artículos válidos para actualizar." };
+  }
+
+  try {
+    const payload = buildInventarioUpdatePayload(item);
+    if (!Object.keys(payload).length) {
+      return { data: [], error: "No hay campos para actualizar." };
+    }
+
+    const table = await inventarioTable();
+    const { data: beforeRows, error: beforeError } = await table
+      .select("*")
+      .in("id", uniqueIds);
+    if (beforeError) {
+      console.error("Error al leer filas antes del traspaso:", beforeError);
+      return { data: [], error: beforeError.message };
+    }
+    const beforeById = new Map(
+      ((beforeRows as InventarioRow[]) || []).map((row) => [Number(row.id), row]),
+    );
+
+    const { data, error } = await table
+      .update(payload)
+      .in("id", uniqueIds)
+      .select();
+
+    if (error) {
+      console.error("Error al actualizar lote en Supabase:", error);
+      return {
+        data: [],
+        error: isMissingEstadoColumn(error.message || "")
+          ? ESTADO_COLUMN_HINT
+          : error.message,
+      };
+    }
+
+    const afterRows = (data as InventarioRow[]) || [];
+    if (!afterRows.length) {
+      return {
+        data: [],
+        error:
+          "No se pudo actualizar el lote. Revisa las políticas RLS de UPDATE.",
+      };
+    }
+
+    const changedKeys = Object.keys(payload);
+    const auditEntries: Array<
+      Omit<InventarioAuditoriaRow, "id" | "created_at">
+    > = [];
+    for (const after of afterRows) {
+      const before = beforeById.get(Number(after.id)) || null;
+      for (const campo of changedKeys) {
+        auditEntries.push({
+          inventario_id: after.id ?? before?.id ?? null,
+          etiqueta: after.etiqueta ?? before?.etiqueta ?? null,
+          accion: "update",
+          campo,
+          valor_antes: auditText(before?.[campo as keyof InventarioRow]),
+          valor_despues: auditText(after[campo as keyof InventarioRow]),
+          origen: after.origen ?? before?.origen ?? null,
+          actor: "sistema",
+        });
+      }
+    }
+    void insertAuditoriaRows(auditEntries);
+
+    return { data: afterRows, error: null };
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : "Error inesperado al actualizar lote.";
+    console.error("Error en updateInventarioMany:", err);
+    return { data: [], error: message };
   }
 }
 

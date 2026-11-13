@@ -12,7 +12,8 @@ type ColKey =
   | "area"
   | "persona"
   | "cantidad"
-  | "observaciones";
+  | "observaciones"
+  | "origen";
 
 const HEADER_ALIASES: Record<ColKey, string[]> = {
   etiqueta: ["etiqueta", "etiquetas", "tag", "codigo", "folio"],
@@ -45,6 +46,14 @@ const HEADER_ALIASES: Record<ColKey, string[]> = {
   ],
   cantidad: ["cantidad", "cant", "qty", "piezas"],
   observaciones: ["observaciones", "observacion", "notas", "comentarios"],
+  origen: [
+    "origen",
+    "inventario",
+    "base",
+    "fuente",
+    "origen inventario",
+    "nombre inventario",
+  ],
 };
 
 /** Alineado con Database/widen-inventario-text.sql (códigos largos / QR) */
@@ -92,6 +101,10 @@ function headerScore(header: string, key: ColKey): number {
     return 0;
   }
   if (key === "persona" && /(area|ubicacion|localizacion|edificio|departamento)/.test(h)) {
+    return 0;
+  }
+  // "inventario" suelto en encabezado ≈ origen; no confundir con artículo
+  if (key === "origen" && /(articulo|etiqueta|codigo)/.test(h)) {
     return 0;
   }
 
@@ -231,9 +244,82 @@ function parseCsvText(text: string): unknown[][] {
 function cellDisplay(cell: ExcelJS.Cell): string {
   const text = String(cell.text ?? "").trim();
   if (text) return text;
-  const value = cell.value;
-  if (value == null || typeof value === "object") return "";
-  return String(value).trim();
+
+  const value = cell.value as unknown;
+  if (value == null) return "";
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (Number.isInteger(value) && Math.abs(value) >= 1e12) {
+      return value.toLocaleString("fullwide", { useGrouping: false });
+    }
+    return Number.isInteger(value) ? String(value) : String(value);
+  }
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  if (typeof value === "string") return value.trim();
+
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    // Fórmulas: usar resultado calculado
+    if ("result" in obj && obj.result != null && typeof obj.result !== "object") {
+      return String(obj.result).trim();
+    }
+    // Texto enriquecido
+    if (Array.isArray(obj.richText)) {
+      return obj.richText
+        .map((part) => String((part as { text?: string }).text ?? ""))
+        .join("")
+        .trim();
+    }
+    // Hipervínculo
+    if (typeof obj.text === "string" && obj.text.trim()) {
+      return obj.text.trim();
+    }
+  }
+  return "";
+}
+
+function sheetToMatrix(sheet: ExcelJS.Worksheet): unknown[][] {
+  const dim = sheet.dimensions;
+  const maxCol = Math.max(
+    dim?.right ?? 0,
+    sheet.columnCount || 0,
+    20,
+  );
+  // No cortar por huecos: leer todo el used-range real.
+  const maxRow = Math.max(dim?.bottom ?? 0, sheet.actualRowCount || 0, sheet.rowCount || 0);
+  const matrix: unknown[][] = [];
+
+  for (let r = 1; r <= maxRow; r += 1) {
+    const row = sheet.getRow(r);
+    const cells: string[] = [];
+    let any = false;
+    for (let c = 1; c <= maxCol; c += 1) {
+      const text = cellDisplay(row.getCell(c));
+      if (text) any = true;
+      cells.push(text);
+    }
+    if (any) matrix.push(cells);
+  }
+  return matrix;
+}
+
+function countValidInventoryRows(matrix: unknown[][]): number {
+  const header = findHeader(matrix);
+  if (!header) return 0;
+  let valid = 0;
+  for (let r = header.index + 1; r < matrix.length; r += 1) {
+    const row = matrix[r] || [];
+    const etq =
+      header.map.etiqueta !== undefined
+        ? cellText(row[header.map.etiqueta])
+        : "";
+    const art =
+      header.map.articulo !== undefined
+        ? cellText(row[header.map.articulo])
+        : "";
+    if (etq && art) valid += 1;
+  }
+  return valid;
 }
 
 async function workbookToMatrix(buffer: ArrayBuffer): Promise<{
@@ -242,21 +328,40 @@ async function workbookToMatrix(buffer: ArrayBuffer): Promise<{
 }> {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
-  const preferred =
-    workbook.worksheets.find((sheet) =>
-      normalizeHeader(sheet.name).includes("lectura"),
-    ) || workbook.worksheets[0];
-  if (!preferred) throw new Error("El archivo de Excel no tiene hojas.");
+  if (!workbook.worksheets.length) {
+    throw new Error("El archivo de Excel no tiene hojas.");
+  }
 
-  const matrix: unknown[][] = [];
-  preferred.eachRow({ includeEmpty: false }, (row) => {
-    const cells: string[] = [];
-    for (let c = 1; c <= row.cellCount; c += 1) {
-      cells.push(cellDisplay(row.getCell(c)));
+  let best: {
+    sheet: ExcelJS.Worksheet;
+    matrix: unknown[][];
+    valid: number;
+    nameBonus: number;
+  } | null = null;
+
+  for (const sheet of workbook.worksheets) {
+    if (sheet.state === "hidden" || sheet.state === "veryHidden") continue;
+    const matrix = sheetToMatrix(sheet);
+    const valid = countValidInventoryRows(matrix);
+    if (valid <= 0) continue;
+    const name = normalizeHeader(sheet.name);
+    const nameBonus =
+      name.includes("lectura") || name.includes("inventario") ? 1 : 0;
+    if (
+      !best ||
+      valid > best.valid ||
+      (valid === best.valid && nameBonus > best.nameBonus)
+    ) {
+      best = { sheet, matrix, valid, nameBonus };
     }
-    if (cells.some((cell) => cell.length > 0)) matrix.push(cells);
-  });
-  return { matrix, sheetName: preferred.name };
+  }
+
+  if (!best) {
+    throw new Error(
+      "No encontré una hoja con columnas Etiqueta y Artículo.",
+    );
+  }
+  return { matrix: best.matrix, sheetName: best.sheet.name };
 }
 
 function findHeader(matrix: unknown[][]): {
@@ -291,8 +396,12 @@ function rowsFromMatrix(
   origen: string
 ): {
   items: NewInventarioItem[];
+  rawValid: number;
   skipped: number;
   skippedDupEtiqueta: number;
+  /** Valores crudos de columna Origen (si existe), 1 por fila válida. */
+  columnOrigens: string[];
+  hasOrigenColumn: boolean;
 } {
   const header = findHeader(matrix);
   if (!header) {
@@ -301,7 +410,9 @@ function rowsFromMatrix(
     );
   }
 
+  const hasOrigenColumn = header.map.origen !== undefined;
   const rawItems: NewInventarioItem[] = [];
+  const columnOrigens: string[] = [];
   let skipped = 0;
 
   for (let r = header.index + 1; r < matrix.length; r++) {
@@ -313,6 +424,7 @@ function rowsFromMatrix(
 
     const etiqueta = get("etiqueta");
     const articulo = get("articulo");
+    // Fila vacía o incompleta: no cuenta como registro.
     if (!etiqueta && !articulo) {
       skipped += 1;
       continue;
@@ -321,9 +433,19 @@ function rowsFromMatrix(
       skipped += 1;
       continue;
     }
+    // Descartar basura típica de Excel (solo símbolos / “total”).
+    if (
+      /^(total|totales|suma|subtotal|#+$|-+)$/i.test(etiqueta) ||
+      /^(total|totales|suma|subtotal|#+$|-+)$/i.test(articulo)
+    ) {
+      skipped += 1;
+      continue;
+    }
 
     const cantidadRaw = get("cantidad");
     const cantidadParsed = Number.parseInt(cantidadRaw.replace(/[^\d-]/g, ""), 10);
+    const rowOrigenRaw = hasOrigenColumn ? get("origen") : "";
+    if (hasOrigenColumn) columnOrigens.push(rowOrigenRaw);
 
     rawItems.push({
       etiqueta: clip(etiqueta, FIELD_LIMITS.etiqueta),
@@ -336,23 +458,30 @@ function rowsFromMatrix(
       cantidad: Number.isFinite(cantidadParsed) && cantidadParsed > 0 ? cantidadParsed : 1,
       observaciones: get("observaciones") || null,
       estado: normalizeEstado(get("estado") || "Activo"),
-      origen,
+      origen: rowOrigenRaw.trim() || origen,
     });
   }
 
   const deduped = dedupeItems(rawItems);
   return {
     items: deduped.items,
+    rawValid: rawItems.length,
     skipped,
     skippedDupEtiqueta: deduped.skippedDupEtiqueta,
+    columnOrigens,
+    hasOrigenColumn,
   };
 }
 
 export type ImportInventarioResult = {
   items: NewInventarioItem[];
+  /** Filas con etiqueta+artículo antes de quitar duplicados del archivo. */
+  rawValid: number;
   skipped: number;
   skippedDupEtiqueta: number;
   sheetName?: string;
+  columnOrigens: string[];
+  hasOrigenColumn: boolean;
 };
 
 export async function parseInventarioImportFile(

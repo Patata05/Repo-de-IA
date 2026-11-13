@@ -97,6 +97,7 @@ function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
   if (!b.length) return a.length;
+  if (Math.abs(a.length - b.length) > 4) return 99;
   const row = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 1; i <= a.length; i += 1) {
     let prev = i - 1;
@@ -109,6 +110,19 @@ function levenshtein(a: string, b: string): number {
     }
   }
   return row[b.length];
+}
+
+function spellingVariants(token: string): string[] {
+  const out = new Set<string>([token]);
+  const push = (s: string) => {
+    if (s) out.add(s);
+  };
+  push(token.replace(/v/g, "b"));
+  push(token.replace(/b/g, "v"));
+  push(token.replace(/z/g, "s"));
+  push(token.replace(/h/g, ""));
+  push(token.replace(/(.)\1+/g, "$1"));
+  return [...out];
 }
 
 /**
@@ -139,15 +153,20 @@ export function suggestDidYouMean(
     }
   }
 
+  const queryVariants = spellingVariants(q);
   const scored: Array<{ label: string; score: number }> = [];
   for (const label of candidates) {
     const n = normalizeSearch(label);
     if (!n) continue;
     if (n === q) continue;
     let score = levenshtein(q, n);
+    for (const v of queryVariants) {
+      score = Math.min(score, levenshtein(v, n));
+      if (n.startsWith(v) && v.length >= 3) score = Math.min(score, 1);
+    }
     if (n.includes(q) || q.includes(n)) score = Math.min(score, 1);
     const maxLen = Math.max(q.length, n.length);
-    if (score > 3 || score / maxLen > 0.45) continue;
+    if (score > 4 || score / maxLen > 0.5) continue;
     scored.push({ label, score });
   }
   scored.sort((a, b) => a.score - b.score || a.label.localeCompare(b.label, "es"));
@@ -167,10 +186,18 @@ export function formatDidYouMeanReply(query: string, suggestions: string[]): str
   if (!suggestions.length) {
     return `No encontré coincidencias para “${query.trim()}”. Prueba con otra palabra o un área/persona concreta.`;
   }
-  const list = suggestions.map((s) => `• **${s}**`).join("\n");
+  if (suggestions.length === 1) {
+    return (
+      `No encontré “${query.trim()}”. ¿Te referías a **${suggestions[0]}**? ` +
+      `Responde **sí** o escribe el nombre correcto.`
+    );
+  }
+  const list = suggestions
+    .map((s, i) => `**${i + 1}. ${s}**`)
+    .join(", ");
   return (
-    `No encontré “${query.trim()}”. ¿Quisiste decir…?\n\n${list}\n\n` +
-    `Responde con una de esas opciones o reformula la búsqueda.`
+    `No encontré “${query.trim()}”. ¿Quisiste decir ${list}? ` +
+    `Dime el número, el nombre, o reformula la búsqueda.`
   );
 }
 

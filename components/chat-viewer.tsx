@@ -74,6 +74,23 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat("es-MX").format(value);
 }
 
+/** Fila de etiqueta solo informativa (no abre ficha al clic). */
+function StaticRecordRow(props: {
+  etiqueta: string;
+  title: string;
+  subtitle: string;
+}) {
+  return (
+    <div className="chat-viewer-list-item is-static">
+      <span className="chat-viewer-badge">{props.etiqueta}</span>
+      <span className="chat-viewer-list-copy">
+        <strong>{props.title}</strong>
+        <span>{props.subtitle}</span>
+      </span>
+    </div>
+  );
+}
+
 function inventoryLabel(items: Array<{ origen?: string | null }>) {
   const origins = [
     ...new Set(items.map((item) => textOf(item.origen)).filter(Boolean)),
@@ -133,6 +150,10 @@ function ChatViewer({
   useLayoutEffect(() => {
     notifyViewerLayout();
   }, [overviewExpanded, qrExpanded]);
+
+  useLayoutEffect(() => {
+    setQrExpanded(false);
+  }, [overview, overviewFocus]);
 
   const areaPreviewLimit = 5;
   const personaPreviewLimit = 6;
@@ -538,8 +559,8 @@ function ChatViewer({
         : overview === "areaMatches"
           ? `${areaMatches.length} áreas encontradas (${formatNumber(areaMatchesTotalRows)} registros) · elige cuál consultar`
           : overview === "personTotal"
-            ? listItems.length > 0 && listItems.length < personRows.length
-              ? `Inventario de la persona (${formatNumber(personRows.length)}) · mostrando ${listItems.length}`
+            ? personRows.length
+              ? `Inventario de la persona · ${formatNumber(personRows.length)} registros`
               : "Inventario de la persona"
             : overview === "personMatches"
               ? `${personMatches.length} personas encontradas (${formatNumber(personMatchesTotalRows)} registros) · elige cuál consultar`
@@ -604,23 +625,11 @@ function ChatViewer({
               const area = textOf(item.area);
               return (
                 <li key={`${item.id ?? etiqueta}-${index}`}>
-                  <button
-                    type="button"
-                    className="chat-viewer-list-item"
-                    onClick={() => onSelectItem?.(item)}
-                  >
-                    <span className="chat-viewer-badge">{etiqueta}</span>
-                    <span className="chat-viewer-list-copy">
-                      <strong>
-                        {articulo}
-                        {marcaLabel}
-                      </strong>
-                      <span>{[persona, area].filter(Boolean).join(" · ")}</span>
-                    </span>
-                    <span className="chat-viewer-item-arrow" aria-hidden="true">
-                      <ChevronRight size={15} />
-                    </span>
-                  </button>
+                  <StaticRecordRow
+                    etiqueta={etiqueta}
+                    title={`${articulo}${marcaLabel}`}
+                    subtitle={[persona, area].filter(Boolean).join(" · ")}
+                  />
                 </li>
               );
             })}
@@ -785,6 +794,7 @@ function ChatViewer({
                                 <button
                                   type="button"
                                   className="chat-viewer-list-item"
+                                  onMouseDown={(e) => e.preventDefault()}
                                   onClick={() => onSelectAreaOption?.(item.area)}
                                   title={`Consultar ${item.area}`}
                                 >
@@ -866,6 +876,7 @@ function ChatViewer({
                                 <button
                                   type="button"
                                   className="chat-viewer-list-item"
+                                  onMouseDown={(e) => e.preventDefault()}
                                   onClick={() =>
                                     onSelectPersonOption?.(item.persona)
                                   }
@@ -901,105 +912,228 @@ function ChatViewer({
                   ) : null}
 
                   {showAreaTotal && displayFocusLabel ? (
-                    <>
-                      <section
-                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total"
-                        aria-label={`Total de ${displayFocusLabel}`}
-                      >
-                        <div className="chat-viewer-stat">
-                          <span className="chat-viewer-stat-label">
-                            Registros
-                          </span>
-                          <strong>{formatNumber(areaRows.length)}</strong>
+                    (() => {
+                      const areaList: ChatApiItem[] = areaRows.length
+                        ? (areaRows as ChatApiItem[])
+                        : listItems;
+                      return (
+                        <div className="chat-viewer-person-layout">
+                          <section
+                            className="chat-viewer-card chat-viewer-stats is-area-total is-compact"
+                            aria-label={`Total de ${displayFocusLabel}`}
+                          >
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Registros
+                              </span>
+                              <strong>
+                                {formatNumber(
+                                  areaRows.length || areaList.length,
+                                )}
+                              </strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Personas
+                              </span>
+                              <strong>{formatNumber(areaPersonas)}</strong>
+                            </div>
+                            <div className="chat-viewer-stat is-text-value">
+                              <span className="chat-viewer-stat-label">
+                                Área
+                              </span>
+                              <strong title={displayFocusLabel}>
+                                {displayFocusLabel}
+                              </strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Activos
+                              </span>
+                              <strong>{formatNumber(areaActivos)}</strong>
+                            </div>
+                          </section>
+
+                          <section
+                            className="chat-viewer-card chat-viewer-records-card"
+                            aria-label="Registros del área"
+                          >
+                            <h3 className="chat-viewer-section-title">
+                              Registros (
+                              {formatNumber(
+                                areaRows.length || areaList.length,
+                              )}
+                              )
+                            </h3>
+                            <div className="chat-viewer-expandable is-expanded">
+                              <ul className="chat-viewer-list">
+                                {areaList.map((item, index) => {
+                                  const etiqueta =
+                                    textOf(item.etiqueta) ||
+                                    `Item ${index + 1}`;
+                                  const articulo =
+                                    textOf(item.articulo) || "Artículo";
+                                  const marca = textOf(item.marca);
+                                  const marcaLabel =
+                                    marca &&
+                                    !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                                      ? ` · ${marca}`
+                                      : "";
+                                  const persona =
+                                    textOf(item.persona) || "Sin asignar";
+                                  return (
+                                    <li
+                                      key={`${item.id ?? etiqueta}-${index}`}
+                                    >
+                                      <StaticRecordRow
+                                        etiqueta={etiqueta}
+                                        title={`${articulo}${marcaLabel}`}
+                                        subtitle={
+                                          persona +
+                                          (displayFocusLabel
+                                            ? ` · ${displayFocusLabel}`
+                                            : "")
+                                        }
+                                      />
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            </div>
+                          </section>
                         </div>
-                        <div className="chat-viewer-stat is-text-value">
-                          <span className="chat-viewer-stat-label">Área</span>
-                          <strong title={displayFocusLabel}>
-                            {displayFocusLabel}
-                          </strong>
-                        </div>
-                        <div className="chat-viewer-stat">
-                          <span className="chat-viewer-stat-label">
-                            Personas
-                          </span>
-                          <strong>{formatNumber(areaPersonas)}</strong>
-                        </div>
-                        <div className="chat-viewer-stat">
-                          <span className="chat-viewer-stat-label">
-                            Activos
-                          </span>
-                          <strong>{formatNumber(areaActivos)}</strong>
-                        </div>
-                      </section>
-                      {renderEmbeddedResultList(listItems, areaRows.length)}
-                    </>
+                      );
+                    })()
                   ) : null}
 
                   {showPersonTotal && displayFocusLabel ? (
-                    <>
-                      <section
-                        className="chat-viewer-card chat-viewer-stats is-hero-stats is-area-total is-person-total"
-                        aria-label={`Inventario de ${displayFocusLabel}`}
-                      >
-                        <div className="chat-viewer-stat">
-                          <span className="chat-viewer-stat-label">
-                            Registros
-                          </span>
-                          <strong>{formatNumber(personRows.length)}</strong>
+                    (() => {
+                      const personList: ChatApiItem[] = personRows.length
+                        ? (personRows as ChatApiItem[])
+                        : listItems;
+                      return (
+                        <div className="chat-viewer-person-layout">
+                          <section
+                            className="chat-viewer-card chat-viewer-stats is-person-total is-compact"
+                            aria-label={`Inventario de ${displayFocusLabel}`}
+                          >
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Registros
+                              </span>
+                              <strong>
+                                {formatNumber(personRows.length || personList.length)}
+                              </strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Áreas
+                              </span>
+                              <strong
+                                title={personAreasSorted
+                                  .map(([a]) => a)
+                                  .join(", ")}
+                              >
+                                {personAreaLabel}
+                              </strong>
+                            </div>
+                            <div className="chat-viewer-stat is-text-value">
+                              <span className="chat-viewer-stat-label">
+                                Persona
+                              </span>
+                              <strong title={displayFocusLabel}>
+                                {displayFocusLabel}
+                              </strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Activos
+                              </span>
+                              <strong>{formatNumber(personActivos)}</strong>
+                            </div>
+                          </section>
+
+                          <div className="chat-viewer-person-split">
+                            <section
+                              className="chat-viewer-card chat-viewer-person-areas"
+                              aria-label="Áreas de la persona"
+                            >
+                              <h3 className="chat-viewer-section-title">
+                                Áreas
+                              </h3>
+                              <ul className="chat-viewer-bars">
+                                {personAreasSorted.map(([area, count]) => (
+                                  <li
+                                    key={area}
+                                    className="chat-viewer-bar-row"
+                                  >
+                                    <div className="chat-viewer-bar-meta">
+                                      <span className="chat-viewer-rank-line">
+                                        <span>{area}</span>
+                                      </span>
+                                      <span>{formatNumber(count)}</span>
+                                    </div>
+                                    <div className="chat-viewer-bar-track">
+                                      <span
+                                        className="chat-viewer-bar-fill"
+                                        style={{
+                                          width: `${Math.max(
+                                            8,
+                                            (count / maxPersonArea) * 100,
+                                          )}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </li>
+                                ))}
+                              </ul>
+                            </section>
+
+                            <section
+                              className="chat-viewer-card chat-viewer-records-card"
+                              aria-label="Registros de la persona"
+                            >
+                              <h3 className="chat-viewer-section-title">
+                                Registros (
+                                {formatNumber(
+                                  personRows.length || personList.length,
+                                )}
+                                )
+                              </h3>
+                              <div className="chat-viewer-expandable is-expanded">
+                                <ul className="chat-viewer-list">
+                                  {personList.map((item, index) => {
+                                    const etiqueta =
+                                      textOf(item.etiqueta) ||
+                                      `Item ${index + 1}`;
+                                    const articulo =
+                                      textOf(item.articulo) || "Artículo";
+                                    const marca = textOf(item.marca);
+                                    const marcaLabel =
+                                      marca &&
+                                      !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                                        ? ` · ${marca}`
+                                        : "";
+                                    const area = textOf(item.area);
+                                    return (
+                                      <li
+                                        key={`${item.id ?? etiqueta}-${index}`}
+                                      >
+                                        <StaticRecordRow
+                                          etiqueta={etiqueta}
+                                          title={`${articulo}${marcaLabel}`}
+                                          subtitle={area || "Sin área"}
+                                        />
+                                      </li>
+                                    );
+                                  })}
+                                </ul>
+                              </div>
+                            </section>
+                          </div>
                         </div>
-                        <div className="chat-viewer-stat is-text-value">
-                          <span className="chat-viewer-stat-label">Persona</span>
-                          <strong title={displayFocusLabel}>
-                            {displayFocusLabel}
-                          </strong>
-                        </div>
-                        <div
-                          className={`chat-viewer-stat${
-                            personAreasSorted.length === 1 ? " is-text-value" : ""
-                          }`}
-                        >
-                          <span className="chat-viewer-stat-label">Áreas</span>
-                          <strong title={personAreasSorted.map(([a]) => a).join(", ")}>
-                            {personAreaLabel}
-                          </strong>
-                        </div>
-                        <div className="chat-viewer-stat">
-                          <span className="chat-viewer-stat-label">Activos</span>
-                          <strong>{formatNumber(personActivos)}</strong>
-                        </div>
-                      </section>
-                      {personAreasSorted.length ? (
-                        <section
-                          className="chat-viewer-card"
-                          aria-label="Áreas de la persona"
-                        >
-                          <h3 className="chat-viewer-section-title">
-                            Dónde están sus cosas
-                          </h3>
-                          <ul className="chat-viewer-bars">
-                            {personAreasSorted.map(([area, count]) => (
-                              <li key={area} className="chat-viewer-bar-row">
-                                <div className="chat-viewer-bar-meta">
-                                  <span className="chat-viewer-rank-line">
-                                    <span>{area}</span>
-                                  </span>
-                                  <span>{formatNumber(count)}</span>
-                                </div>
-                                <div className="chat-viewer-bar-track">
-                                  <span
-                                    className="chat-viewer-bar-fill"
-                                    style={{
-                                      width: `${Math.max(8, (count / maxPersonArea) * 100)}%`,
-                                    }}
-                                  />
-                                </div>
-                              </li>
-                            ))}
-                          </ul>
-                        </section>
-                      ) : null}
-                      {renderEmbeddedResultList(listItems, personRows.length)}
-                    </>
+                      );
+                    })()
                   ) : null}
 
                   {showStats ? (
@@ -1222,30 +1356,13 @@ function ChatViewer({
                           const area = textOf(row.area);
                           return (
                             <li key={`${row.id ?? etiqueta}-${index}`}>
-                              <button
-                                type="button"
-                                className="chat-viewer-list-item"
-                                onClick={() => onSelectItem?.(row)}
-                              >
-                                <span className="chat-viewer-badge">
-                                  {etiqueta}
-                                </span>
-                                <span className="chat-viewer-list-copy">
-                                  <strong>
-                                    {articulo}
-                                    {marcaLabel}
-                                  </strong>
-                                  <span>
-                                    {[persona, area].filter(Boolean).join(" · ")}
-                                  </span>
-                                </span>
-                                <span
-                                  className="chat-viewer-item-arrow"
-                                  aria-hidden="true"
-                                >
-                                  <ChevronRight size={15} />
-                                </span>
-                              </button>
+                              <StaticRecordRow
+                                etiqueta={etiqueta}
+                                title={`${articulo}${marcaLabel}`}
+                                subtitle={[persona, area]
+                                  .filter(Boolean)
+                                  .join(" · ")}
+                              />
                             </li>
                           );
                         })}
@@ -1359,32 +1476,14 @@ function ChatViewer({
                                 </button>
                               </div>
                             ) : (
-                              <button
-                                type="button"
-                                className="chat-viewer-list-item"
-                                onClick={() => onSelectItem?.(item)}
-                              >
-                                <span className="chat-viewer-badge">
-                                  {etiqueta}
-                                </span>
-                                <span className="chat-viewer-list-copy">
-                                  <strong>
-                                    {articulo}
-                                    {marcaLabel}
-                                  </strong>
-                                  <span>
-                                    {[persona, area]
-                                      .filter(Boolean)
-                                      .join(" · ") || origen}
-                                  </span>
-                                </span>
-                                <span
-                                  className="chat-viewer-item-arrow"
-                                  aria-hidden="true"
-                                >
-                                  <ChevronRight size={15} />
-                                </span>
-                              </button>
+                              <StaticRecordRow
+                                etiqueta={etiqueta}
+                                title={`${articulo}${marcaLabel}`}
+                                subtitle={
+                                  [persona, area].filter(Boolean).join(" · ") ||
+                                  origen
+                                }
+                              />
                             )}
                           </li>
                         );
