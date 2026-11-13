@@ -453,14 +453,14 @@ html:not(.theme-dark) .sidebar-rail-toggle:focus-visible {
   height: 17px;
 }
 
-.sidebar.is-collapsed .brand-copy {
+  .sidebar.is-collapsed .brand-copy {
   position: absolute;
   width: 1px;
   height: 1px;
-  opacity: 0;
-  max-width: 0;
+    opacity: 0;
+    max-width: 0;
   overflow: hidden;
-  pointer-events: none;
+    pointer-events: none;
 }
 
 .sidebar.is-collapsed .sidebar-rail-toggle {
@@ -494,7 +494,7 @@ html:not(.theme-dark) .sidebar-rail-toggle:focus-visible {
   position: absolute;
   width: 1px;
   height: 1px;
-  overflow: hidden;
+    overflow: hidden;
   clip: rect(0, 0, 0, 0);
 }
 
@@ -608,7 +608,7 @@ html:not(.theme-dark) .sidebar-backdrop {
   transition: opacity 160ms ease, max-height 220ms ease, margin 220ms ease;
 }
 
-.sidebar.is-collapsed .nav-caption {
+  .sidebar.is-collapsed .nav-caption {
   display: none;
 }
 
@@ -768,7 +768,7 @@ html:not(.theme-dark) .sidebar-backdrop {
   background: transparent;
   color: var(--muted-strong);
   cursor: pointer;
-  opacity: 0;
+    opacity: 0;
   transition: opacity 140ms ease, background-color 140ms ease, color 140ms ease;
 }
 
@@ -2299,9 +2299,15 @@ tbody tr:last-child td {
 
 .chat-viewer.is-docked:has(.is-overview-personTotal),
 .chat-viewer.is-docked:has(.is-overview-areaTotal),
+.chat-viewer.is-docked:has(.is-overview-areaMatches),
+.chat-viewer.is-docked:has(.is-overview-personMatches),
 .chat-viewer.is-docked:has(.is-overview-full),
+.chat-viewer.is-docked:has(.is-overview-stats),
 .chat-viewer.is-docked:has(.is-overview-areas),
-.chat-viewer.is-docked:has(.is-overview-personas) {
+.chat-viewer.is-docked:has(.is-overview-recent),
+.chat-viewer.is-docked:has(.is-overview-personas),
+.chat-viewer.is-docked:has(.is-overview-marcas),
+.chat-viewer.is-docked:has(.is-overview-estado) {
   height: calc(100dvh - 132px);
   min-height: calc(100dvh - 132px);
 }
@@ -4726,14 +4732,81 @@ html:not(.theme-dark) .chat-response-sync-pill {
   margin-top: auto;
 }
 
-/* Plantilla persona/área: stats arriba; registros con Ver más colapsado/expandido */
+/* Plantilla persona/área: stats arriba; registros con scroll (sin Ver más) */
 .chat-viewer.is-docked .is-overview-personTotal .chat-viewer-scroll.is-records-shell,
-.chat-viewer.is-docked .is-overview-areaTotal .chat-viewer-scroll.is-records-shell {
+.chat-viewer.is-docked .is-overview-areaTotal .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-personMatches .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-stats .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-areas .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-recent .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-personas .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-marcas .chat-viewer-scroll.is-records-shell,
+.chat-viewer.is-docked .is-overview-estado .chat-viewer-scroll.is-records-shell {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Panorama / general / listas: sin botón Ver más; scroll dentro de cada card */
+.chat-viewer.is-docked .is-overview-full .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-stats .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-areas .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-recent .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-personas .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-marcas .chat-viewer-show-more,
+.chat-viewer.is-docked .is-overview-estado .chat-viewer-show-more {
+  display: none !important;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-expandable.is-overview-scroll-shell,
+.chat-viewer.is-docked .is-overview-areas .chat-viewer-expandable.is-overview-scroll-shell,
+.chat-viewer.is-docked .is-overview-recent .chat-viewer-expandable.is-overview-scroll-shell,
+.chat-viewer.is-docked .is-overview-personas .chat-viewer-expandable.is-overview-scroll-shell,
+.chat-viewer.is-docked .is-overview-marcas .chat-viewer-expandable.is-overview-scroll-shell,
+.chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-expandable.is-records-shell,
+.chat-viewer.is-docked .is-overview-personMatches .chat-viewer-expandable.is-records-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-stats {
+  flex: 0 0 auto !important;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-card:not(.chat-viewer-stats),
+.chat-viewer.is-docked .is-overview-areas .chat-viewer-card,
+.chat-viewer.is-docked .is-overview-recent .chat-viewer-card,
+.chat-viewer.is-docked .is-overview-personas .chat-viewer-card,
+.chat-viewer.is-docked .is-overview-marcas .chat-viewer-card,
+.chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-card:not(.chat-viewer-stats),
+.chat-viewer.is-docked .is-overview-personMatches .chat-viewer-card:not(.chat-viewer-stats) {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-bars,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-list,
+.chat-viewer.is-docked .is-overview-areas .chat-viewer-bars,
+.chat-viewer.is-docked .is-overview-recent .chat-viewer-list,
+.chat-viewer.is-docked .is-overview-personas .chat-viewer-people,
+.chat-viewer.is-docked .is-overview-marcas .chat-viewer-chips,
+.chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-list,
+.chat-viewer.is-docked .is-overview-personMatches .chat-viewer-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 .chat-viewer.is-docked .is-overview-personTotal .chat-viewer-expandable.is-records-shell,
@@ -5441,21 +5514,25 @@ html:not(.theme-dark) .chat-import-card {
   color: var(--text);
 }
 
-/* Tarjetas Excel tipo Gemini */
+/* Tarjetas Excel: punto medio (menos ancha, un poco más alta) */
 .chat-export-files {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin-top: 14px;
-  max-width: 420px;
+  max-width: min(320px, 100%);
+  width: 100%;
 }
 
 .chat-export-card {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px 14px 12px;
-  border-radius: 14px;
+  justify-content: center;
+  gap: 8px;
+  min-height: 68px;
+  height: auto;
+  padding: 12px 14px;
+  border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.06);
   color: inherit;
@@ -5483,10 +5560,14 @@ html:not(.theme-dark) .chat-export-card:hover {
 }
 
 .chat-export-card-title {
-  font-size: 0.92rem;
+  font-size: 0.9rem;
   font-weight: 600;
   line-height: 1.25;
   color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   word-break: break-word;
 }
 

@@ -79,6 +79,8 @@ function StaticRecordRow(props: {
   etiqueta: string;
   title: string;
   subtitle: string;
+  /** Inventario / origen de esta ficha (Inv 1 vs Inv 3…). */
+  origen?: string;
 }) {
   return (
     <div className="chat-viewer-list-item is-static">
@@ -86,6 +88,12 @@ function StaticRecordRow(props: {
       <span className="chat-viewer-list-copy">
         <strong>{props.title}</strong>
         <span>{props.subtitle}</span>
+        {props.origen ? (
+          <span className="chat-viewer-origen">
+            <Layers size={12} aria-hidden="true" />
+            {props.origen}
+          </span>
+        ) : null}
       </span>
     </div>
   );
@@ -144,22 +152,27 @@ function ChatViewer({
   const focusArea = textOf(overviewFocus);
   const parsedFocus = useMemo(() => parseMatchesFocus(focusArea), [focusArea]);
   const [qrExpanded, setQrExpanded] = useState(false);
-  const [overviewExpanded, setOverviewExpanded] = useState(false);
 
   // Antes del paint: evita el parpadeo al expandir en el tope final.
   useLayoutEffect(() => {
     notifyViewerLayout();
-  }, [overviewExpanded, qrExpanded]);
+  }, [qrExpanded, overview]);
 
   useLayoutEffect(() => {
     setQrExpanded(false);
   }, [overview, overviewFocus]);
 
-  const areaPreviewLimit = 5;
-  const personaPreviewLimit = 6;
-  const marcaPreviewLimit = 8;
-  const recentPreviewLimit = 5;
+  /** Recientes: mismos 10 que escribe el chatbot. */
   const recentLimit = 10;
+  /** Overviews con scroll interno (sin botón Ver más), igual que persona/área. */
+  const scrollOnlyOverview =
+    overview === "full" ||
+    overview === "stats" ||
+    overview === "areas" ||
+    overview === "recent" ||
+    overview === "personas" ||
+    overview === "marcas" ||
+    overview === "estado";
 
   const overviewData = useMemo(() => {
     const emptyPairs: Array<[string, number]> = [];
@@ -199,10 +212,31 @@ function ChatViewer({
       personMatches: emptyPersonMatches,
       personMatchesTotalRows: 0,
       recentAll: [] as InventarioRow[],
+      scopedTotal: inventory.length,
     };
     if (!overview) return base;
 
     const focusNorm = foldText(parsedFocus.label || focusArea);
+
+    // Inventario N / área concreta en panorama-general (no persona/área total).
+    const scopeRows = (() => {
+      if (
+        !focusNorm ||
+        overview === "areaTotal" ||
+        overview === "areaMatches" ||
+        overview === "personTotal" ||
+        overview === "personMatches"
+      ) {
+        return inventory;
+      }
+      const byOrigen = inventory.filter(
+        (row) => foldText(row.origen) === focusNorm,
+      );
+      if (byOrigen.length) return byOrigen;
+      const byArea = inventory.filter((row) => foldText(row.area) === focusNorm);
+      if (byArea.length) return byArea;
+      return inventory;
+    })();
 
     if (overview === "areaTotal") {
       // Priorizar coincidencia exacta con el nombre canónico del área para evitar
@@ -358,7 +392,7 @@ function ChatViewer({
     if (overview === "recent") {
       return {
         ...base,
-        recentAll: [...inventory]
+        recentAll: [...scopeRows]
           .sort((a, b) => {
             const ta =
               Date.parse(String(a.updated_at || a.created_at || "")) || 0;
@@ -380,7 +414,7 @@ function ChatViewer({
     const marcaCounts = new Map<string, number>();
     const estadoCounts = { activo: 0, inactivo: 0, otro: 0 };
 
-    for (const row of inventory) {
+    for (const row of scopeRows) {
       if (needAreas) {
         const area = textOf(row.area) || "Sin área";
         areaCounts.set(area, (areaCounts.get(area) ?? 0) + 1);
@@ -427,7 +461,7 @@ function ChatViewer({
       estadoTotal:
         estadoCounts.activo + estadoCounts.inactivo + estadoCounts.otro || 1,
       recentAll: needRecent
-        ? [...inventory]
+        ? [...scopeRows]
             .sort((a, b) => {
               const ta =
                 Date.parse(String(a.updated_at || a.created_at || "")) || 0;
@@ -437,8 +471,9 @@ function ChatViewer({
             })
             .slice(0, recentLimit)
         : [],
+      scopedTotal: scopeRows.length,
     };
-  }, [inventory, overview, focusArea]);
+  }, [inventory, overview, focusArea, parsedFocus.label, parsedFocus.explicitCandidates, recentLimit]);
 
   const {
     areasSorted,
@@ -464,6 +499,7 @@ function ChatViewer({
     personMatches,
     personMatchesTotalRows,
     recentAll,
+    scopedTotal,
   } = overviewData;
 
   const listItems: ChatApiItem[] = hasQr
@@ -510,6 +546,15 @@ function ChatViewer({
   ];
   const personLabel =
     personasInResults.length === 1 ? personasInResults[0] : "";
+  const resultOrigins = [
+    ...new Set(listItems.map((item) => textOf(item.origen)).filter(Boolean)),
+  ];
+  const multiInventario = resultOrigins.length > 1;
+  const sameEtiquetaMulti =
+    multiInventario &&
+    new Set(
+      listItems.map((item) => textOf(item.etiqueta).toLowerCase()).filter(Boolean),
+    ).size === 1;
 
   const displayFocusLabel = parsedFocus.label || focusArea;
 
@@ -521,7 +566,11 @@ function ChatViewer({
             ? resultItems
             : qrCards.map((card) => ({ origen: null, ...card })),
         )
-      : personLabel || displayFocusLabel || "Etiquetas"
+      : multiInventario
+        ? sameEtiquetaMulti
+          ? `Etiqueta ${textOf(listItems[0]?.etiqueta) || ""} · ${resultOrigins.length} inventarios`
+          : inventoryLabel(listItems)
+        : personLabel || displayFocusLabel || "Etiquetas"
     : overview === "areas"
       ? "Áreas"
       : overview === "areaTotal"
@@ -535,19 +584,23 @@ function ChatViewer({
               : overview === "recent"
                 ? "Recientes"
                 : overview === "stats"
-                  ? "Totales"
+                  ? displayFocusLabel || "Totales"
                   : overview === "personas"
                     ? "Personas"
                     : overview === "estado"
                       ? "Estado"
                       : overview === "marcas"
                         ? "Marcas"
-                        : "En el inventario";
+                        : overview === "full"
+                          ? displayFocusLabel || "En el inventario"
+                          : displayFocusLabel || "En el inventario";
 
   const contextSub = hasResults
     ? hasQr
       ? `${qrCards.length} código${qrCards.length === 1 ? "" : "s"} QR`
-      : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
+      : multiInventario
+        ? `${listItems.length} ficha${listItems.length === 1 ? "" : "s"} · ${resultOrigins.join(" · ")}`
+        : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
     : overview === "areas"
       ? `${areasSorted.length} áreas · distribución`
       : overview === "areaTotal"
@@ -623,12 +676,14 @@ function ChatViewer({
                   : "";
               const persona = textOf(item.persona) || "Sin asignar";
               const area = textOf(item.area);
+              const origen = textOf(item.origen);
               return (
-                <li key={`${item.id ?? etiqueta}-${index}`}>
+                <li key={`${item.id ?? etiqueta}-${origen}-${index}`}>
                   <StaticRecordRow
                     etiqueta={etiqueta}
                     title={`${articulo}${marcaLabel}`}
                     subtitle={[persona, area].filter(Boolean).join(" · ")}
+                    origen={origen || undefined}
                   />
                 </li>
               );
@@ -665,83 +720,30 @@ function ChatViewer({
         (() => {
           const areasOnly = overview === "areas";
           const recentOnly = overview === "recent";
-          const collapsedAreaLimit = 3;
-          const collapsedRecentLimit = 3;
-          const canCollapseFull =
-            overview === "full" &&
-            ((showAreas && areasSorted.length > collapsedAreaLimit) ||
-              (showRecent && recentAll.length > collapsedRecentLimit));
-          const canCollapseAreas =
-            areasOnly && areasSorted.length > areaPreviewLimit;
-          const canCollapseRecent =
-            recentOnly && recentAll.length > recentPreviewLimit;
-          const canCollapsePersonas =
-            showPersonas && personasSorted.length > personaPreviewLimit;
-          const canCollapseMarcas =
-            showMarcas && marcasSorted.length > marcaPreviewLimit;
-          const canCollapseOverview =
-            canCollapseFull ||
-            canCollapseAreas ||
-            canCollapseRecent ||
-            canCollapsePersonas ||
-            canCollapseMarcas;
-          const visibleAreas = !showAreas
-            ? []
-            : areasOnly
-              ? overviewExpanded
-                ? areasSorted
-                : areasSorted.slice(0, areaPreviewLimit)
-              : overviewExpanded
-                ? areasSorted.slice(0, areaPreviewLimit)
-                : areasSorted.slice(0, collapsedAreaLimit);
-          const visibleRecent = !showRecent
-            ? []
-            : recentOnly
-              ? overviewExpanded
-                ? recentAll
-                : recentAll.slice(0, recentPreviewLimit)
-              : overviewExpanded
-                ? recentAll
-                : recentAll.slice(0, collapsedRecentLimit);
-          const visiblePersonas = showPersonas
-            ? overviewExpanded
-              ? personasSorted
-              : personasSorted.slice(0, personaPreviewLimit)
-            : [];
-          const visibleMarcas = showMarcas
-            ? overviewExpanded
-              ? marcasSorted
-              : marcasSorted.slice(0, marcaPreviewLimit)
-            : [];
-          const moreCount = canCollapseFull
-            ? Math.max(0, recentAll.length - collapsedRecentLimit) +
-              Math.max(0, areasSorted.length - collapsedAreaLimit)
-            : canCollapseRecent
-              ? recentAll.length - recentPreviewLimit
-              : canCollapseAreas
-                ? areasSorted.length - areaPreviewLimit
-                : canCollapsePersonas
-                  ? personasSorted.length - personaPreviewLimit
-                  : canCollapseMarcas
-                    ? marcasSorted.length - marcaPreviewLimit
-                    : 0;
+          // Panorama / general / personas / áreas / recientes: lista completa + scroll, sin Ver más.
+          const visibleAreas = showAreas ? areasSorted : [];
+          const visibleRecent = showRecent ? recentAll : [];
+          const visiblePersonas = showPersonas ? personasSorted : [];
+          const visibleMarcas = showMarcas ? marcasSorted : [];
           const isPersonOrAreaShell =
             overview === "personTotal" || overview === "areaTotal";
+          const isMatchesShell =
+            overview === "areaMatches" || overview === "personMatches";
+          const isScrollShell =
+            isPersonOrAreaShell || isMatchesShell || scrollOnlyOverview;
           return (
             <>
               <div
                 className={`chat-viewer-scroll${
-                  isPersonOrAreaShell
-                    ? qrExpanded
-                      ? " is-expanded is-records-shell"
-                      : " is-collapsed is-records-shell"
+                  isScrollShell
+                    ? " is-expanded is-records-shell"
                     : ""
                 }`}
               >
                 <div
-                  className={`chat-viewer-expandable${
-                    overviewExpanded ? " is-expanded" : ""
-                  }${isPersonOrAreaShell ? " is-records-shell" : ""}`}
+                  className={`chat-viewer-expandable is-expanded${
+                    isScrollShell ? " is-records-shell" : ""
+                  }${scrollOnlyOverview ? " is-overview-scroll-shell" : ""}`}
                 >
                   {showAreaMatches ? (
                     <>
@@ -1145,7 +1147,7 @@ function ChatViewer({
                     >
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Registros</span>
-                        <strong>{formatNumber(inventory.length)}</strong>
+                        <strong>{formatNumber(scopedTotal)}</strong>
                       </div>
                       <div className="chat-viewer-stat">
                         <span className="chat-viewer-stat-label">Áreas</span>
@@ -1369,19 +1371,6 @@ function ChatViewer({
                       </ul>
                     </section>
                   ) : null}
-                  {canCollapseOverview ? (
-                    <button
-                      type="button"
-                      className="chat-viewer-show-more"
-                      onClick={() => setOverviewExpanded((open) => !open)}
-                    >
-                      {overviewExpanded
-                        ? "Ver menos"
-                        : moreCount > 0
-                          ? `Ver más (${moreCount})`
-                          : "Ver más"}
-                    </button>
-                  ) : null}
                 </div>
               </div>
             </>
@@ -1436,10 +1425,12 @@ function ChatViewer({
                             : "";
                         const persona = textOf(item.persona) || "Sin asignar";
                         const area = textOf(item.area);
-                        const origen = textOf(item.origen) || contextLabel;
+                        const origen = textOf(item.origen);
 
                         return (
-                          <li key={`${item.id ?? etiqueta}-${index}`}>
+                          <li
+                            key={`${item.id ?? etiqueta}-${origen || "x"}-${index}`}
+                          >
                             {hasQr ? (
                               <div className="chat-viewer-list-item has-qr-link">
                                 <span className="chat-viewer-item-main">
@@ -1454,7 +1445,9 @@ function ChatViewer({
                                     <span>
                                       {[persona, area]
                                         .filter(Boolean)
-                                        .join(" · ") || origen}
+                                        .join(" · ") ||
+                                        origen ||
+                                        "—"}
                                     </span>
                                     {origen ? (
                                       <span className="chat-viewer-origen">
@@ -1481,8 +1474,9 @@ function ChatViewer({
                                 title={`${articulo}${marcaLabel}`}
                                 subtitle={
                                   [persona, area].filter(Boolean).join(" · ") ||
-                                  origen
+                                  "—"
                                 }
+                                origen={origen || undefined}
                               />
                             )}
                           </li>
