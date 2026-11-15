@@ -9,4 +9,5 @@ pyspellchecker>=0.8
 autocorrect>=2.6
 instructor>=1.7
 pydantic>=2.8
+pydantic-ai-slim[openai]>=0.0.49
 rank-bm25>=0.2

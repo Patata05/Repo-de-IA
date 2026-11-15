@@ -5,6 +5,7 @@ from inventario import views
 urlpatterns = [
     path("inventario/", views.inventario, name="inventario"),
     path("chat/", views.chat, name="chat"),
-    path("chat/normalize/", views.chat_normalize, name="chat_normalize"),
+    path("chat/n8n/", views.chat_n8n, name="chat_n8n"),
+    path("chat/compose/", views.chat_compose, name="chat_compose"),
     path("health/", views.health, name="health"),
 ]
