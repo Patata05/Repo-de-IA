@@ -1,15 +1,18 @@
 "use client";
 
-import { memo, useLayoutEffect, useMemo, useState } from "react";
+import {
+  memo,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { ChevronRight, Layers, QrCode } from "lucide-react";
 import type { ChatApiItem, ChatQrPayload } from "@/lib/chat-api";
 import type { InventarioRow } from "@/lib/supabase";
 
 export type ChatViewerQr = ChatQrPayload & { dataUrl?: string };
-
-const QR_PREVIEW_LIMIT = 7;
-/** Preview en el recuadro: llena el alto colapsado; Ver más muestra el resto. */
-const RESULT_PREVIEW_LIMIT = 8;
 
 export type ChatViewerOverview =
   | "full"
@@ -126,6 +129,119 @@ function parseMatchesFocus(rawFocus: string): {
   return { label, explicitCandidates };
 }
 
+/** Card con colapso por overflow real (áreas / personas / registros). */
+function OverflowCollapseCard(props: {
+  className?: string;
+  title: ReactNode;
+  ariaLabel: string;
+  expanded: boolean;
+  onToggle: () => void;
+  measureKey: string;
+  /** Si false, no pone título h3 (p. ej. QR). */
+  showTitle?: boolean;
+  /** Mantener altura predeterminada aunque el contenido “quepa”. */
+  lockCollapsedHeight?: boolean;
+  children: ReactNode;
+}) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [hiddenCount, setHiddenCount] = useState(0);
+  const [fitsAll, setFitsAll] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+
+    if (props.expanded) {
+      // Conservar overflows para “Ver menos”.
+      return;
+    }
+
+    // Medir en modo colapsado (restaura Ver más/Ver menos).
+    // Solo al cambiar measureKey/expanded — NO en cada tecla del draft.
+    setFitsAll(false);
+
+    let locked = false;
+    const measure = () => {
+      const node = bodyRef.current;
+      if (!node || props.expanded || locked) return;
+      const overflow = node.scrollHeight > node.clientHeight + 2;
+      locked = true;
+      setOverflows(overflow);
+      setFitsAll(props.lockCollapsedHeight ? false : !overflow);
+      if (!overflow) {
+        setHiddenCount(0);
+      } else {
+        const list = node.querySelector("ul");
+        const items = list ? (Array.from(list.children) as HTMLElement[]) : [];
+        const limit = node.clientHeight;
+        let hidden = 0;
+        for (const kid of items) {
+          if (kid.offsetTop + kid.offsetHeight > limit + 1) hidden += 1;
+        }
+        setHiddenCount(hidden > 0 ? hidden : Math.max(1, items.length));
+      }
+      // Evita bucle RO al cambiar is-fit ↔ is-collapsed.
+      requestAnimationFrame(() => {
+        locked = false;
+      });
+    };
+
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(measure);
+    });
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    window.addEventListener("resize", measure);
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [props.expanded, props.measureKey, props.lockCollapsedHeight]);
+
+  const showToggle = overflows;
+  const cardState = props.expanded
+    ? " is-expanded"
+    : fitsAll && !props.lockCollapsedHeight
+      ? " is-fit"
+      : " is-collapsed";
+
+  return (
+    <section
+      className={`chat-viewer-card${props.className || ""}${cardState}`}
+      aria-label={props.ariaLabel}
+    >
+      {props.showTitle === false ? null : (
+        <h3 className="chat-viewer-section-title">{props.title}</h3>
+      )}
+      <div
+        ref={bodyRef}
+        className={`chat-viewer-expandable is-overflow-body${
+          props.expanded ? " is-expanded" : ""
+        }`}
+      >
+        {props.children}
+      </div>
+      {showToggle ? (
+        <button
+          type="button"
+          className="chat-viewer-show-more"
+          onClick={props.onToggle}
+        >
+          {props.expanded
+            ? "Ver menos"
+            : hiddenCount > 0
+              ? `Ver más (${hiddenCount})`
+              : "Ver más"}
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
 function ChatViewer({
   inventory,
   resultItems = [],
@@ -160,19 +276,18 @@ function ChatViewer({
 
   useLayoutEffect(() => {
     setQrExpanded(false);
-  }, [overview, overviewFocus]);
+  }, [overview, overviewFocus, resultItems.length]);
 
   /** Recientes: mismos 10 que escribe el chatbot. */
   const recentLimit = 10;
-  /** Overviews con scroll interno (sin botón Ver más), igual que persona/área. */
+  /** Overviews con scroll interno (sin botón Ver más por overflow).
+   *  `recent` NO: usa OverflowCollapseCard + altura fija como Etiquetas. */
   const scrollOnlyOverview =
     overview === "full" ||
     overview === "stats" ||
-    overview === "areas" ||
-    overview === "recent" ||
-    overview === "personas" ||
     overview === "marcas" ||
     overview === "estado";
+  // “areas”, “personas”, “recent” y etiquetas usan Ver más si no caben.
 
   const overviewData = useMemo(() => {
     const emptyPairs: Array<[string, number]> = [];
@@ -218,8 +333,61 @@ function ChatViewer({
 
     const focusNorm = foldText(parsedFocus.label || focusArea);
 
+    // Listado del chat (p. ej. “esos 10 en qué áreas”) → ranking solo de esos.
+    const scopedFromChat =
+      Array.isArray(resultItems) &&
+      resultItems.length > 0 &&
+      (overview === "areas" ||
+        overview === "personas" ||
+        overview === "estado" ||
+        overview === "marcas" ||
+        overview === "stats");
+
     // Inventario N / área concreta en panorama-general (no persona/área total).
     const scopeRows = (() => {
+      if (scopedFromChat) {
+        const byId = new Map(
+          inventory
+            .filter((r) => r.id != null)
+            .map((r) => [Number(r.id), r] as const),
+        );
+        const rows: InventarioRow[] = [];
+        const seen = new Set<string>();
+        for (const it of resultItems) {
+          const id = it.id != null ? Number(it.id) : NaN;
+          const et = String(it.etiqueta ?? "").trim().toLowerCase();
+          const key =
+            Number.isFinite(id) && id > 0
+              ? `id:${id}`
+              : et
+                ? `et:${et}`
+                : "";
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          const hit =
+            (Number.isFinite(id) && id > 0 && byId.get(id)) ||
+            (et
+              ? inventory.find(
+                  (r) =>
+                    String(r.etiqueta ?? "").trim().toLowerCase() === et &&
+                    (!it.origen ||
+                      String(r.origen ?? "").trim() ===
+                        String(it.origen).trim()),
+                )
+              : undefined) ||
+            (et
+              ? inventory.find(
+                  (r) => String(r.etiqueta ?? "").trim().toLowerCase() === et,
+                )
+              : undefined);
+          if (hit) rows.push(hit);
+          else if (it) {
+            // Fallback mínimo si aún no está hidratado en inventory.
+            rows.push(it as InventarioRow);
+          }
+        }
+        if (rows.length) return rows;
+      }
       if (
         !focusNorm ||
         overview === "areaTotal" ||
@@ -473,7 +641,15 @@ function ChatViewer({
         : [],
       scopedTotal: scopeRows.length,
     };
-  }, [inventory, overview, focusArea, parsedFocus.label, parsedFocus.explicitCandidates, recentLimit]);
+  }, [
+    inventory,
+    resultItems,
+    overview,
+    focusArea,
+    parsedFocus.label,
+    parsedFocus.explicitCandidates,
+    recentLimit,
+  ]);
 
   const {
     areasSorted,
@@ -572,7 +748,9 @@ function ChatViewer({
           : inventoryLabel(listItems)
         : personLabel || displayFocusLabel || "Etiquetas"
     : overview === "areas"
-      ? "Áreas"
+      ? resultItems.length > 0
+        ? "Áreas del listado"
+        : "Áreas"
       : overview === "areaTotal"
         ? displayFocusLabel || "Área"
         : overview === "areaMatches"
@@ -586,7 +764,9 @@ function ChatViewer({
                 : overview === "stats"
                   ? displayFocusLabel || "Totales"
                   : overview === "personas"
-                    ? "Personas"
+                    ? resultItems.length > 0
+                      ? "Personas del listado"
+                      : "Personas"
                     : overview === "estado"
                       ? "Estado"
                       : overview === "marcas"
@@ -602,7 +782,9 @@ function ChatViewer({
         ? `${listItems.length} ficha${listItems.length === 1 ? "" : "s"} · ${resultOrigins.join(" · ")}`
         : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
     : overview === "areas"
-      ? `${areasSorted.length} áreas · distribución`
+      ? resultItems.length > 0
+        ? `${areasSorted.length} áreas · ${resultItems.length} del listado`
+        : `${areasSorted.length} áreas · distribución`
       : overview === "areaTotal"
         ? listItems.length > 0 && listItems.length < areaRows.length
           ? `Total del área (${formatNumber(areaRows.length)}) · mostrando ${listItems.length} registros`
@@ -634,12 +816,6 @@ function ChatViewer({
     totalContextRows: number,
   ) => {
     if (!itemsToRender.length) return null;
-    const previewLimit = RESULT_PREVIEW_LIMIT;
-    const canCollapseItems = itemsToRender.length > previewLimit;
-    const visibleEmbedded =
-      canCollapseItems && !qrExpanded
-        ? itemsToRender.slice(0, previewLimit)
-        : itemsToRender;
     const countLabel = formatNumber(
       totalContextRows > 0 ? totalContextRows : itemsToRender.length,
     );
@@ -649,59 +825,40 @@ function ChatViewer({
         : overview === "personTotal"
           ? `Registros (${countLabel})`
           : `Registros del área (${countLabel})`;
-    const cardState = canCollapseItems
-      ? qrExpanded
-        ? " is-expanded"
-        : " is-collapsed"
-      : " is-expanded";
     return (
-      <section
-        className={`chat-viewer-card chat-viewer-records-card${cardState}`}
-        aria-label="Registros de la consulta"
+      <OverflowCollapseCard
+        className=" chat-viewer-records-card"
+        title={titleLabel}
+        ariaLabel="Registros de la consulta"
+        expanded={qrExpanded}
+        onToggle={() => setQrExpanded((open) => !open)}
+        measureKey={`embed:${itemsToRender.length}:${overview || ""}`}
       >
-        <h3 className="chat-viewer-section-title">{titleLabel}</h3>
-        <div
-          className={`chat-viewer-expandable${
-            qrExpanded ? " is-expanded" : ""
-          }`}
-        >
-          <ul className="chat-viewer-list">
-            {visibleEmbedded.map((item, index) => {
-              const etiqueta = textOf(item.etiqueta) || `Item ${index + 1}`;
-              const articulo = textOf(item.articulo) || "Artículo";
-              const marca = textOf(item.marca);
-              const marcaLabel =
-                marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
-                  ? ` · ${marca}`
-                  : "";
-              const persona = textOf(item.persona) || "Sin asignar";
-              const area = textOf(item.area);
-              const origen = textOf(item.origen);
-              return (
-                <li key={`${item.id ?? etiqueta}-${origen}-${index}`}>
-                  <StaticRecordRow
-                    etiqueta={etiqueta}
-                    title={`${articulo}${marcaLabel}`}
-                    subtitle={[persona, area].filter(Boolean).join(" · ")}
-                    origen={origen || undefined}
-                  />
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-        {canCollapseItems ? (
-          <button
-            type="button"
-            className="chat-viewer-show-more"
-            onClick={() => setQrExpanded((open) => !open)}
-          >
-            {qrExpanded
-              ? "Ver menos"
-              : `Ver más (${itemsToRender.length - previewLimit})`}
-          </button>
-        ) : null}
-      </section>
+        <ul className="chat-viewer-list">
+          {itemsToRender.map((item, index) => {
+            const etiqueta = textOf(item.etiqueta) || `Item ${index + 1}`;
+            const articulo = textOf(item.articulo) || "Artículo";
+            const marca = textOf(item.marca);
+            const marcaLabel =
+              marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                ? ` · ${marca}`
+                : "";
+            const persona = textOf(item.persona) || "Sin asignar";
+            const area = textOf(item.area);
+            const origen = textOf(item.origen);
+            return (
+              <li key={`${item.id ?? etiqueta}-${origen}-${index}`}>
+                <StaticRecordRow
+                  etiqueta={etiqueta}
+                  title={`${articulo}${marcaLabel}`}
+                  subtitle={[persona, area].filter(Boolean).join(" · ")}
+                  origen={origen || undefined}
+                />
+              </li>
+            );
+          })}
+        </ul>
+      </OverflowCollapseCard>
     );
   };
 
@@ -720,9 +877,9 @@ function ChatViewer({
         (() => {
           const areasOnly = overview === "areas";
           const recentOnly = overview === "recent";
-          // Panorama / general / personas / áreas / recientes: lista completa + scroll, sin Ver más.
           const visibleAreas = showAreas ? areasSorted : [];
           const visibleRecent = showRecent ? recentAll : [];
+          const personasOnly = overview === "personas";
           const visiblePersonas = showPersonas ? personasSorted : [];
           const visibleMarcas = showMarcas ? marcasSorted : [];
           const isPersonOrAreaShell =
@@ -1164,52 +1321,79 @@ function ChatViewer({
                     </section>
                   ) : null}
 
-                  {showAreas && visibleAreas.length ? (
-                    <section
-                      className={`chat-viewer-card${
-                        areasOnly ? " chat-viewer-areas-hero" : ""
-                      }`}
-                      aria-label="Áreas"
-                    >
-                      <h3 className="chat-viewer-section-title">
-                        {areasOnly ? "Ranking por área" : "Áreas"}
-                      </h3>
-                      <ul className="chat-viewer-bars">
-                        {visibleAreas.map(([area, count], index) => (
-                          <li key={area} className="chat-viewer-bar-row">
-                            <div className="chat-viewer-bar-meta">
-                              <span className="chat-viewer-rank-line">
-                                {areasOnly ? (
+                  {showAreas && areasSorted.length ? (
+                    areasOnly ? (
+                      <OverflowCollapseCard
+                        className=" chat-viewer-areas-hero"
+                        title="Ranking por área"
+                        ariaLabel="Áreas"
+                        expanded={qrExpanded}
+                        onToggle={() => setQrExpanded((open) => !open)}
+                        measureKey={`areas:${areasSorted.length}`}
+                      >
+                        <ul className="chat-viewer-bars">
+                          {visibleAreas.map(([area, count], index) => (
+                            <li key={area} className="chat-viewer-bar-row">
+                              <div className="chat-viewer-bar-meta">
+                                <span className="chat-viewer-rank-line">
                                   <span className="chat-viewer-rank">
                                     {index + 1}
                                   </span>
-                                ) : null}
-                                <span>{area}</span>
-                              </span>
-                              <span>{formatNumber(count)}</span>
-                            </div>
-                            <div className="chat-viewer-bar-track">
-                              <span
-                                className="chat-viewer-bar-fill"
-                                style={{
-                                  width: `${Math.max(8, (count / maxArea) * 100)}%`,
-                                }}
-                              />
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </section>
+                                  <span>{area}</span>
+                                </span>
+                                <span>{formatNumber(count)}</span>
+                              </div>
+                              <div className="chat-viewer-bar-track">
+                                <span
+                                  className="chat-viewer-bar-fill"
+                                  style={{
+                                    width: `${Math.max(8, (count / maxArea) * 100)}%`,
+                                  }}
+                                />
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </OverflowCollapseCard>
+                    ) : (
+                      <section
+                        className="chat-viewer-card"
+                        aria-label="Áreas"
+                      >
+                        <h3 className="chat-viewer-section-title">Áreas</h3>
+                        <ul className="chat-viewer-bars">
+                          {visibleAreas.map(([area, count]) => (
+                            <li key={area} className="chat-viewer-bar-row">
+                              <div className="chat-viewer-bar-meta">
+                                <span className="chat-viewer-rank-line">
+                                  <span>{area}</span>
+                                </span>
+                                <span>{formatNumber(count)}</span>
+                              </div>
+                              <div className="chat-viewer-bar-track">
+                                <span
+                                  className="chat-viewer-bar-fill"
+                                  style={{
+                                    width: `${Math.max(8, (count / maxArea) * 100)}%`,
+                                  }}
+                                />
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    )
                   ) : null}
 
-                  {showPersonas && visiblePersonas.length ? (
-                    <section
-                      className="chat-viewer-card chat-viewer-people-hero"
-                      aria-label="Personas"
+                  {showPersonas && personasSorted.length ? (
+                    <OverflowCollapseCard
+                      className=" chat-viewer-people-hero"
+                      title="Asignaciones"
+                      ariaLabel="Personas"
+                      expanded={qrExpanded}
+                      onToggle={() => setQrExpanded((open) => !open)}
+                      measureKey={`personas:${personasSorted.length}`}
                     >
-                      <h3 className="chat-viewer-section-title">
-                        Asignaciones
-                      </h3>
                       <ul className="chat-viewer-people">
                         {visiblePersonas.map(([persona, count]) => {
                           const initials = persona
@@ -1220,34 +1404,40 @@ function ChatViewer({
                             .join("");
                           return (
                             <li key={persona} className="chat-viewer-people-row">
-                              <span
-                                className="chat-viewer-avatar"
-                                aria-hidden="true"
-                              >
-                                {initials || "?"}
-                              </span>
-                              <span className="chat-viewer-people-copy">
-                                <strong>{persona}</strong>
-                                <span>
-                                  {formatNumber(count)} artículo
-                                  {count === 1 ? "" : "s"}
-                                </span>
-                              </span>
-                              <span
-                                className="chat-viewer-people-meter"
-                                aria-hidden="true"
+                              <button
+                                type="button"
+                                className="chat-viewer-people-hit"
+                                onClick={() => onSelectPersonOption?.(persona)}
                               >
                                 <span
-                                  style={{
-                                    width: `${Math.max(10, (count / maxPersona) * 100)}%`,
-                                  }}
-                                />
-                              </span>
+                                  className="chat-viewer-avatar"
+                                  aria-hidden="true"
+                                >
+                                  {initials || "?"}
+                                </span>
+                                <span className="chat-viewer-people-copy">
+                                  <strong>{persona}</strong>
+                                  <span>
+                                    {formatNumber(count)} artículo
+                                    {count === 1 ? "" : "s"}
+                                  </span>
+                                </span>
+                                <span
+                                  className="chat-viewer-people-meter"
+                                  aria-hidden="true"
+                                >
+                                  <span
+                                    style={{
+                                      width: `${Math.max(10, (count / maxPersona) * 100)}%`,
+                                    }}
+                                  />
+                                </span>
+                              </button>
                             </li>
                           );
                         })}
                       </ul>
-                    </section>
+                    </OverflowCollapseCard>
                   ) : null}
 
                   {showEstado ? (
@@ -1335,15 +1525,19 @@ function ChatViewer({
                   ) : null}
 
                   {visibleRecent.length ? (
-                    <section
-                      className={`chat-viewer-card${
+                    <OverflowCollapseCard
+                      className={` chat-viewer-records-card${
                         recentOnly ? " chat-viewer-recent-hero" : ""
                       }`}
-                      aria-label="Recientes"
+                      title={
+                        recentOnly ? "Últimos movimientos" : "Recientes"
+                      }
+                      ariaLabel="Recientes"
+                      expanded={qrExpanded}
+                      onToggle={() => setQrExpanded((open) => !open)}
+                      measureKey={`recent:${visibleRecent.length}:${overviewFocus || ""}`}
+                      lockCollapsedHeight={recentOnly}
                     >
-                      <h3 className="chat-viewer-section-title">
-                        {recentOnly ? "Últimos movimientos" : "Recientes"}
-                      </h3>
                       <ul className="chat-viewer-list">
                         {visibleRecent.map((row, index) => {
                           const etiqueta =
@@ -1369,7 +1563,7 @@ function ChatViewer({
                           );
                         })}
                       </ul>
-                    </section>
+                    </OverflowCollapseCard>
                   ) : null}
                 </div>
               </div>
@@ -1377,129 +1571,93 @@ function ChatViewer({
           );
         })()
       ) : hasResults ? (
-        (() => {
-          const previewLimit = hasQr ? QR_PREVIEW_LIMIT : RESULT_PREVIEW_LIMIT;
-          const canCollapse = listItems.length > previewLimit;
-          const visibleItems =
-            canCollapse && !qrExpanded
-              ? listItems.slice(0, previewLimit)
-              : listItems;
-          return (
-            <>
-              <div
-                className={`chat-viewer-scroll${
-                  canCollapse
-                    ? qrExpanded
-                      ? " is-expanded"
-                      : " is-collapsed"
-                    : " is-expanded"
-                }`}
-              >
-                <section
-                  className={`chat-viewer-card${
-                    canCollapse
-                      ? qrExpanded
-                        ? " is-expanded"
-                        : " is-collapsed"
-                      : " is-expanded"
-                  }`}
-                  aria-label="Resultados de la consulta"
-                >
-                  {hasQr ? null : (
-                    <h3 className="chat-viewer-section-title">Etiquetas</h3>
-                  )}
-                  <div
-                    className={`chat-viewer-expandable${
-                      qrExpanded ? " is-expanded" : ""
-                    }`}
-                  >
-                    <ul className={`chat-viewer-list${hasQr ? " is-qr-links" : ""}`}>
-                      {visibleItems.map((item, index) => {
-                        const etiqueta =
-                          textOf(item.etiqueta) || `Item ${index + 1}`;
-                        const articulo = textOf(item.articulo) || "Artículo";
-                        const marca = textOf(item.marca);
-                        const marcaLabel =
-                          marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
-                            ? ` · ${marca}`
-                            : "";
-                        const persona = textOf(item.persona) || "Sin asignar";
-                        const area = textOf(item.area);
-                        const origen = textOf(item.origen);
+        <div
+          className={`chat-viewer-scroll${
+            qrExpanded ? " is-expanded" : " is-collapsed"
+          }`}
+        >
+          <OverflowCollapseCard
+            className=""
+            title="Etiquetas"
+            ariaLabel="Resultados de la consulta"
+            expanded={qrExpanded}
+            onToggle={() => setQrExpanded((open) => !open)}
+            measureKey={`results:${listItems.length}:${hasQr ? "qr" : "list"}`}
+            showTitle={!hasQr}
+            lockCollapsedHeight
+          >
+            <ul className={`chat-viewer-list${hasQr ? " is-qr-links" : ""}`}>
+              {listItems.map((item, index) => {
+                const etiqueta =
+                  textOf(item.etiqueta) || `Item ${index + 1}`;
+                const articulo = textOf(item.articulo) || "Artículo";
+                const marca = textOf(item.marca);
+                const marcaLabel =
+                  marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                    ? ` · ${marca}`
+                    : "";
+                const persona = textOf(item.persona) || "Sin asignar";
+                const area = textOf(item.area);
+                const origen = textOf(item.origen);
 
-                        return (
-                          <li
-                            key={`${item.id ?? etiqueta}-${origen || "x"}-${index}`}
-                          >
-                            {hasQr ? (
-                              <div className="chat-viewer-list-item has-qr-link">
-                                <span className="chat-viewer-item-main">
-                                  <span className="chat-viewer-badge">
-                                    {etiqueta}
-                                  </span>
-                                  <span className="chat-viewer-list-copy">
-                                    <strong>
-                                      {articulo}
-                                      {marcaLabel}
-                                    </strong>
-                                    <span>
-                                      {[persona, area]
-                                        .filter(Boolean)
-                                        .join(" · ") ||
-                                        origen ||
-                                        "—"}
-                                    </span>
-                                    {origen ? (
-                                      <span className="chat-viewer-origen">
-                                        <Layers size={12} aria-hidden="true" />
-                                        {origen}
-                                      </span>
-                                    ) : null}
-                                  </span>
-                                </span>
-                                <button
-                                  type="button"
-                                  className="chat-viewer-qr-open"
-                                  onClick={() => onSelectItem?.(item)}
-                                  title={`Abrir ficha ${etiqueta}`}
-                                >
-                                  <QrCode size={14} />
-                                  <span>QR</span>
-                                  <ChevronRight size={16} />
-                                </button>
-                              </div>
-                            ) : (
-                              <StaticRecordRow
-                                etiqueta={etiqueta}
-                                title={`${articulo}${marcaLabel}`}
-                                subtitle={
-                                  [persona, area].filter(Boolean).join(" · ") ||
-                                  "—"
-                                }
-                                origen={origen || undefined}
-                              />
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  </div>
-                  {canCollapse ? (
-                    <button
-                      type="button"
-                      className="chat-viewer-show-more"
-                      onClick={() => setQrExpanded((open) => !open)}
-                    >
-                      {qrExpanded
-                        ? "Ver menos"
-                        : `Ver más (${listItems.length - previewLimit})`}
-                    </button>
-                  ) : null}
-                </section>
-              </div>
-            </>
-          );
-        })()
+                return (
+                  <li
+                    key={`${item.id ?? etiqueta}-${origen || "x"}-${index}`}
+                  >
+                    {hasQr ? (
+                      <div className="chat-viewer-list-item has-qr-link">
+                        <span className="chat-viewer-item-main">
+                          <span className="chat-viewer-badge">
+                            {etiqueta}
+                          </span>
+                          <span className="chat-viewer-list-copy">
+                            <strong>
+                              {articulo}
+                              {marcaLabel}
+                            </strong>
+                            <span>
+                              {[persona, area]
+                                .filter(Boolean)
+                                .join(" · ") ||
+                                origen ||
+                                "—"}
+                            </span>
+                            {origen ? (
+                              <span className="chat-viewer-origen">
+                                <Layers size={12} aria-hidden="true" />
+                                {origen}
+                              </span>
+                            ) : null}
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          className="chat-viewer-qr-open"
+                          onClick={() => onSelectItem?.(item)}
+                          title={`Abrir ficha ${etiqueta}`}
+                        >
+                          <QrCode size={14} />
+                          <span>QR</span>
+                          <ChevronRight size={16} />
+                        </button>
+                      </div>
+                    ) : (
+                      <StaticRecordRow
+                        etiqueta={etiqueta}
+                        title={`${articulo}${marcaLabel}`}
+                        subtitle={
+                          [persona, area].filter(Boolean).join(" · ") ||
+                          "—"
+                        }
+                        origen={origen || undefined}
+                      />
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </OverflowCollapseCard>
+        </div>
       ) : null}
     </div>
   );

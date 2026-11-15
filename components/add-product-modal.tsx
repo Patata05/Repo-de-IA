@@ -228,6 +228,8 @@ interface AddProductModalProps {
   existingAreas: string[];
   existingPeople: string[];
   items: InventarioRow[];
+  /** Destino forzado desde el chat (ej. Inventario 5). */
+  preferredDestino?: string | null;
 }
 
 type StepMode = "choose" | "qr" | "form";
@@ -239,16 +241,18 @@ export default function AddProductModal({
   existingAreas,
   existingPeople,
   items,
+  preferredDestino = null,
 }: AddProductModalProps) {
   const existingOrigens = useMemo(() => listExistingOrigens(items), [items]);
   const createOrigenOption = useMemo(
     () => nextInventarioName(existingOrigens),
     [existingOrigens],
   );
-  const defaultOrigen = useMemo(
-    () => latestInventarioName(existingOrigens),
-    [existingOrigens],
-  );
+  const defaultOrigen = useMemo(() => {
+    const pref = String(preferredDestino || "").trim();
+    if (pref) return pref;
+    return latestInventarioName(existingOrigens);
+  }, [existingOrigens, preferredDestino]);
 
   const [mode, setMode] = useState<StepMode>("choose");
   const [fromQR, setFromQR] = useState(false);

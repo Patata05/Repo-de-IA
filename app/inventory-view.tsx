@@ -53,6 +53,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
+import { readInventario } from "@/lib/supabase";
 import {
   addInventarioBulkAction,
   deleteInventarioAction,
@@ -68,17 +69,28 @@ import {
   askInventoryChat,
   fetchChatHealth,
   type ChatApiItem,
+  type ChatApiResponse,
   type ChatModelOption,
   type ChatQrPayload,
   type ChatTokenUsage,
 } from "@/lib/chat-api";
+import {
+  enviarMensajeN8n,
+  ejecutarAcciones,
+  pickMostrarPanelAccion,
+  type Accion,
+  type N8nThreadFocus,
+} from "@/lib/asistente";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import {
   buildCreateInventarioAskReply,
+  detectBulkCopyAllOthersToInventarioAsk,
   detectBulkCopyBetweenInventariosAsk,
   detectCompareInventariosAsk,
+  detectCompareScopedListAsk,
   detectCopyEtiquetasToInventarioAsk,
   detectCopyPersonRecordsToInventarioAsk,
+  diffRowsAgainstInventario,
   detectCreateInventarioAsk,
   detectDuplicateEtiquetasAsk,
   detectExcludedEtiquetasAsk,
@@ -104,10 +116,62 @@ import {
   type PendingNewInventario,
 } from "@/lib/inventario-origen";
 import { normalizeChatSpellingAsync } from "@/lib/chat-spell";
+import { composeChatReply } from "@/lib/chat-compose";
 import {
   detectInventarioMultiPlan,
   looksLikeInventarioMultiAsk,
 } from "@/lib/chat-multi-plan";
+import {
+  detectChatDeleteIntent,
+  formatDeleteDoneFallback,
+  formatDeleteModalPrompt,
+  formatDeleteSoftConfirm,
+  looksLikeDeleteInventoryAsk,
+  looksLikeWipeAllInventariosAsk,
+  resolveChatDeleteRows,
+  type ChatDeletePlan,
+} from "@/lib/chat-delete-plan";
+
+/** PydanticAI (backend): prosa dinámica; si falla, usa la plantilla local. */
+function looksLikeRoboticCompareReply(text: string): boolean {
+  const t = String(text || "");
+  return (
+    /esta consulta\s*\(\s*\d+\s*\)/i.test(t) ||
+    /\b0\b[^.…]{0,40}(no aparecen|faltan|sobran|iguales)/i.test(t) ||
+    /\b(coinciden al 100%|campos comparados)\b/i.test(t)
+  );
+}
+
+async function polishInventoryReply(opts: {
+  userText: string;
+  kind: string;
+  fallback: string;
+  threadHint?: string;
+  facts: Record<string, unknown>;
+  sessionId?: string | null;
+}): Promise<{ reply: string; followUps?: ChatFollowUp[] }> {
+  const polished = await composeChatReply({
+    userText: opts.userText,
+    kind: opts.kind,
+    threadHint: opts.threadHint || "",
+    fallback: opts.fallback,
+    facts: opts.facts,
+    sessionId: opts.sessionId,
+  });
+  let reply = polished.reply || opts.fallback;
+  // Si el LLM devuelve la plantilla vieja/robótica, usa el fallback claro.
+  if (
+    (opts.kind === "compare" || opts.kind === "compare_scoped") &&
+    looksLikeRoboticCompareReply(reply)
+  ) {
+    reply = opts.fallback;
+  }
+  const followUps =
+    polished.followUps.length > 0
+      ? polished.followUps.map((label) => ({ label, prompt: label }))
+      : undefined;
+  return { reply, followUps };
+}
 import { formatInventarioQrCompact } from "@/lib/inventario-qr";
 import {
   answerFromMemoryAboutBefore,
@@ -200,6 +264,8 @@ type ViewerOverview =
   | "estado"
   | "marcas";
 
+type ChatFollowUp = { label: string; prompt: string };
+
 type ChatMessage = {
   id: number;
   from: "bot" | "user";
@@ -213,6 +279,8 @@ type ChatMessage = {
   viewerOverview?: ViewerOverview;
   /** Foco de la incidencia (ej. nombre de área en areaTotal). */
   viewerFocus?: string;
+  /** Chips clicables bajo la respuesta. */
+  followUps?: ChatFollowUp[];
   /** Progreso visual al importar Excel/CSV. */
   importProgress?: {
     label: string;
@@ -299,7 +367,8 @@ function estimateTextTokens(text: string): number {
 
 function formatCompactTokens(value: number): string {
   const raw = Number(value);
-  const n = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 64_000;
+  // 0 es válido (sin uso); solo NaN/negativos caen al presupuesto por defecto.
+  const n = Number.isFinite(raw) && raw >= 0 ? Math.round(raw) : 64_000;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 10_000) return `${Math.round(n / 1000)}k`;
   if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
@@ -588,11 +657,306 @@ function looksLikeContextAnaphora(userText: string) {
 }
 
 /** “último registro / recién metido / más recientes” (global, no del área previa). */
+/**
+ * “¿es de los últimos?” / “¿está entre los recientes?” → sí/no del hilo,
+ * no listar los 10.
+ */
+function detectIsAmongRecentAsk(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /\b(dame|muestra|mostrar|lista|listar|trae|traer|ensena|enseñame|ensename|abr[e]?|abrir|genera)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  const aboutRecent =
+    /\b(ultimos?|recientes?)\b/.test(n) ||
+    /\bde\s+los\s+ultimos?\b/.test(n) ||
+    /\bentre\s+los\s+(ultimos?|recientes?)\b/.test(n);
+  if (!aboutRecent) return false;
+  return (
+    /\b(es|esta|estan|sera|fue|pertenece|pertenecen|aparece|aparecen|sale|salen|viene|vienen|incluye|incluido|incluida)\b/.test(
+      n,
+    ) ||
+    /\b(es\s+de|esta\s+entre|esta\s+en|forma\s+parte|es\s+parte|de\s+los\s+ultimos|de\s+los\s+recientes)\b/.test(
+      n,
+    )
+  );
+}
+
+/** Etiqueta del mensaje o del hilo (último registro del que hablamos). */
+function resolveThreadFocusEtiqueta(
+  userText: string,
+  recentMessages: Array<{ from: string; text?: string; resultItems?: ChatApiItem[] }>,
+  sideItems?: ChatApiItem[] | null,
+): string | undefined {
+  const pickMeaningful = (tags: string[]) => {
+    for (const t of tags) {
+      const s = String(t || "").trim();
+      if (!s) continue;
+      if (/^\d+$/.test(s) && s.length <= 2) continue;
+      if (/^\d+$/.test(s) && Number(s) <= 20) continue;
+      return s;
+    }
+    return undefined;
+  };
+
+  const fromText = (raw: string) => {
+    const tags: string[] = [];
+    for (const m of String(raw || "").matchAll(/\b(\d{3,12})\b/g)) {
+      tags.push(m[1]);
+    }
+    for (const m of String(raw || "").matchAll(
+      /\b([A-Za-z]{1,6}[-_]?\d{2,8})\b/g,
+    )) {
+      tags.push(m[1]);
+    }
+    tags.push(...extractEtiquetasFromText(raw));
+    return pickMeaningful(tags);
+  };
+
+  const direct = fromText(userText);
+  if (direct) return direct;
+
+  if (sideItems?.length) {
+    const uniq = [
+      ...new Set(
+        sideItems
+          .map((it) => String(it.etiqueta ?? "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (uniq.length >= 1 && uniq.length <= 6) {
+      return uniq[0];
+    }
+  }
+
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const m = recentMessages[i];
+    if (m.from === "user") {
+      const hit = fromText(m.text || "");
+      if (hit) return hit;
+    }
+  }
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const m = recentMessages[i];
+    if (m.from !== "bot") continue;
+    if (Array.isArray(m.resultItems) && m.resultItems.length) {
+      const uniq = [
+        ...new Set(
+          m.resultItems
+            .map((it) => String(it.etiqueta ?? "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (uniq.length >= 1 && uniq.length <= 6) return uniq[0];
+    }
+    const hit = fromText(m.text || "");
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+/**
+ * “esos 10 / estos últimos: ¿en qué áreas / personas / inventarios?”
+ * → agrega del listado del hilo; no volver a listar “últimos registros”.
+ */
+function detectScopedListFieldAsk(
+  userText: string,
+): { field: "area" | "persona" | "origen" | "estado" } | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  // “qué inventarios tenemos / cuál crear” = catálogo global, no orígenes del listado.
+  if (
+    /\b(inventarios?)\b/.test(n) &&
+    /\b(tenemos|hay|existen|hechos|creados|cual|cuales|nuevo|crear|creamos|podremos|podemos)\b/.test(
+      n,
+    ) &&
+    !/\b(esos|esas|este\s+listado|esta\s+consulta|de\s+arriba|ultimos?|recientes?)\b/.test(
+      n,
+    )
+  ) {
+    return undefined;
+  }
+  // Pedido puro de listar recientes (sin pregunta de campo).
+  if (
+    /\b(dame|muestra|mostrar|lista|listar|trae|traer|ensena|ensename)\b/.test(
+      n,
+    ) &&
+    !/\b(area|areas|persona|personas|origen|inventari|estado|donde|encuentran|ubican)\b/.test(
+      n,
+    )
+  ) {
+    return undefined;
+  }
+  // No usar “esto/esta” sueltos (“antes de hacer esto”) como anáfora del listado.
+  const scoped =
+    /\b(estos|estas|esos|esas|ese|esa|este\s+listado|esta\s+consulta|los\s+de\s+arriba)\b/.test(
+      n,
+    ) ||
+    /\b(ultimos?|recientes?)\s+\d*\s*registros?\b/.test(n) ||
+    /\b\d+\s+(ultimos?|recientes?)\s+registros?\b/.test(n) ||
+    /\besos?\s+(diez|10|\d+)\b/.test(n) ||
+    // Anáfora corta: “en qué áreas están” (el listado ya está en el hilo/visor).
+    /\b(en\s+que|de\s+que|donde|se\s+encuentran|se\s+ubican)\s+(areas?|personas?|estan|estan)\b/.test(
+      n,
+    ) ||
+    /\b(areas?|personas?)\s+(estan|tienen|hay)\b/.test(n) ||
+    /^en\s+que\s+areas?\b/.test(n) ||
+    /^donde\s+estan\b/.test(n);
+
+  if (!scoped) return undefined;
+
+  const asksWhere =
+    /\b(en\s+que|de\s+que|que|cuales?|donde|en\s+donde|se\s+encuentran|se\s+ubican|pertenecen|tienen|tienen?\s+cada|estan)\b/.test(
+      n,
+    ) || /\?\s*$/.test(String(userText).trim());
+
+  if (/\b(areas?|departamento|departamentos|zona|zonas)\b/.test(n)) {
+    return asksWhere || /\bareas?\b/.test(n) ? { field: "area" } : undefined;
+  }
+  // “dame los nombres de esas 16 personas” = ranking global, NO campo del listado.
+  if (
+    /\b(nombres?|listado\s+de\s+personas|esas?\s+\d+\s+personas|cuantas?\s+personas|todas\s+las\s+personas)\b/.test(
+      n,
+    ) ||
+    (/\b(dame|muestra|mostrar|lista|listar|trae)\b/.test(n) &&
+      /\bpersonas?\b/.test(n) &&
+      !/\b(estan|encuentran|ubican|en\s+que|de\s+que)\b/.test(n))
+  ) {
+    return undefined;
+  }
+  if (/\b(personas?|asignad|responsable|quien|quienes)\b/.test(n)) {
+    // Solo “¿en qué personas están estos?” / “personas de ese listado”.
+    if (
+      !asksWhere &&
+      !/\b(estan|encuentran|ubican|tienen\s+cada|del\s+listado)\b/.test(n)
+    ) {
+      return undefined;
+    }
+    return { field: "persona" };
+  }
+  // “origen/fuente de esos” sí; “inventario 1/nuevo” no (catálogo / browse).
+  if (/\b(origen|fuente)\b/.test(n)) {
+    return { field: "origen" };
+  }
+  if (
+    /\binventari\w*\b/.test(n) &&
+    /\b(esos|esas|este\s+listado|del\s+listado|de\s+arriba)\b/.test(n)
+  ) {
+    return { field: "origen" };
+  }
+  if (/\b(estado|activos?|inactivos?)\b/.test(n)) {
+    return { field: "estado" };
+  }
+  // “dónde están esos” sin campo → áreas (lo más útil).
+  if (
+    asksWhere &&
+    /\b(donde|encuentran|ubican|estan|estan\s+ubicados)\b/.test(n)
+  ) {
+    return { field: "area" };
+  }
+  return undefined;
+}
+
+function aggregateFieldCounts(
+  rows: InventarioRow[],
+  field: "area" | "persona" | "origen" | "estado",
+): Array<{ name: string; count: number; samples: string[] }> {
+  const map = new Map<string, { count: number; samples: string[] }>();
+  for (const row of rows) {
+    const name =
+      String(
+        field === "area"
+          ? row.area
+          : field === "persona"
+            ? row.persona
+            : field === "origen"
+              ? row.origen
+              : row.estado,
+      )
+        .trim() || "(sin dato)";
+    const et = String(row.etiqueta ?? "").trim();
+    const prev = map.get(name) || { count: 0, samples: [] };
+    prev.count += 1;
+    if (et && prev.samples.length < 2) prev.samples.push(et);
+    map.set(name, prev);
+  }
+  return [...map.entries()]
+    .map(([name, v]) => ({ name, count: v.count, samples: v.samples }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "es"));
+}
+
+function formatScopedListFieldReply(
+  rows: InventarioRow[],
+  field: "area" | "persona" | "origen" | "estado",
+): string {
+  const label =
+    field === "area"
+      ? "área"
+      : field === "persona"
+        ? "persona"
+        : field === "origen"
+          ? "inventario/origen"
+          : "estado";
+  const plural =
+    field === "area"
+      ? "áreas"
+      : field === "persona"
+        ? "personas"
+        : field === "origen"
+          ? "orígenes"
+          : "estados";
+  if (!rows.length) {
+    return `No tengo el listado a mano. Pide primero los últimos registros (o una búsqueda) y luego pregunta en qué ${plural} están.`;
+  }
+  const groups = aggregateFieldCounts(rows, field);
+  const n = rows.length;
+  const bits = groups
+    .slice(0, 8)
+    .map((g) => {
+      const sample =
+        g.samples.length > 0
+          ? ` (ej. ${g.samples.map((s) => `**${s}**`).join(", ")})`
+          : "";
+      return `**${g.name}** (${g.count})${sample}`;
+    })
+    .join("; ");
+  const more =
+    groups.length > 8
+      ? ` y ${groups.length - 8} ${plural} más`
+      : "";
+  const panel =
+    field === "area"
+      ? "plantilla de áreas"
+      : field === "persona"
+        ? "plantilla de personas"
+        : field === "estado"
+          ? "plantilla de estado"
+          : "panel";
+  return pickChatVariant(
+    [
+      `De esos **${n}** registros, las ${plural} son: ${bits}${more}. Te abrí el cuadro de incidencias con la **${panel}**. ¿Filtramos una ${label} o exportamos Excel?`,
+      `Esos **${n}** están repartidos así: ${bits}${more}. Mira la **${panel}** a la derecha. ¿Vemos una ${label} o generamos QR?`,
+      `En el listado (${n}) hay **${groups.length}** ${plural}: ${bits}${more}. El detalle está en el cuadro de incidencias. ¿Otra consulta?`,
+    ],
+    `${field}:${n}:${groups.map((g) => g.name).join("|")}`,
+  );
+}
+
 function detectRecentRecordsAsk(
   userText: string,
 ): { limit: number; soloHoy: boolean } | undefined {
   const n = normalizeChatIntent(userText);
   if (!n) return undefined;
+  // “que no sea recientes” ≠ pedir últimos.
+  if (detectExcludeRecentRefineAsk(userText)) return undefined;
+  // Pregunta de pertenencia al hilo ≠ “dame los últimos”.
+  if (detectIsAmongRecentAsk(userText)) return undefined;
+  // “esos 10 en qué áreas…” ≠ listar de nuevo.
+  if (detectScopedListFieldAsk(userText)) return undefined;
   // “mete este registro al nuevo inventario” ≠ últimos registros.
   if (
     /\bnuevo\s+inventario\b/.test(n) ||
@@ -651,6 +1015,15 @@ function detectRecentRecordsAsk(
   return { limit: singular ? 1 : 10, soloHoy };
 }
 
+function rowRecencyTs(row: InventarioRow): number {
+  return (
+    Date.parse(String(row.created_at ?? "")) ||
+    Date.parse(String(row.updated_at ?? "")) ||
+    Number(row.id ?? 0) ||
+    0
+  );
+}
+
 function getRecentInventoryRows(
   inventory: InventarioRow[],
   limit: number,
@@ -662,36 +1035,123 @@ function getRecentInventoryRows(
   return [...inventory]
     .filter((row) => {
       if (!soloHoy) return true;
-      const ts =
-        Date.parse(String(row.created_at ?? "")) ||
-        Date.parse(String(row.updated_at ?? "")) ||
-        0;
+      const ts = rowRecencyTs(row);
       return ts >= todayMs;
     })
-    .sort((a, b) => {
-      const ta =
-        Date.parse(String(a.created_at ?? "")) ||
-        Date.parse(String(a.updated_at ?? "")) ||
-        Number(a.id ?? 0) ||
-        0;
-      const tb =
-        Date.parse(String(b.created_at ?? "")) ||
-        Date.parse(String(b.updated_at ?? "")) ||
-        Number(b.id ?? 0) ||
-        0;
-      return tb - ta;
-    })
-    .slice(0, Math.max(1, Math.min(10, limit)));
+    .sort((a, b) => rowRecencyTs(b) - rowRecencyTs(a))
+    .slice(0, Math.max(1, Math.min(50, limit)));
+}
+
+/**
+ * N registros que NO están entre los más recientes
+ * (omite el bloque reciente del hilo / top reciente).
+ */
+function getNonRecentInventoryRows(
+  inventory: InventarioRow[],
+  limit: number,
+  excludeRecent = 10,
+) {
+  const sorted = [...inventory].sort(
+    (a, b) => rowRecencyTs(b) - rowRecencyTs(a),
+  );
+  const skip = Math.max(excludeRecent, limit);
+  const rest = sorted.slice(skip);
+  const pool = rest.length >= limit ? rest : sorted.slice().reverse();
+  return pool.slice(0, Math.max(1, Math.min(50, limit)));
+}
+
+/** “que no sea recientes” / “no los últimos” → refinar el listado del hilo. */
+function detectExcludeRecentRefineAsk(userText: string): {
+  limit: number;
+} | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n) return undefined;
+  const negatesRecent =
+    /\b(no|sin|excepto|menos|fuera)\b/.test(n) &&
+    /\b(recientes?|ultimos?|nuevos?|nuevas?|recien)\b/.test(n);
+  const otherThanRecent =
+    /\b(otros?|otras?|distintos?|diferentes?)\b/.test(n) &&
+    /\b(recientes?|ultimos?)\b/.test(n);
+  const notRecentPhrase =
+    /\bque\s+no\s+sea(?:n)?\s+(los\s+)?(recientes?|ultimos?)\b/.test(n) ||
+    /\bno\s+(los\s+)?(recientes?|ultimos?)\b/.test(n) ||
+    /\bno\s+sean?\s+(los\s+)?(recientes?|ultimos?)\b/.test(n);
+  if (!negatesRecent && !otherThanRecent && !notRecentPhrase) {
+    return undefined;
+  }
+  const count = parseRequestedCount(userText);
+  return { limit: count != null ? Math.max(1, Math.min(50, count)) : 10 };
+}
+
+/** Últimas variantes usadas por “bolsa” (evita repetir la misma respuesta). */
+const chatVariantRecent = new Map<string, string[]>();
+
+/**
+ * Elige prosa distinta en cada turno (bolsa sin repetición inmediata).
+ * `salt` agrupa el tipo de mensaje (p. ej. "compare-empty").
+ */
+function pickChatVariant(variants: string[], salt = ""): string {
+  const list = variants.map((v) => String(v || "").trim()).filter(Boolean);
+  if (!list.length) return "";
+  if (list.length === 1) return list[0];
+
+  const bagKey = salt.trim() || `bag:${list.join("|").slice(0, 80)}`;
+  const recent = chatVariantRecent.get(bagKey) || [];
+  const avoid = new Set(recent.slice(-Math.min(3, list.length - 1)));
+  const pool = list.filter((v) => !avoid.has(v));
+  const choices = pool.length ? pool : list;
+
+  let h = (Date.now() + choices.length * 17) % 1009;
+  for (let i = 0; i < bagKey.length; i += 1) {
+    h = (h + bagKey.charCodeAt(i) * (i + 2)) % 1009;
+  }
+  const picked = choices[Math.abs(h) % choices.length];
+  const nextRecent = [...recent, picked].slice(-8);
+  chatVariantRecent.set(bagKey, nextRecent);
+  if (chatVariantRecent.size > 80) {
+    const first = chatVariantRecent.keys().next().value;
+    if (first != null) chatVariantRecent.delete(first);
+  }
+  return picked;
+}
+
+/** “¿recuerdas…?”, “te pedí…”, “otra vez…” → reconocer el hilo. */
+function looksLikeThreadRecall(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  return /\b(recuerd|acord|te pedi|te pregunte|lo de antes|otra vez|de nuevo|como te dije|me dijiste|habiamos|volvamos|repetir|repiteme|repitemelo)\b/.test(
+    n,
+  );
+}
+
+function formatRowBrief(row: InventarioRow): string {
+  const et = String(row.etiqueta ?? "").trim() || "S/E";
+  const art = String(row.articulo ?? "").trim() || "Artículo";
+  return `**${et}** (${art})`;
 }
 
 function buildRecentRecordsReply(
   rows: InventarioRow[],
   ask: { limit: number; soloHoy: boolean },
+  opts?: { userText?: string },
 ) {
+  const userText = opts?.userText || "";
+  const recall = looksLikeThreadRecall(userText);
   if (!rows.length) {
     return ask.soloHoy
-      ? "No encontré registros de **hoy**. ¿Quieres ver los más recientes en general?"
-      : "No encontré registros recientes en el inventario.";
+      ? pickChatVariant(
+          [
+            "Por ahora no veo altas de **hoy**. ¿Revisamos los más recientes en general?",
+            "Hoy todavía no hay movimientos nuevos. ¿Te muestro los últimos del inventario?",
+          ],
+          userText,
+        )
+      : pickChatVariant(
+          [
+            "No encontré registros recientes para mostrar. ¿Probamos con un área o una persona?",
+            "Aún no tengo movimientos recientes que listar. ¿Qué te gustaría consultar?",
+          ],
+          userText,
+        );
   }
   const fmt = (n: number) => n.toLocaleString("es-MX");
   const sample = rows[0];
@@ -702,27 +1162,119 @@ function buildRecentRecordsReply(
   const per = String(sample.persona ?? "").trim() || "Sin asignar";
   const area = String(sample.area ?? "").trim() || "Sin área";
   if (ask.limit === 1 || rows.length === 1) {
+    const open = recall
+      ? pickChatVariant(
+          [
+            `Claro, me acuerdo: el último registro que pediste es **${et}**.`,
+            `Sí, lo recuerdo. El más reciente sigue siendo **${et}**.`,
+          ],
+          userText + et,
+        )
+      : pickChatVariant(
+          [
+            `El movimiento más reciente es **${et}**.`,
+            `Acabo de ubicar el último alta: **${et}**.`,
+          ],
+          et,
+        );
     return (
-      `El **último registro** dado de alta es **${et}**: **${art}** ` +
-      `(${area} · ${per}).\n\n` +
-      `El detalle está en el visor derecho. ` +
-      `¿Quieres generar su QR, ver más recientes o consultar otra ficha?`
+      `${open} Es **${art}** (${area} · ${per}). ` +
+      pickChatVariant(
+        [
+          `El detalle está a la derecha; si quieres generamos su QR o vemos más recientes.`,
+          `Lo tienes en el panel. ¿Abrimos la ficha, armamos QR o seguimos con otra consulta?`,
+        ],
+        open,
+      )
     );
   }
-  const lines = rows.map((row) => {
-    const e = String(row.etiqueta ?? "").trim() || "S/E";
-    const a = String(row.articulo ?? "").trim() || "Artículo";
-    const p = String(row.persona ?? "").trim() || "Sin asignar";
-    const ar = String(row.area ?? "").trim() || "Sin área";
-    return `• **${e}** — ${a} (${ar} · ${p})`;
-  });
-  return (
-    `Estos son los **${fmt(rows.length)}** registros más recientes` +
-    `${ask.soloHoy ? " de hoy" : ""}:\n\n` +
-    `${lines.join("\n")}\n\n` +
-    `El listado interactivo está en el visor. ` +
-    `¿Quieres inspeccionar uno o generar códigos QR?`
+  const n = fmt(rows.length);
+  const hoy = ask.soloHoy ? " de hoy" : "";
+  const examples = rows
+    .slice(0, 3)
+    .map((row) => formatRowBrief(row))
+    .join(", ");
+  const open = recall
+    ? pickChatVariant(
+        [
+          `Claro que sí: me pediste los últimos **${n}** y aquí te los traigo otra vez${hoy}.`,
+          `Sí, lo recuerdo. Volvemos a esos **${n}** registros más recientes${hoy}.`,
+          `Por supuesto. Como me pediste, te muestro de nuevo los **${n}** movimientos recientes${hoy}.`,
+        ],
+        userText + n,
+      )
+    : pickChatVariant(
+        [
+          `Listo: te comparto los **${n}** registros más recientes${hoy}.`,
+          `Aquí tienes los **${n}** movimientos más nuevos${hoy}.`,
+          `Encontré **${n}** registros recientes${hoy} para ti.`,
+        ],
+        n + hoy,
+      );
+  const mid = pickChatVariant(
+    [
+      `Entre ellos están ${examples}.`,
+      `Por mencionar algunos: ${examples}.`,
+      `Empiezan con ${examples}.`,
+    ],
+    examples,
   );
+  const close = pickChatVariant(
+    [
+      `El listado completo está en el panel derecho; si quieres abrimos uno o generamos QR.`,
+      `A la derecha tienes el detalle. ¿Revisamos alguna ficha o seguimos con otra consulta?`,
+      `Puedes explorarlos en el visor o decirme qué hacemos después.`,
+    ],
+    open,
+  );
+  return `${open} ${mid}\n\n${close}`;
+}
+
+function buildNonRecentRecordsReply(
+  rows: InventarioRow[],
+  ask: { limit: number },
+  opts?: { userText?: string },
+) {
+  const userText = opts?.userText || "";
+  const fmt = (n: number) => n.toLocaleString("es-MX");
+  if (!rows.length) {
+    return pickChatVariant(
+      [
+        "No encontré otros registros fuera de los más recientes. ¿Probamos con un área o una persona?",
+        "Con el filtro de no-recientes no me quedan filas que mostrar. ¿Quieres otro criterio?",
+      ],
+      userText,
+    );
+  }
+  const n = fmt(rows.length);
+  const examples = rows
+    .slice(0, 3)
+    .map((row) => formatRowBrief(row))
+    .join(", ");
+  const open = pickChatVariant(
+    [
+      `De acuerdo: te traigo **${n}** registros que no son los más recientes.`,
+      `Listo, sin los últimos: aquí van **${n}** registros de más atrás.`,
+      `Perfecto — omití los recientes y te dejé **${n}** del resto del inventario.`,
+    ],
+    userText + n,
+  );
+  const mid = pickChatVariant(
+    [
+      `Entre ellos están ${examples}.`,
+      `Por mencionar algunos: ${examples}.`,
+      `Empiezan con ${examples}.`,
+    ],
+    examples,
+  );
+  const close = pickChatVariant(
+    [
+      `El listado está en el panel; si quieres filtro por área o generamos QR, dímelo.`,
+      `A la derecha tienes el detalle. ¿Seguimos con otra consulta?`,
+    ],
+    open,
+  );
+  return `${open} ${mid}\n\n${close}`;
 }
 
 /**
@@ -1011,8 +1563,7 @@ function detectContextFollowUpAsk(
 function looksLikePersonEtiquetasAsk(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
-  if (!looksLikePersonAnaphora(userText)) return false;
-  return (
+  const wantsList =
     /\betiquet/.test(n) ||
     intentHas(
       n,
@@ -1026,8 +1577,21 @@ function looksLikePersonEtiquetasAsk(userText: string) {
       "listar",
       "ficha",
       "fichas",
-    )
-  );
+    );
+  if (!wantsList) return false;
+  // Anáfora: “sus etiquetas”
+  if (looksLikePersonAnaphora(userText)) return true;
+  // Nombrada: “dame las etiquetas de Fernanda Vargas”
+  if (
+    /\b(etiquet\w*|registros?|articulos?|equipos?)\s+de\b/.test(n) ||
+    /\bde\s+[a-z]{2,}(?:\s+[a-z]{2,}){0,3}\b/.test(n)
+  ) {
+    return (
+      intentHas(n, "dame", "muestra", "mostrar", "ver", "lista", "listar", "trae") ||
+      /\betiquet/.test(n)
+    );
+  }
+  return false;
 }
 
 /**
@@ -1186,6 +1750,157 @@ function lastBotViewerFocus(messages: ChatMessage[]): string | null {
   return null;
 }
 
+function lastBotViewerOverview(
+  messages: ChatMessage[],
+): ViewerOverview | undefined {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.from !== "bot") continue;
+    if (message.viewerOverview) return message.viewerOverview;
+  }
+  return undefined;
+}
+
+/**
+ * Filas para Excel: origen → persona/área del hilo (todas) → listado previo.
+ * Nunca cae en dump genérico si hay anáfora/foco de persona.
+ */
+function resolveExcelExportSource(opts: {
+  userText: string;
+  excelAsk: {
+    origen: string | null;
+    theme: string | null;
+    fromContext: boolean;
+  };
+  inventory: InventarioRow[];
+  chatHistory: Array<{
+    from: string;
+    text: string;
+    resultItems?: ChatApiItem[];
+    viewerFocus?: string;
+    viewerOverview?: ViewerOverview;
+  }>;
+  messages: ChatMessage[];
+  lastConcrete?: {
+    resultItems?: ChatApiItem[];
+    viewerFocus?: string | null;
+    viewerOverview?: ViewerOverview;
+  } | null;
+}): { rows: InventarioRow[]; focusName: string | null; usedThread: boolean } {
+  const {
+    userText,
+    excelAsk,
+    inventory,
+    chatHistory,
+    messages,
+    lastConcrete,
+  } = opts;
+  const foldOrig = (o: string) =>
+    o
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/\p{M}/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  if (excelAsk.origen) {
+    const want = foldOrig(excelAsk.origen);
+    const existing = listExistingOrigens(inventory);
+    const canon =
+      existing.find((o) => foldOrig(o) === want) ||
+      existing.find((o) => foldOrig(o).includes(want)) ||
+      excelAsk.origen;
+    const rows = inventory.filter(
+      (row) => foldOrig(String(row.origen ?? "")) === foldOrig(canon),
+    );
+    return { rows, focusName: canon, usedThread: false };
+  }
+
+  const catalog = getAllPersonCatalog(inventory);
+  const named =
+    detectPersonTotalAsk(userText, inventory, chatHistory) ||
+    findPersonInText(userText, inventory) ||
+    resolvePersonFocus(userText, inventory, chatHistory);
+  const prevFocus =
+    lastBotViewerFocus(messages) || lastConcrete?.viewerFocus || null;
+  const prevOverview =
+    lastBotViewerOverview(messages) || lastConcrete?.viewerOverview;
+  const focusCandidate =
+    named ||
+    (excelAsk.fromContext ||
+    prevOverview === "personTotal" ||
+    prevOverview === "personMatches"
+      ? prevFocus
+      : null);
+
+  if (focusCandidate) {
+    const exact =
+      catalog.find((p) => p.name === focusCandidate) ||
+      catalog.find((p) =>
+        normalizeChatIntent(p.name).includes(
+          normalizeChatIntent(focusCandidate),
+        ),
+      ) ||
+      catalog.find((p) =>
+        normalizeChatIntent(focusCandidate).includes(
+          normalizeChatIntent(p.name),
+        ),
+      );
+    if (exact?.rows?.length) {
+      return { rows: exact.rows, focusName: exact.name, usedThread: true };
+    }
+  }
+
+  const areaHit =
+    matchAreaFromPrompt(userText, inventory) ||
+    (excelAsk.fromContext &&
+    (prevOverview === "areaTotal" || prevOverview === "areaMatches")
+      ? prevFocus
+      : null);
+  if (areaHit) {
+    const rows = inventory.filter((row) =>
+      areaMatchesNeedle(String(row.area ?? ""), areaHit),
+    );
+    if (rows.length) {
+      return { rows, focusName: areaHit, usedThread: Boolean(prevFocus) };
+    }
+  }
+
+  if (excelAsk.theme) {
+    const needle = normalizeChatIntent(excelAsk.theme);
+    const rows = inventory.filter((row) =>
+      normalizeChatIntent(String(row.area ?? "")).includes(needle),
+    );
+    if (rows.length) {
+      return { rows, focusName: excelAsk.theme, usedThread: false };
+    }
+  }
+
+  if (excelAsk.fromContext || prevOverview === "personTotal") {
+    // Preferir TODAS las filas de la persona del foco, no el sample del panel.
+    if (prevFocus) {
+      const byFocus = rowsForPersonName(inventory, prevFocus);
+      if (byFocus.length) {
+        return { rows: byFocus, focusName: prevFocus, usedThread: true };
+      }
+    }
+    const prevItems =
+      lastBotResultItems(messages).length > 0
+        ? lastBotResultItems(messages)
+        : lastConcrete?.resultItems || [];
+    if (prevItems.length) {
+      return {
+        rows: chatApiItemsToRows(prevItems, inventory),
+        focusName: prevFocus,
+        usedThread: true,
+      };
+    }
+    return { rows: [], focusName: prevFocus, usedThread: true };
+  }
+
+  return { rows: [], focusName: null, usedThread: false };
+}
+
 function resolveCanonicalPerson(
   raw: string,
   inventory: InventarioRow[],
@@ -1276,7 +1991,128 @@ function pickOne<T>(options: T[]): T {
   return options[Math.floor(Math.random() * options.length)]!;
 }
 
-/** Vista previa de import: mismo dato, prosa distinta cada vez. */
+/** Separa `[Archivo: x.xlsx]` del texto libre del mensaje de usuario. */
+function parseUserAttachDisplay(text: string): {
+  attach?: { kind: "file" | "image"; name: string };
+  body: string;
+} {
+  const raw = String(text || "");
+  const m = raw.match(
+    /^\[(Archivo|Imagen):\s*([^\]]+)\](?:\n([\s\S]*))?$/i,
+  );
+  if (!m) return { body: raw };
+  return {
+    attach: {
+      kind: /^imagen$/i.test(m[1]) ? "image" : "file",
+      name: m[2].trim(),
+    },
+    body: String(m[3] || "").trim(),
+  };
+}
+
+function isSpreadsheetFileName(name: string) {
+  return /\.(xlsx|xls|csv)$/i.test(String(name || "").trim());
+}
+
+const CHAT_PENDING_IMPORT_KEY = "inventario-chat-pending-import";
+
+function looksLikeImportPreviewAsk(text: string) {
+  const t = String(text || "");
+  return (
+    /\b(importo|importaci[oó]n|importalos|imp[oó]rtalos|los\s+cargo|arranco\s+la\s+importaci)/i.test(
+      t,
+    ) && /\b(s[ií]|confirm)/i.test(t)
+  );
+}
+
+function chatApiItemToNewInventario(it: ChatApiItem): NewInventarioItem | null {
+  const etiqueta = String(it.etiqueta ?? "").trim();
+  const articulo = String(it.articulo ?? "").trim();
+  if (!etiqueta || !articulo) return null;
+  return {
+    etiqueta,
+    articulo,
+    marca: it.marca ?? null,
+    modelo: it.modelo ?? null,
+    serie: it.serie ?? null,
+    area: String(it.area ?? "").trim() || "Sin área",
+    persona: it.persona ?? null,
+    cantidad: it.cantidad ?? 1,
+    observaciones: it.observaciones ?? null,
+    estado: it.estado ?? null,
+    origen: it.origen ?? null,
+  };
+}
+
+function recoverPendingImportFromMessages(
+  messages: Array<{ from: string; text?: string; resultItems?: ChatApiItem[] }>,
+): NewInventarioItem[] | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.from !== "bot") continue;
+    if (!Array.isArray(m.resultItems) || !m.resultItems.length) continue;
+    if (!looksLikeImportPreviewAsk(m.text || "")) continue;
+    const rows = m.resultItems
+      .map(chatApiItemToNewInventario)
+      .filter((r): r is NewInventarioItem => Boolean(r));
+    return rows.length ? rows : null;
+  }
+  return null;
+}
+
+function savePendingImportToSession(
+  sessionId: string | null | undefined,
+  items: NewInventarioItem[] | null,
+) {
+  if (typeof window === "undefined" || !sessionId) return;
+  try {
+    const key = `${CHAT_PENDING_IMPORT_KEY}:${sessionId}`;
+    if (!items?.length) {
+      window.sessionStorage.removeItem(key);
+      return;
+    }
+    window.sessionStorage.setItem(key, JSON.stringify(items));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function loadPendingImportFromSession(
+  sessionId: string | null | undefined,
+): NewInventarioItem[] | null {
+  if (typeof window === "undefined" || !sessionId) return null;
+  try {
+    const raw = window.sessionStorage.getItem(
+      `${CHAT_PENDING_IMPORT_KEY}:${sessionId}`,
+    );
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed) || !parsed.length) return null;
+    return parsed as NewInventarioItem[];
+  } catch {
+    return null;
+  }
+}
+
+/** NewInventarioItem → tarjeta del visor (misma UI que consultas). */
+function importItemsToChatApi(items: NewInventarioItem[]): ChatApiItem[] {
+  return items.map((item, i) => ({
+    id: -(i + 1),
+    etiqueta: item.etiqueta,
+    articulo: item.articulo,
+    marca: item.marca ?? null,
+    modelo: item.modelo ?? null,
+    serie: item.serie ?? null,
+    area: item.area ?? null,
+    persona: item.persona ?? null,
+    cantidad: item.cantidad ?? null,
+    estado: item.estado ?? null,
+    origen: item.origen ?? null,
+    observaciones: item.observaciones ?? null,
+  }));
+}
+
+/** Vista previa de import: prosa distinta; el detalle va en tarjetas del panel. */
 function buildChatImportPreviewReply(input: {
   fileName: string;
   sheetName?: string;
@@ -1291,117 +2127,160 @@ function buildChatImportPreviewReply(input: {
   count: number;
   rawValid: number;
   dups: number;
-  sample: string;
-  more: string;
 }): string {
   const n = formatNumber(input.count);
   const sheetBit = input.sheetName ? ` (hoja “${input.sheetName}”)` : "";
   const origen = input.origen;
+  const salt = `import-preview:${input.fileName}:${n}`;
 
   const sourcePhrase =
     input.source === "sheet"
-      ? pickOne([
-          `la hoja “${input.sheetName}”`,
-          "el nombre de la hoja",
-          "cómo se llama la hoja del Excel",
-        ])
+      ? pickChatVariant(
+          [
+            `la hoja “${input.sheetName}”`,
+            "el nombre de la hoja",
+            "cómo se llama la hoja del Excel",
+          ],
+          `${salt}:src`,
+        )
       : input.source === "file"
-        ? pickOne([
-            "el nombre del archivo",
-            "cómo se llama el Excel",
-            "el título del archivo",
-          ])
+        ? pickChatVariant(
+            [
+              "el nombre del archivo",
+              "cómo se llama el Excel",
+              "el título del archivo",
+            ],
+            `${salt}:src`,
+          )
         : input.source === "column"
-          ? pickOne([
-              "la columna Origen",
-              "el origen que viene en cada fila",
-              "lo que marca la columna de origen",
-            ])
+          ? pickChatVariant(
+              [
+                "la columna Origen",
+                "el origen que viene en cada fila",
+                "lo que marca la columna de origen",
+              ],
+              `${salt}:src`,
+            )
           : input.source === "prompt"
-            ? pickOne([
-                "lo que me pediste",
-                "tu indicación",
-                "el destino que escribiste",
-              ])
+            ? pickChatVariant(
+                [
+                  "lo que me pediste",
+                  "tu indicación",
+                  "el destino que escribiste",
+                ],
+                `${salt}:src`,
+              )
             : input.source === "filter"
-              ? pickOne([
-                  "el inventario que tienes seleccionado",
-                  "el filtro activo",
-                ])
-              : pickOne([
-                  "que no traía origen claro",
-                  "que el Excel no dejaba claro el origen",
-                ]);
+              ? pickChatVariant(
+                  [
+                    "el inventario que tienes seleccionado",
+                    "el filtro activo",
+                  ],
+                  `${salt}:src`,
+                )
+              : pickChatVariant(
+                  [
+                    "que no traía origen claro",
+                    "que el Excel no dejaba claro el origen",
+                  ],
+                  `${salt}:src`,
+                );
 
-  const open = pickOne([
-    `Perfecto, ya leí “${input.fileName}”${sheetBit}. El origen de los datos queda en **${origen}** (según ${sourcePhrase}).`,
-    `Listo con “${input.fileName}”${sheetBit}. Voy a importarlo con origen **${origen}**, tomando ${sourcePhrase}.`,
-    `Ya revisé el archivo${sheetBit}. Origen: **${origen}** (${sourcePhrase}).`,
-    `“${input.fileName}”${sheetBit} listo. Lo asociaré a **${origen}**.`,
-    `Claro. Para este archivo el origen es **${origen}** (${sourcePhrase}).`,
-  ]);
+  const open = pickChatVariant(
+    [
+      `Perfecto, ya leí “${input.fileName}”${sheetBit}. El origen queda en **${origen}** (según ${sourcePhrase}).`,
+      `Listo con “${input.fileName}”${sheetBit}. Lo preparé para **${origen}**, tomando ${sourcePhrase}.`,
+      `Ya revisé el archivo${sheetBit}. Destino: **${origen}** (${sourcePhrase}).`,
+      `“${input.fileName}”${sheetBit} entendido. Lo asociaré a **${origen}**.`,
+      `Claro. Para este Excel el origen es **${origen}** (${sourcePhrase}).`,
+      `Recibí “${input.fileName}”${sheetBit}. Lo tengo listo hacia **${origen}**.`,
+    ],
+    `${salt}:open`,
+  );
 
   const countLine =
     input.dups > 0
-      ? pickOne([
-          `Hay **${formatNumber(input.rawValid)}** filas con etiqueta y artículo; **${formatNumber(input.dups)}** etiqueta${input.dups === 1 ? "" : "s"} se repite${input.dups === 1 ? "" : "n"}, así que importaré **${n}** únicos.`,
-          `Detecté **${formatNumber(input.rawValid)}** filas útiles y **${formatNumber(input.dups)}** duplicado${input.dups === 1 ? "" : "s"} de etiqueta → quedarán **${n}**.`,
-          `En total **${n}** registros únicos para importar (había ${formatNumber(input.dups)} etiqueta${input.dups === 1 ? "" : "s"} repetida${input.dups === 1 ? "" : "s"}).`,
-        ])
-      : pickOne([
-          `Encontré **${n}** registro${input.count === 1 ? "" : "s"} con etiqueta y artículo.`,
-          `Son **${n}** registros listos (etiqueta + artículo).`,
-          `Sale un total de **${n}** filas válidas.`,
-          `Van **${n}** artículos con código legible.`,
-        ]);
+      ? pickChatVariant(
+          [
+            `Hay **${formatNumber(input.rawValid)}** filas con etiqueta y artículo; **${formatNumber(input.dups)}** etiqueta${input.dups === 1 ? "" : "s"} se repite${input.dups === 1 ? "" : "n"}, así que importaré **${n}** únicos.`,
+            `Detecté **${formatNumber(input.rawValid)}** filas útiles y **${formatNumber(input.dups)}** duplicado${input.dups === 1 ? "" : "s"} → quedarán **${n}**.`,
+            `En total **${n}** registros únicos (había ${formatNumber(input.dups)} etiqueta${input.dups === 1 ? "" : "s"} repetida${input.dups === 1 ? "" : "s"}).`,
+          ],
+          `${salt}:count`,
+        )
+      : pickChatVariant(
+          [
+            `Encontré **${n}** registro${input.count === 1 ? "" : "s"} con etiqueta y artículo.`,
+            `Son **${n}** registros listos para cargar.`,
+            `Sale un total de **${n}** filas válidas.`,
+            `Van **${n}** artículos con código legible.`,
+            `El archivo trae **${n}** filas listas.`,
+          ],
+          `${salt}:count`,
+        );
 
-  const sampleIntro = pickOne([
-    "Un vistazo:",
-    "Por ejemplo:",
-    "Algunos de ellos:",
-    "Muestra rápida:",
-  ]);
-
-  const ask = pickOne([
-    `¿Los importo ahora a **${origen}**? Responde **sí** o **importalos**.`,
-    `¿Sigo y los cargo en **${origen}**? Dime **sí** o **importalos**.`,
-    `Si te late, confirmo la carga a **${origen}** con **sí** / **importalos**.`,
-    `¿Arranco la importación a **${origen}**? **sí** o **importalos**.`,
-  ]);
-
-  return (
-    `${open}\n\n` +
-    `${countLine}\n` +
-    `${sampleIntro}\n${input.sample}${input.more}\n\n` +
-    ask
+  const panelHint = pickChatVariant(
+    [
+      "La vista previa está en las **tarjetas de la derecha**.",
+      "Revisa el detalle en el **panel derecho** (mismas tarjetas de siempre).",
+      "A la derecha te dejo las **tarjetas** con lo que viene en el Excel.",
+      "El listado lo tienes en el **visor** a la derecha.",
+    ],
+    `${salt}:panel`,
   );
+
+  const ask = pickChatVariant(
+    [
+      `¿Los importo ahora a **${origen}**? Responde **sí** o **importalos**.`,
+      `¿Sigo y los cargo en **${origen}**? Dime **sí** o **importalos**.`,
+      `Si te late, confirmo la carga a **${origen}** con **sí** / **importalos**.`,
+      `¿Arranco la importación a **${origen}**? **sí** o **importalos**.`,
+      `¿Confirmas meterlos en **${origen}**? Escribe **sí** o **importalos**.`,
+    ],
+    `${salt}:ask`,
+  );
+
+  return `${open}\n\n${countLine}\n${panelHint}\n\n${ask}`;
 }
 
 function buildChatImportMixedReply(input: {
   fileName: string;
   sheetName?: string;
-  mixLines: string;
+  mixSummary: string;
   dupNote: string;
-  sample: string;
-  more: string;
 }): string {
   const sheetBit = input.sheetName ? ` (hoja “${input.sheetName}”)` : "";
-  const open = pickOne([
-    `Leí “${input.fileName}”${sheetBit}, pero el origen viene **mezclado** entre los registros.`,
-    `El Excel “${input.fileName}”${sheetBit} trae **varios orígenes** a la vez.`,
-    `Revisé “${input.fileName}”${sheetBit} y no es un solo inventario: hay orígenes distintos.`,
-  ]);
-  const pending = pickOne([
-    `Dejé **todos** pendientes. Puedes responder **sí** para respetar el origen de cada fila, o decir un solo destino («importar a Inventario 1» / «a S/O»).`,
-    `No los meto todavía. **sí** = importar respetando cada origen; o indícame un destino único.`,
-    `Quedan en espera: confirma con **sí** (origen por fila) o elige un solo destino.`,
-  ]);
+  const salt = `import-mixed:${input.fileName}`;
+  const open = pickChatVariant(
+    [
+      `Leí “${input.fileName}”${sheetBit}, pero el origen viene **mezclado** entre los registros.`,
+      `El Excel “${input.fileName}”${sheetBit} trae **varios orígenes** a la vez.`,
+      `Revisé “${input.fileName}”${sheetBit} y no es un solo inventario: hay orígenes distintos.`,
+      `“${input.fileName}”${sheetBit} está listo, aunque mezcla inventarios distintos.`,
+    ],
+    `${salt}:open`,
+  );
+  const pending = pickChatVariant(
+    [
+      `Dejé **todos** pendientes. Responde **sí** para respetar el origen de cada fila, o di un solo destino («importar a Inventario 1» / «a S/O»).`,
+      `No los meto todavía. **sí** = importar respetando cada origen; o indícame un destino único.`,
+      `Quedan en espera: confirma con **sí** (origen por fila) o elige un solo destino.`,
+    ],
+    `${salt}:ask`,
+  );
+  const panelHint = pickChatVariant(
+    [
+      "Las filas están en las **tarjetas de la derecha**.",
+      "Mira el detalle en el **panel derecho**.",
+    ],
+    `${salt}:panel`,
+  );
   return (
     `${open}\n\n` +
-    `${input.mixLines}\n` +
+    `${input.mixSummary}\n` +
     `${input.dupNote}\n\n` +
-    `${pending}\n\n` +
-    `${input.sample}${input.more}`
+    `${panelHint}\n\n` +
+    pending
   );
 }
 
@@ -1958,6 +2837,41 @@ const AREA_QUERY_STOP_WORDS = new Set([
   "cosas",
   "mobiliario",
   "bien",
+  // Temporal / hilo: “que no sea recientes” ≠ área “Atención a Clientes”.
+  "reciente",
+  "recientes",
+  "ultimo",
+  "ultimos",
+  "nueva",
+  "nuevo",
+  "nuevas",
+  "nuevos",
+  "hoy",
+  "ayer",
+  "antes",
+  "despues",
+  "sea",
+  "sean",
+  "sino",
+  "menos",
+  "excepto",
+  "fuera",
+  "sin",
+  "no",
+  "ni",
+  "o",
+  "u",
+  "otro",
+  "otra",
+  "otros",
+  "otras",
+  "aver",
+  "mismo",
+  "misma",
+  "mismos",
+  "mismas",
+  "listado",
+  "visor",
   "bienes",
 ]);
 
@@ -2308,6 +3222,8 @@ function findMatchingAreasForPrompt(
   if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
     return undefined;
   }
+  // “que no sea recientes” / filtro temporal ≠ área fuzzy (“Atención a Clientes”).
+  if (detectExcludeRecentRefineAsk(userText)) return undefined;
   if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
     return undefined;
   }
@@ -2322,6 +3238,13 @@ function findMatchingAreasForPrompt(
     return undefined;
   }
   if (detectEtiquetaOrigenAsk(userText, inventory)) {
+    return undefined;
+  }
+  // “qué hay en el Inventario 1” ≠ área Atención a Clientes.
+  if (
+    /\binventarios?\s*\d+\b/.test(normalizeChatIntent(userText)) ||
+    matchOrigenFromPrompt(userText, origensForSkip)
+  ) {
     return undefined;
   }
   const n = normalizeChatIntent(userText);
@@ -2475,13 +3398,20 @@ function findMatchingPeopleForPrompt(
     return undefined;
   }
   if (looksLikeRecordMutationAsk(userText)) return undefined;
+  // “Inventario 1” es origen, no nombre de persona.
+  if (
+    /\binventarios?\s*\d+\b/.test(normalizeChatIntent(userText)) &&
+    !/\b(persona|personas|quien|quienes)\b/.test(normalizeChatIntent(userText))
+  ) {
+    return undefined;
+  }
   const turn = analyzeTurnQuick(userText, inventory);
   if (turn.isWriteTurn || turn.discourseOnly) return undefined;
   // Solo buscar persona si hay señal de consulta o nombre de catálogo.
   const nGate = normalizeChatIntent(userText);
   const looksPersonInventory =
     /\binventario\s+(general\s+)?de\b/.test(nGate) ||
-    /\b(inventario|registros?|equipos?)\s+(general\s+)?de\s+[a-z]{2,}/.test(
+    /\b(inventario|registros?|equipos?|etiquetas?|articulos?)\s+(general\s+)?de\s+[a-z]{2,}/.test(
       nGate,
     );
   if (
@@ -2523,8 +3453,8 @@ function findMatchingPeopleForPrompt(
   ) {
     return undefined;
   }
-  // "dame sus etiquetas" → anáfora (paso 4), no buscar persona por tokens sueltos.
-  if (looksLikePersonAnaphora(userText) || looksLikePersonEtiquetasAsk(userText)) {
+  // "dame sus etiquetas" → anáfora (paso 4). Si nombra a alguien, sí buscar aquí.
+  if (looksLikePersonAnaphora(userText) && !findPersonInText(userText, inventory)) {
     return undefined;
   }
 
@@ -2652,33 +3582,55 @@ function buildExactAreaReply(
       ? Math.min(total, Math.max(1, limit))
       : Math.min(total, MAX_ETIQUETA_LIST);
   const shownRows = areaSummary.rows.slice(0, effectiveLimit);
-  const samples = shownRows.slice(0, 5).map((row) => {
-    const tag = String(row.etiqueta ?? "").trim() || "S/E";
-    const art = String(row.articulo ?? "").trim() || "Artículo";
-    const per = String(row.persona ?? "").trim() || "Sin asignar";
-    return `**${tag}** (${art}, ${per})`;
-  });
-  let sampleProse = "";
-  if (samples.length === 1) {
-    sampleProse = ` Por ejemplo: ${samples[0]}.`;
-  } else if (samples.length > 1) {
-    const head = samples.slice(0, -1).join(", ");
-    sampleProse = ` Algunos ejemplos: ${head} y ${samples[samples.length - 1]}.`;
-  }
-
+  const examples = shownRows
+    .slice(0, 3)
+    .map((row) => formatRowBrief(row))
+    .join(", ");
+  const totalLabel = total.toLocaleString("es-MX");
+  const open = pickChatVariant(
+    [
+      `En **${areaSummary.name}** hay **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+      `El área **${areaSummary.name}** concentra **${totalLabel}** ficha${total === 1 ? "" : "s"}`,
+      `Para **${areaSummary.name}** localicé **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+    ],
+    areaSummary.name + totalLabel,
+  );
+  const stats =
+    ` (**${areaSummary.personas}** persona${areaSummary.personas === 1 ? "" : "s"} · **${areaSummary.activos}** activo${areaSummary.activos === 1 ? "" : "s"}).`;
+  const mid = examples
+    ? pickChatVariant(
+        [
+          ` Por ejemplo: ${examples}.`,
+          ` Entre ellos: ${examples}.`,
+          ` Algunos son ${examples}.`,
+        ],
+        examples,
+      )
+    : "";
   const scopeNote =
     limit != null && limit < total
-      ? ` Te muestro los **${shownRows.length}** que pediste (de **${total}** en el área).`
-      : shownRows.length < total
-        ? ` El detalle completo de los **${total}** está en el panel derecho.`
-        : ` El detalle está en el panel derecho.`;
-
-  const reply =
-    `En el área **${areaSummary.name}** hay **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} en total ` +
-    `(**${areaSummary.personas}** persona${areaSummary.personas === 1 ? "" : "s"} · **${areaSummary.activos}** activo${areaSummary.activos === 1 ? "" : "s"}).` +
-    sampleProse +
-    scopeNote +
-    ` ¿Quieres filtrar por persona, consultar otra área o generar códigos QR?`;
+      ? pickChatVariant(
+          [
+            ` Te muestro los **${shownRows.length}** que pediste.`,
+            ` Aquí van los **${shownRows.length}** que solicitaste.`,
+          ],
+          String(shownRows.length),
+        )
+      : pickChatVariant(
+          [
+            ` El detalle completo está en el panel derecho.`,
+            ` A la derecha tienes el listado completo.`,
+          ],
+          areaSummary.name,
+        );
+  const close = pickChatVariant(
+    [
+      ` ¿Filtramos por persona, generamos QR o vemos otra área?`,
+      ` Si quieres, seguimos con una persona, QR o otra consulta.`,
+    ],
+    open,
+  );
+  const reply = `${open}${stats}${mid}${scopeNote}${close}`;
 
   return { reply, shownRows };
 }
@@ -2713,28 +3665,43 @@ function buildExactPersonReply(
   const sampleSeen = new Set<string>();
   const samples: string[] = [];
   for (const row of shownRows) {
-    if (samples.length >= 5) break;
+    if (samples.length >= 3) break;
     const tag = String(row.etiqueta ?? "").trim() || "S/E";
     const key = tag.toLowerCase();
     if (sampleSeen.has(key)) continue;
     sampleSeen.add(key);
-    const art = String(row.articulo ?? "").trim() || "Artículo";
-    const ar = String(row.area ?? "").trim() || "Sin área";
-    samples.push(`**${tag}** (${art}, ${ar})`);
+    samples.push(formatRowBrief(row));
   }
-  let sampleProse = "";
-  if (samples.length === 1) {
-    sampleProse = ` Por ejemplo: ${samples[0]}.`;
-  } else if (samples.length > 1) {
-    const head = samples.slice(0, -1).join(", ");
-    sampleProse = ` Algunos ejemplos: ${head} y ${samples[samples.length - 1]}.`;
-  }
-
-  const reply =
-    `**${personSummary.name}** tiene **${total.toLocaleString("es-MX")}** registro${total === 1 ? "" : "s"} ` +
-    `(**${personSummary.activos}** activo${personSummary.activos === 1 ? "" : "s"}) en **${areas.length}** área${areas.length === 1 ? "" : "s"} (${areaLine}).` +
-    sampleProse +
-    ` El detalle está en el panel derecho. ¿Quieres generar QR o filtrar por un área?`;
+  const totalLabel = total.toLocaleString("es-MX");
+  const open = pickChatVariant(
+    [
+      `**${personSummary.name}** tiene **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+      `Encontré **${totalLabel}** ficha${total === 1 ? "" : "s"} a nombre de **${personSummary.name}**`,
+      `El inventario de **${personSummary.name}** suma **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+    ],
+    personSummary.name + totalLabel,
+  );
+  const stats =
+    ` (**${personSummary.activos}** activo${personSummary.activos === 1 ? "" : "s"}) en **${areas.length}** área${areas.length === 1 ? "" : "s"} (${areaLine}).`;
+  const mid = samples.length
+    ? pickChatVariant(
+        [
+          ` Por mencionar algunos: ${samples.join(", ")}.`,
+          ` Entre ellos están ${samples.join(", ")}.`,
+          ` Empiezan con ${samples.join(", ")}.`,
+        ],
+        samples.join("|"),
+      )
+    : "";
+  const close = pickChatVariant(
+    [
+      ` El detalle está en el panel derecho. ¿Generamos QR, filtramos por área o seguimos con otra consulta?`,
+      ` A la derecha tienes el listado. Si quieres, vemos etiquetas, QR o un área en particular.`,
+      ` ¿Revisamos sus etiquetas, armamos QR o pasamos algo a otro inventario?`,
+    ],
+    open,
+  );
+  const reply = `${open}${stats}${mid}${close}`;
 
   return { reply, shownRows };
 }
@@ -3259,12 +4226,16 @@ function findPersonInText(
 function looksLikePersonAnaphora(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
-  // No tratar “su id / su etiqueta” como inventario de persona.
-  if (/\b(su|sus)\s+(id|ids|etiqueta|etiquetas|codigo|codigos|folio)\b/.test(n)) {
+  // “su id / su código / su etiqueta” puntual ≠ listado.
+  // “sus etiquetas / sus registros” SÍ es anáfora (no mandar a n8n).
+  if (/\bsu\s+(id|ids|etiqueta|codigo|codigos|folio)\b/.test(n)) {
+    return false;
+  }
+  if (/\bsus\s+(id|ids|codigo|codigos|folio)\b/.test(n)) {
     return false;
   }
   return (
-    /\b(su|sus)\s+(inventario|registros?|etiquetas?|equipos?|articulos?|cosas|ficha|fichas)\b/.test(
+    /\b(su|sus)\s+(inventario|registros?|etiquetas?|equipos?|articulos?|cosas|ficha|fichas|excel|xlsx|csv|archivo)\b/.test(
       n,
     ) ||
     /\bde el\b/.test(n) ||
@@ -3461,6 +4432,140 @@ function looksLikeRecordMutationAsk(userText: string) {
   if (/\b(como antes|como estaba|valor anterior)\b/.test(n)) return true;
   if (extractEtiquetaPrefixAsk(userText) || turn.etiquetaPrefix) return true;
   return false;
+}
+
+/**
+ * Consultas → n8n; estas intenciones siguen el pipeline local
+ * (Excel, merge, crear, mutar, borrar, QR, formulario).
+ */
+function shouldKeepLocalWritePipeline(
+  userText: string,
+  inventory: InventarioRow[],
+  opts?: { pendingNewInventario?: boolean },
+): boolean {
+  if (opts?.pendingNewInventario) return true;
+  if (looksLikeRecordMutationAsk(userText)) return true;
+  if (looksLikeDeleteRecordAsk(userText) || looksLikeDeleteInventoryAsk(userText)) {
+    return true;
+  }
+  if (userAskedQr(userText)) return true;
+  if (detectExcelExportAsk(userText)) return true;
+  if (detectChatDeleteIntent(userText, listExistingOrigens(inventory))) {
+    return true;
+  }
+  const n = normalizeChatIntent(userText);
+  if (
+    /\b(nuevo\s+registro|subir(le)?\s+(un\s+)?registro|opciones\s+a\s+llenar|como\s+crear|alta\s+(de\s+)?registro|llenar\s+(el\s+)?formulario)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  const origens = listExistingOrigens(inventory);
+  if (detectCreateInventarioAsk(userText, origens)) return true;
+  if (detectBulkCopyBetweenInventariosAsk(userText, origens)) return true;
+  if (detectBulkCopyAllOthersToInventarioAsk(userText, origens)) return true;
+  if (detectCopyEtiquetasToInventarioAsk(userText, origens)) return true;
+  if (detectCopyPersonRecordsToInventarioAsk(userText, origens)) return true;
+  if (detectBulkTransferAsk(userText)) return true;
+  if (looksLikeInventarioMultiAsk(userText)) return true;
+  return false;
+}
+
+const N8N_OVERVIEWS = new Set<ViewerOverview>([
+  "full",
+  "stats",
+  "areas",
+  "personas",
+  "recent",
+  "marcas",
+  "estado",
+  "personTotal",
+  "areaTotal",
+  "areaMatches",
+  "personMatches",
+]);
+
+function resolveN8nMostrarPanel(
+  accion: Accion | null,
+  inventory: InventarioRow[],
+): {
+  resultItems: ChatApiItem[];
+  viewerOverview?: ViewerOverview;
+  viewerFocus?: string;
+} | null {
+  if (!accion || accion.tipo !== "mostrar_panel") return null;
+  const limitRaw = Number(accion.limit);
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.floor(limitRaw), MAX_ETIQUETA_LIST)
+      : MAX_ETIQUETA_LIST;
+  const overviewRaw = String(accion.overview || "").trim() as ViewerOverview;
+  const overview = N8N_OVERVIEWS.has(overviewRaw) ? overviewRaw : undefined;
+  const persona = String(accion.persona || "").trim();
+  const area = String(accion.area || "").trim();
+  const origen = String(accion.origen || accion.filtros?.origen || "").trim();
+  const focus = String(accion.focus || persona || area || origen || "").trim();
+
+  const fold = (s: string) => normalizeChatIntent(s);
+  let rows: InventarioRow[] = [];
+
+  if (persona) {
+    rows = rowsForPersonName(inventory, persona);
+    if (!rows.length) {
+      const hit = getAllPersonCatalog(inventory).find(
+        (p) =>
+          fold(p.name) === fold(persona) ||
+          fold(p.name).includes(fold(persona)) ||
+          fold(persona).includes(fold(p.name)),
+      );
+      if (hit) rows = hit.rows;
+    }
+  } else if (area) {
+    const catalog = getAllAreaCatalog(inventory);
+    const hit =
+      catalog.find((c) => fold(c.name) === fold(area)) ||
+      catalog.find(
+        (c) =>
+          fold(c.name).includes(fold(area)) ||
+          fold(area).includes(fold(c.name)),
+      );
+    rows = hit ? hit.rows : [];
+  } else if (origen) {
+    const want = fold(origen);
+    rows = inventory.filter((row) => fold(String(row.origen ?? "")) === want);
+  }
+
+  if (!rows.length && overview === "recent") {
+    rows = [...inventory]
+      .sort((a, b) => Number(b.id ?? 0) - Number(a.id ?? 0))
+      .slice(0, Math.min(limit, 10));
+  }
+
+  const sliced = rows.slice(0, limit);
+  const viewerOverview =
+    overview ||
+    (persona
+      ? sliced.length
+        ? undefined
+        : "personTotal"
+      : area
+        ? "areaTotal"
+        : origen
+          ? "recent"
+          : undefined);
+  const viewerFocus = focus || undefined;
+
+  if (!sliced.length && !viewerOverview) return null;
+
+  return {
+    resultItems: sliced.map((row) => rowToChatApiItem(row)),
+    viewerOverview: sliced.length && !overview && persona ? undefined : viewerOverview,
+    viewerFocus:
+      persona && sliced.length && !overview
+        ? persona
+        : viewerFocus,
+  };
 }
 
 function stripLeadingAffirmative(userText: string) {
@@ -4304,7 +5409,10 @@ function correctIntentToken(token: string) {
       if (token.length <= 7 && !token.startsWith(canon.slice(0, 3))) continue;
     }
     const dist = levenshtein(token, canon);
-    if (dist < bestDist && dist <= budget) {
+    // Prefijo distinto (Vargas→marcas): solo dist 1. Evita apellidos→keywords.
+    const samePrefix = token.slice(0, 1) === canon.slice(0, 1);
+    const maxDist = samePrefix ? budget : Math.min(1, budget);
+    if (dist < bestDist && dist <= maxDist) {
       bestDist = dist;
       best = canon;
       if (dist === 1) break;
@@ -4433,16 +5541,41 @@ function isNonConcreteChatAsk(userText: string) {
   ) {
     return true;
   }
-  // Frases cortas de acuse sin pedido de dato.
+  // Acuse conversacional (“bien me parece perfecto”) sin verbo de consulta.
+  const hasInventoryAsk =
+    /\b(dame|muestra|mostrar|ver|lista|listar|cuant|busca|buscar|etiqueta|etiquetas|inventario|inventarios|area|areas|persona|personas|qr|exporta|importa|compara|duplicad|crea|crear|pasa|pasar|copia|borra|elimina|cambia|actualiza|ultimos?|recientes?)\b/.test(
+      n,
+    );
   if (
-    n.split(/\s+/).length <= 3 &&
-    /^(ok|okay|okey|vale|gracias|perfecto|listo|entendido|claro|de acuerdo|esta bien|está bien)\b/.test(
+    !hasInventoryAsk &&
+    /\b(me parece|esta bien|esta perfecto|todo bien|muy bien|que bien|de acuerdo|perfecto|excelente|genial|gracias|entendido|listo|claro que si)\b/.test(
       n,
     )
   ) {
     return true;
   }
+  // Frase corta solo con muletillas de acuse.
+  const ackTok =
+    /^(ok|okay|okey|vale|va|sale|bueno|bien|gracias|perfecto|perfecta|excelente|genial|super|listo|entendido|entiendo|claro|dale|sip|si|de|acuerdo|esta|muy|todo|me|parece|correcto|jaj+|jaja+|jeje+|xd)$/;
+  const toks = n.split(/\s+/).filter(Boolean);
+  if (toks.length > 0 && toks.length <= 8 && toks.every((t) => ackTok.test(t))) {
+    return true;
+  }
   return false;
+}
+
+/** Respuesta corta de acuse (sin plantilla de área). */
+function buildConversationalAckReply(userText: string): string {
+  return pickChatVariant(
+    [
+      "Perfecto. Cuando quieras seguimos con otra consulta del inventario.",
+      "De acuerdo. ¿Revisamos algo más: persona, área, últimos registros o QR?",
+      "Me alegra que te sirva. Dime qué quieres ver o ajustar a continuación.",
+      "Listo. Estoy aquí para la siguiente consulta cuando la necesites.",
+      "Entendido. Si quieres, vemos etiquetas, un área o exportamos a Excel.",
+    ],
+    userText,
+  );
 }
 
 /** Saludos / “qué se puede hacer”: conversación en texto; incidencia solo si aporta. */
@@ -5038,6 +6171,155 @@ function detectOrigenPersonasAsk(
   return matchOrigenFromPrompt(userText, existing);
 }
 
+/**
+ * “qué hay en el Inventario 1” / “dame registros del inventario 2”
+ * (contenido por origen, no área).
+ */
+function detectOrigenBrowseAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): { origen: string; limit: number | null } | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n || !inventory.length) return undefined;
+  if (detectOrigenPersonasAsk(userText, inventory)) return undefined;
+  if (detectCompareInventariosAsk(userText, listExistingOrigens(inventory))) {
+    return undefined;
+  }
+  if (detectBulkCopyBetweenInventariosAsk(userText, listExistingOrigens(inventory))) {
+    return undefined;
+  }
+  if (looksLikeDeleteRecordAsk(userText) || looksLikeRecordMutationAsk(userText)) {
+    return undefined;
+  }
+  // Crear inventario / alta / copiar ≠ “qué hay en Inventario N”.
+  if (
+    /\b(crea|crear|crealo|creala|creame|crees|creas|haz|hacer|abre|abrir|genera|generar|nuevo\s+registro|subir(le)?\s+un\s+registro|opciones\s+a\s+llenar|como\s+crear|mete\w*|pasa\w*|copia\w*|importa\w*|mueve\w*|traslad\w*)\b/.test(
+      n,
+    )
+  ) {
+    return undefined;
+  }
+  // “dame el excel…” / “áreas del Inventario 5” → otros detectores.
+  if (
+    /\b(excel|xlsx|xls|csv|spreadsheet|hoja\s+de\s+calculo)\b/.test(n) ||
+    /\b(exportar|descargar|exporta|descarga)\b/.test(n)
+  ) {
+    return undefined;
+  }
+  if (/\b(areas?|personas?|estados?)\b/.test(n)) {
+    return undefined;
+  }
+  const origen = matchOrigenFromPrompt(userText, listExistingOrigens(inventory));
+  if (!origen || !/\binventarios?\s*\d+\b/.test(n)) return undefined;
+  // Solo listado/contenido del origen (no “dame” suelto ni campos).
+  const wantsBrowse =
+    /\b(que\s+hay|que\s+tiene|cuantos?|cuantas?|muestra|mostrar|ver|lista|listar|trae|contenido|articulos?|equipos?|todo|toda|todos|todas|resumen|detalle)\b/.test(
+      n,
+    ) ||
+    (/\bregistros?\b/.test(n) &&
+      !/\b(nuevo|crear|crea|subir|llenar|alta|areas?|excel)\b/.test(n)) ||
+    (/\bdame\b/.test(n) &&
+      /\b(registros?|articulos?|equipos?|contenido|listado)\b/.test(n)) ||
+    /\ben\s+el\s+inventario\s*\d+\b/.test(n);
+  if (!wantsBrowse) return undefined;
+  const count = parseRequestedCount(userText);
+  return {
+    origen,
+    limit: count != null ? Math.max(1, Math.min(50, count)) : null,
+  };
+}
+
+/** “áreas / personas / estado del Inventario 5”. */
+function detectOrigenFieldAsk(
+  userText: string,
+  inventory: InventarioRow[],
+): { origen: string; field: "area" | "persona" | "estado" } | undefined {
+  const n = normalizeChatIntent(userText);
+  if (!n || !inventory.length) return undefined;
+  if (
+    /\b(excel|xlsx|xls|csv|exportar|descargar)\b/.test(n) ||
+    /\b(crea|crear|crealo|nuevo\s+registro)\b/.test(n)
+  ) {
+    return undefined;
+  }
+  if (!/\binventarios?\s*\d+\b/.test(n)) return undefined;
+  const origen = matchOrigenFromPrompt(
+    userText,
+    listExistingOrigens(inventory),
+  );
+  if (!origen) return undefined;
+  if (/\b(areas?|departamento|departamentos)\b/.test(n)) {
+    return { origen, field: "area" };
+  }
+  if (/\b(personas?|asignad|responsable)\b/.test(n)) {
+    return { origen, field: "persona" };
+  }
+  if (/\b(estados?|activos?|inactivos?)\b/.test(n)) {
+    return { origen, field: "estado" };
+  }
+  return undefined;
+}
+
+function buildOrigenBrowseReply(
+  origen: string,
+  inventory: InventarioRow[],
+  limit: number | null,
+): { reply: string; shownRows: InventarioRow[] } {
+  const rows = inventory.filter(
+    (row) => String(row.origen ?? "").trim() === origen,
+  );
+  if (!rows.length) {
+    return {
+      reply:
+        `No encontré registros en **${origen}**. ` +
+        `¿Quieres probar con otro inventario (Inventario 1, Inventario 2…) o con S/O?`,
+      shownRows: [],
+    };
+  }
+  const total = rows.length;
+  const personas = new Set(
+    rows.map((r) => String(r.persona ?? "").trim()).filter(Boolean),
+  ).size;
+  const activos = rows.filter(isRowActivo).length;
+  const effectiveLimit =
+    limit != null
+      ? Math.min(total, Math.max(1, limit))
+      : Math.min(total, MAX_ETIQUETA_LIST);
+  const shownRows = rows.slice(0, effectiveLimit);
+  const examples = shownRows
+    .slice(0, 3)
+    .map((row) => formatRowBrief(row))
+    .join(", ");
+  const totalLabel = total.toLocaleString("es-MX");
+  const open = pickChatVariant(
+    [
+      `En **${origen}** hay **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+      `**${origen}** concentra **${totalLabel}** ficha${total === 1 ? "" : "s"}`,
+      `Para **${origen}** localicé **${totalLabel}** registro${total === 1 ? "" : "s"}`,
+    ],
+    origen + totalLabel,
+  );
+  const stats = ` (**${personas}** persona${personas === 1 ? "" : "s"} · **${activos}** activo${activos === 1 ? "" : "s"}).`;
+  const mid = examples
+    ? pickChatVariant(
+        [
+          ` Por ejemplo: ${examples}.`,
+          ` Entre ellos: ${examples}.`,
+          ` Algunos son ${examples}.`,
+        ],
+        examples,
+      )
+    : "";
+  const close = pickChatVariant(
+    [
+      ` El detalle está en el panel. ¿Filtramos por área, persona o exportamos Excel?`,
+      ` A la derecha tienes el listado de **${origen}**. ¿Seguimos con otra consulta?`,
+    ],
+    open,
+  );
+  return { reply: `${open}${stats}${mid}${close}`, shownRows };
+}
+
 function buildOrigenPersonasReply(
   origen: string,
   inventory: InventarioRow[],
@@ -5309,10 +6591,36 @@ function buildLocalOverviewReply(
   }
 
   if (overview === "personas") {
+    const topPeople = [...personCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8);
+    const namesProse = topPeople.length
+      ? topPeople
+          .map(([name, count]) => `**${name}** (${fmt(count)})`)
+          .join(", ")
+      : "";
+    const more =
+      personCounts.size > topPeople.length
+        ? ` y **${fmt(personCounts.size - topPeople.length)}** más`
+        : "";
+    const wantsNames =
+      /\b(nombres?|esas?\s+\d+\s+personas|quienes|listar?|dame|muestra)\b/.test(
+        ask,
+      );
+    if (wantsNames && namesProse) {
+      return pickChatVariant(
+        [
+          `Estas son las **${fmt(personCounts.size)}** personas de **${scopeTitle}**: ${namesProse}${more}. El ranking completo está en el cuadro de incidencias. ¿Abrimos el inventario de alguien?`,
+          `Hay **${fmt(personCounts.size)}** personas con equipo (**${fmt(total)}** registros). Empiezan: ${namesProse}${more}. Mira la plantilla de personas a la derecha o dime un nombre.`,
+          `Listo: **${fmt(personCounts.size)}** asignaciones en **${scopeTitle}**. ${namesProse}${more}. ¿Ver más en el panel o filtrar a una persona?`,
+        ],
+        `personas:${personCounts.size}`,
+      );
+    }
     return (
       `En **${scopeTitle}** hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
       `con equipo asignado (**${fmt(total)}** registros). ` +
-      `Dime un nombre para ver su inventario, o pide «dame las personas» para el ranking.`
+      `Te abrí la plantilla de personas; dime un nombre para ver su inventario.`
     );
   }
 
@@ -5336,7 +6644,7 @@ function buildLocalOverviewReply(
   if (overview === "recent") {
     const ask = { limit: 10, soloHoy: false };
     const rows = getRecentInventoryRows(scoped, ask.limit, ask.soloHoy);
-    return buildRecentRecordsReply(rows, ask);
+    return buildRecentRecordsReply(rows, ask, { userText: "" });
   }
 
   return null;
@@ -5468,10 +6776,13 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
     (askVerb ||
       intentHas(user, "top", "desglose", "cuantas", "cuantos", "todas", "todos", "ranking") ||
       /\bpor\s+personas?\b/.test(user) ||
+      /\b(nombres?\s+de\s+(esas?\s+)?(las\s+)?personas|esas?\s+\d+\s+personas|quienes\s+son)\b/.test(
+        user,
+      ) ||
       /^(personas?|por\s+personas?)$/.test(user))
   ) {
     // "personas del inventario 1" lo resuelve el detector de origen, no el ranking.
-    if (/\binventarios?\s*\d+\b/.test(user) || /\binventario\b/.test(user)) {
+    if (/\binventarios?\s*\d+\b/.test(user) && !/\bgeneral\b/.test(user)) {
       return undefined;
     }
     // “perdón…” u otras frases no son ranking de personas.
@@ -5488,6 +6799,14 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
     return "estado";
   }
 
+  // “etiquetas de X” / persona concreta → no ranking de marcas.
+  if (
+    /\betiquet/.test(user) &&
+    /\bde\b/.test(user) &&
+    !intentHas(user, "marca", "marcas")
+  ) {
+    return undefined;
+  }
   if (
     intentHas(user, "marcas", "marca") &&
     (askVerb ||
@@ -5550,8 +6869,34 @@ function extractEtiquetasFromText(text: string): string[] {
   return tags;
 }
 
+/** “¿en qué inventario(s) está / se encuentra / aparece …?” */
+function asksWhichInventarios(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /\b(origen|fuente|venia|vino|antes|de donde)\b/.test(n) ||
+    /\b(de|en)\s+que\s+inventarios?\b/.test(n) ||
+    /\b(que|cual|cuales)\s+inventarios?\b/.test(n) ||
+    /\binventarios?\s+(tiene|tiene|aparece|aparecen|esta|estan|se\s+encuentra|se\s+encuentran)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  // “en que inventarios se encuentra la etiqueta X”
+  if (
+    /\binventari/.test(n) &&
+    /\b(encuentra|encuentran|aparece|aparecen|esta|estan|pertenece|pertenecen|ubicad|ubicacion|donde)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
- * “la etiqueta 283586 de qué inventario venía / antes / origen”.
+ * “la etiqueta 283586 de qué inventario venía / en qué inventarios está”.
  */
 function detectEtiquetaOrigenAsk(
   userText: string,
@@ -5560,18 +6905,19 @@ function detectEtiquetaOrigenAsk(
   if (!inventory.length) return undefined;
   const n = normalizeChatIntent(userText);
   if (!n) return undefined;
-  const asksOrigen =
-    /\b(origen|fuente|venia|vino|antes|de donde|de que inventario|que inventario|cual inventario|en que inventario)\b/.test(
-      n,
-    ) ||
-    (/\binventari/.test(n) &&
-      /\b(antes|venia|vino|origen|fuente|o del|o de)\b/.test(n));
-  if (!asksOrigen) return undefined;
+  if (!asksWhichInventarios(userText)) return undefined;
 
   let tags = extractEtiquetasFromText(userText);
   if (!tags.length) {
-    const bare = userText.match(/\b(\d{4,12})\b/);
-    if (bare && /\betiqueta/.test(n)) tags = [bare[1]];
+    const bare = userText.match(/\b(\d{4,12}|[A-Za-z]{1,8}[-_/]?\d{2,10})\b/);
+    if (
+      bare &&
+      (/\betiqueta/.test(n) ||
+        /\b(siguiente|esta|esa)\s+etiqueta\b/.test(n) ||
+        asksWhichInventarios(userText))
+    ) {
+      tags = [bare[1]];
+    }
   }
   if (!tags.length) return undefined;
 
@@ -5584,6 +6930,65 @@ function detectEtiquetaOrigenAsk(
     return { etiqueta, rows: [] };
   }
   return { etiqueta, rows };
+}
+
+/**
+ * “en qué inventarios está María Elena / esa persona”.
+ */
+function detectPersonInventariosAsk(
+  userText: string,
+  inventory: InventarioRow[],
+  chatHistory?: Array<{
+    from: string;
+    text: string;
+    resultItems?: ChatApiItem[];
+    viewerFocus?: string;
+    viewerOverview?: ViewerOverview;
+  }>,
+): { person: string; rows: InventarioRow[] } | undefined {
+  if (!inventory.length) return undefined;
+  if (!asksWhichInventarios(userText)) return undefined;
+  const n = normalizeChatIntent(userText);
+  // Si hay etiqueta explícita, prioriza el detector de etiqueta.
+  if (/\betiqueta/.test(n) && /\d{3,}/.test(n)) return undefined;
+  if (extractEtiquetasFromText(userText).length) return undefined;
+
+  const person =
+    findPersonInText(userText, inventory) ||
+    resolvePersonFocus(userText, inventory, chatHistory) ||
+    detectPersonTotalAsk(userText, inventory, chatHistory);
+  if (!person) return undefined;
+  const rows = rowsForPersonName(inventory, person);
+  return { person, rows };
+}
+
+function buildPersonInventariosReply(ask: {
+  person: string;
+  rows: InventarioRow[];
+}): string {
+  if (!ask.rows.length) {
+    return `No encontré registros de **${ask.person}** para listar inventarios.`;
+  }
+  const counts = new Map<string, number>();
+  for (const row of ask.rows) {
+    const origen = String(row.origen ?? "").trim() || "Sin origen";
+    counts.set(origen, (counts.get(origen) || 0) + 1);
+  }
+  const entries = [...counts.entries()].sort(
+    (a, b) =>
+      origenCurrencyRank(a[0]) - origenCurrencyRank(b[0]) || b[1] - a[1],
+  );
+  const lines = entries.map(
+    ([origen, count]) =>
+      `• **${origen}** — **${count.toLocaleString("es-MX")}** registro${count === 1 ? "" : "s"}`,
+  );
+  return (
+    `**${ask.person}** aparece en **${entries.length}** inventario` +
+    `${entries.length === 1 ? "" : "s"} ` +
+    `(**${ask.rows.length.toLocaleString("es-MX")}** registro${ask.rows.length === 1 ? "" : "s"} en total):\n` +
+    lines.join("\n") +
+    `\n\nEl detalle está en el panel derecho.`
+  );
 }
 
 function buildEtiquetaOrigenReply(
@@ -5991,6 +7396,126 @@ function ChatUserEditBox({
   );
 }
 
+/** Chips de siguiente paso según el tipo de respuesta. */
+function buildChatFollowUps(side?: {
+  resultItems?: ChatApiItem[];
+  qr?: ChatQrPayload[];
+  viewerOverview?: ViewerOverview;
+  viewerFocus?: string;
+}): ChatFollowUp[] {
+  const overview = side?.viewerOverview;
+  const focus = String(side?.viewerFocus || "").trim();
+  const hasItems = (side?.resultItems?.length || 0) > 0;
+  const hasQr = (side?.qr?.length || 0) > 0;
+  const ups: ChatFollowUp[] = [];
+
+  if (overview === "recent") {
+    ups.push(
+      { label: "Generar QR", prompt: "genera códigos QR de estos registros" },
+      { label: "Buscar por persona", prompt: "buscar por persona" },
+      { label: "Equipos por área", prompt: "equipos por área" },
+      { label: "Exportar Excel", prompt: "exporta estos registros a excel" },
+    );
+  } else if (overview === "personTotal" && focus) {
+    ups.push(
+      { label: "Generar QR", prompt: `genera QR de ${focus}` },
+      { label: "Ver etiquetas", prompt: `dame las etiquetas de ${focus}` },
+      {
+        label: "Pasar a Inventario 4",
+        prompt: `pasa los registros de ${focus} al inventario 4`,
+      },
+      { label: "Filtrar por área", prompt: `en qué áreas está ${focus}` },
+    );
+  } else if (overview === "areaTotal" && focus) {
+    ups.push(
+      { label: "Personas del área", prompt: `quiénes hay en ${focus}` },
+      { label: "Generar QR", prompt: `genera QR de ${focus}` },
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Exportar Excel", prompt: `exporta ${focus} a excel` },
+    );
+  } else if (overview === "areaMatches" || overview === "personMatches") {
+    ups.push(
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Totales", prompt: "dame el resumen del inventario" },
+    );
+  } else if (overview === "areas") {
+    ups.push(
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Buscar por persona", prompt: "buscar por persona" },
+      { label: "Totales", prompt: "dame el resumen del inventario" },
+    );
+  } else if (overview === "personas") {
+    ups.push(
+      { label: "Equipos por área", prompt: "equipos por área" },
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Totales", prompt: "dame el resumen del inventario" },
+    );
+  } else if (hasQr) {
+    ups.push(
+      { label: "Más registros", prompt: "últimos registros" },
+      { label: "Buscar otra etiqueta", prompt: "buscar por etiqueta" },
+      { label: "Exportar Excel", prompt: "exporta esto a excel" },
+    );
+  } else if (hasItems) {
+    ups.push(
+      { label: "Generar QR", prompt: "genera QR de estas etiquetas" },
+      { label: "Exportar Excel", prompt: "exporta esto a excel" },
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Buscar por persona", prompt: "buscar por persona" },
+    );
+  } else {
+    ups.push(
+      { label: "Últimos registros", prompt: "últimos registros" },
+      { label: "Buscar por persona", prompt: "buscar por persona" },
+      { label: "Equipos por área", prompt: "equipos por área" },
+      { label: "Ideas de consulta", prompt: "ideas de consulta" },
+    );
+  }
+
+  const seen = new Set<string>();
+  return ups.filter((u) => {
+    const key = u.prompt.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 4);
+}
+
+/** Solo códigos reales (OF-0026, 283586). No títulos tipo “Reportes”. */
+function extractEtiquetaFromListItem(raw: string): string | null {
+  const text = String(raw || "").trim();
+  const bold = text.match(/^\*\*([^*]+)\*\*/);
+  if (bold) {
+    const et = bold[1].trim();
+    if (/^(?=.*\d)[A-Za-z0-9][A-Za-z0-9\-_/.]{2,}$/.test(et)) return et;
+    if (/^[A-Za-z]{1,8}[-_/]\d{2,}$/i.test(et)) return et;
+  }
+  const plain = text.match(/^([A-Za-z]{1,8}[-_]?\d{2,12}|\d{4,12})\b/);
+  if (plain) return plain[1];
+  return null;
+}
+
+const IDEA_LIST_PROMPTS: Record<string, string> = {
+  "buscar por persona": "buscar por persona",
+  "equipos por area": "equipos por área",
+  "ultimos registros": "últimos registros",
+  "listar inventarios": "qué inventarios tenemos",
+  "comparar inventarios": "comparar inventarios",
+  "buscar una etiqueta": "buscar etiqueta",
+  reportes: "dame el desglose por estado",
+  "exportar a excel": "exporta el inventario a excel",
+};
+
+/** Título de idea conocida (**Reportes** — …) → prompt usable. */
+function extractIdeaPromptFromListItem(raw: string): string | null {
+  const text = String(raw || "").trim();
+  const bold = text.match(/^\*\*([^*]+)\*\*/);
+  if (!bold) return null;
+  const title = bold[1].trim();
+  if (!title || extractEtiquetaFromListItem(`**${title}**`)) return null;
+  return IDEA_LIST_PROMPTS[normalizeChatIntent(title)] || null;
+}
+
 /** Separa prosa y tablas markdown: primero el texto, tabla al final. */
 function reorderChatProseThenTable(text: string) {
   const lines = String(text || "").split(/\r?\n/);
@@ -6070,11 +7595,55 @@ function renderChatInlineText(text: string) {
   });
 }
 
-function renderChatRichText(text: string) {
+function renderChatRichText(
+  text: string,
+  opts?: { onAsk?: (prompt: string) => void },
+) {
   const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
   const blocks: React.ReactNode[] = [];
   let i = 0;
   let keyCounter = 0;
+  const onAsk = opts?.onAsk;
+
+  const renderListRow = (content: string, key: string, badge?: string) => {
+    const et = extractEtiquetaFromListItem(content);
+    const ideaPrompt = !et ? extractIdeaPromptFromListItem(content) : null;
+    const askPrompt = et ? `etiqueta ${et}` : ideaPrompt;
+    const canAsk = Boolean(onAsk && askPrompt);
+    const inner = (
+      <>
+        {badge ? (
+          <span className="chat-rich-order-badge" aria-hidden="true">
+            {badge}
+          </span>
+        ) : (
+          <span className="chat-rich-bullet" aria-hidden="true" />
+        )}
+        <span className="chat-rich-list-content">
+          {renderChatInlineText(content)}
+        </span>
+      </>
+    );
+    if (!canAsk || !askPrompt || !onAsk) {
+      return (
+        <li key={key} className="chat-rich-list-item">
+          {inner}
+        </li>
+      );
+    }
+    return (
+      <li key={key} className="chat-rich-list-item">
+        <button
+          type="button"
+          className="chat-rich-list-action"
+          title={et ? `Consultar etiqueta ${et}` : `Consultar: ${askPrompt}`}
+          onClick={() => onAsk(askPrompt)}
+        >
+          {inner}
+        </button>
+      </li>
+    );
+  };
 
   while (i < lines.length) {
     const rawLine = lines[i];
@@ -6142,24 +7711,18 @@ function renderChatRichText(text: string) {
       continue;
     }
 
-    // 3. Unordered list (•, -, *) → prosa (sin bolitas verdes)
+    // 3. Unordered list (•, -, *) — lista interactiva
     if (/^[•\-\*]\s+/.test(trimmed)) {
       const items: string[] = [];
       while (i < lines.length && /^[•\-\*]\s+/.test(lines[i].trim())) {
         items.push(lines[i].trim().replace(/^[•\-\*]\s+/, ""));
         i += 1;
       }
-      const prose =
-        items.length <= 1
-          ? items[0] || ""
-          : `${items.slice(0, -1).join("; ")}; y ${items[items.length - 1]}`;
-      if (prose) {
-        blocks.push(
-          <p key={`p-${keyCounter++}`} className="chat-rich-paragraph">
-            {renderChatInlineText(prose)}
-          </p>,
-        );
-      }
+      blocks.push(
+        <ul key={`ul-${keyCounter++}`} className="chat-rich-list">
+          {items.map((item, idx) => renderListRow(item, `u-${idx}`))}
+        </ul>,
+      );
       continue;
     }
 
@@ -6175,16 +7738,9 @@ function renderChatRichText(text: string) {
       }
       blocks.push(
         <ol key={`ol-${keyCounter++}`} className="chat-rich-list is-ordered">
-          {items.map((item, idx) => (
-            <li key={idx} className="chat-rich-list-item">
-              <span className="chat-rich-order-badge" aria-hidden="true">
-                {item.num}
-              </span>
-              <span className="chat-rich-list-content">
-                {renderChatInlineText(item.content)}
-              </span>
-            </li>
-          ))}
+          {items.map((item, idx) =>
+            renderListRow(item.content, `o-${idx}`, item.num),
+          )}
         </ol>,
       );
       continue;
@@ -7160,6 +8716,7 @@ const SideRail = memo(function SideRail({
 export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [items, setItems] = useState<InventarioRow[]>(rows);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [addModalDestino, setAddModalDestino] = useState<string | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<InventarioRow | null>(null);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const collapseSidebarRef = useRef<(() => void) | null>(null);
@@ -7218,8 +8775,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   );
   const [pendingBulkTransfer, setPendingBulkTransfer] =
     useState<PendingBulkTransfer | null>(null);
-  const [pendingChatDeleteRow, setPendingChatDeleteRow] =
-    useState<InventarioRow | null>(null);
+  const [pendingChatDeletePlan, setPendingChatDeletePlan] =
+    useState<ChatDeletePlan | null>(null);
+  const pendingChatDeletePlanRef = useRef<ChatDeletePlan | null>(null);
   const [chatDeleteBusy, setChatDeleteBusy] = useState(false);
   const [chatDropActive, setChatDropActive] = useState(false);
   const [chatQrByMsg, setChatQrByMsg] = useState<Record<number, ChatQrCard[]>>({});
@@ -7265,6 +8823,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const pendingBulkTransferRef = useRef<PendingBulkTransfer | null>(null);
   const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
   const pendingNewInventarioRef = useRef<PendingNewInventario | null>(null);
+  /** Confirmación: meter todos los demás inventarios → destino. */
+  const pendingOrigenMergeRef = useRef<{
+    dest: string;
+    sources: string[];
+    askedAt: number;
+  } | null>(null);
   /** Último listado concreto (aunque el visor no se haya abierto) para follow-ups tipo "no se ven". */
   const lastConcreteSideRef = useRef<{
     resultItems: ChatApiItem[];
@@ -7456,15 +9020,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   }, [rail]);
 
   const selectLlmModel = useCallback((option: ChatModelOption) => {
-    saveSelectedModelForKey(option.key_fingerprint, option.id);
+    const keyFingerprint = String(
+      option.key_fingerprint || activeLlmMeta.keyFingerprint || "default",
+    );
+    saveSelectedModelForKey(keyFingerprint, option.id);
     setActiveLlmMeta({
       provider: option.provider,
       providerLabel: option.provider_label || option.provider.toUpperCase(),
       model: option.id,
-      keyFingerprint: option.key_fingerprint,
+      keyFingerprint,
       budget: normalizeModelTokenBudget(option.token_budget, 64_000),
     });
-  }, []);
+  }, [activeLlmMeta.keyFingerprint]);
 
   useEffect(() => {
     if (!tokenPopoverOpen) return;
@@ -7571,7 +9138,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       model: activeLlmMeta.model,
       modelLabel: matchedOption?.label || shortModel,
       shortModel,
-      keyFingerprint: activeLlmMeta.keyFingerprint,
+      keyFingerprint: String(activeLlmMeta.keyFingerprint || "default"),
       used: totalUsed,
       baseUsed,
       draftTokens,
@@ -7679,6 +9246,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     addOpen: isAddModalOpen,
     detailId: selectedProduct?.id != null ? Number(selectedProduct.id) : null,
   };
+
+  // n8n (opt-in): acción `refrescar` → CustomEvent inventario:refrescar.
+  useEffect(() => {
+    const recargarTabla = () => {
+      void readInventario().then(({ rows: next }) => {
+        if (Array.isArray(next)) setItems(next);
+      });
+    };
+    const h = () => recargarTabla();
+    window.addEventListener("inventario:refrescar", h);
+    return () => window.removeEventListener("inventario:refrescar", h);
+  }, []);
 
   // Memoria compartida entre chats: snapshot del total actual.
   useEffect(() => {
@@ -8217,7 +9796,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         el.style.minHeight = "";
       });
     }
-    if (!scrollRoot || !logEl) return;
+    // Home (nueva consulta): sin log → forzar altura/scroll limpios.
+    if (!logEl) {
+      if (scrollRoot) {
+        scrollRoot.scrollTop = 0;
+        delete scrollRoot.dataset.chatScrollMax;
+        scrollRoot.scrollTo?.(0, 0);
+      }
+      const panel = viewPanelRef.current;
+      if (panel) panel.scrollTop = 0;
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+      return;
+    }
+    if (!scrollRoot) return;
 
     const PIN_GAP = 28;
     const anchor = logEl.querySelector<HTMLElement>(
@@ -8539,6 +10130,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const setPendingChatImportSafe = (items: NewInventarioItem[] | null) => {
     pendingChatImportRef.current = items;
     setPendingChatImport(items);
+    savePendingImportToSession(activeChatIdRef.current, items);
   };
 
   const setPendingFieldRevertSafe = (change: ChatFieldChange | null) => {
@@ -8563,20 +10155,84 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setPendingBulkTransfer(transfer);
   };
 
+  const setPendingChatDeletePlanSafe = (plan: ChatDeletePlan | null) => {
+    pendingChatDeletePlanRef.current = plan;
+    setPendingChatDeletePlan(plan);
+  };
+
+  const contextRowsForDelete = (): InventarioRow[] => {
+    const priorItems =
+      lastConcreteSideRef.current?.resultItems ||
+      [...messagesRef.current]
+        .reverse()
+        .find(
+          (m) =>
+            m.from === "bot" &&
+            Array.isArray(m.resultItems) &&
+            m.resultItems.length > 0,
+        )?.resultItems ||
+      [];
+    const rows: InventarioRow[] = [];
+    const seen = new Set<string>();
+    for (const it of priorItems) {
+      const et = String(it.etiqueta ?? "").trim().toLowerCase();
+      const key =
+        it.id != null && Number.isFinite(Number(it.id))
+          ? `id:${it.id}`
+          : et
+            ? `et:${et}`
+            : "";
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const hit =
+        (it.id != null &&
+          items.find((r) => Number(r.id) === Number(it.id))) ||
+        (et &&
+          items.find(
+            (r) =>
+              String(r.etiqueta ?? "").trim().toLowerCase() === et &&
+              (!it.origen ||
+                String(r.origen ?? "").trim() === String(it.origen).trim()),
+          )) ||
+        (et &&
+          items.find(
+            (r) => String(r.etiqueta ?? "").trim().toLowerCase() === et,
+          ));
+      if (hit) rows.push(hit);
+    }
+    return rows;
+  };
+
   const confirmChatDeleteRecord = async () => {
-    const target = pendingChatDeleteRow;
-    if (!target?.id || chatDeleteBusy) return;
+    const plan = pendingChatDeletePlanRef.current || pendingChatDeletePlan;
+    if (!plan?.rows.length || chatDeleteBusy) return;
+    const targets = plan.rows.filter(
+      (r) => r.id != null && Number.isFinite(Number(r.id)),
+    );
+    if (!targets.length) return;
     setChatDeleteBusy(true);
     try {
-      const result = await deleteInventarioAction(Number(target.id));
-      if (!result.success) {
+      const ids = targets.map((r) => Number(r.id));
+      const result =
+        ids.length === 1
+          ? await deleteInventarioAction(ids[0]).then((res) =>
+              res.success
+                ? { success: true as const, deletedIds: [ids[0]], error: null }
+                : {
+                    success: false as const,
+                    deletedIds: [] as number[],
+                    error: res.error || "No se pudo eliminar.",
+                  },
+            )
+          : await deleteInventarioManyAction(ids);
+      if (!result.success || !result.deletedIds?.length) {
         setChatDeleteBusy(false);
-        setPendingChatDeleteRow(null);
+        setPendingChatDeletePlanSafe(null);
         const sessionId = activeChatIdRef.current;
         if (sessionId) {
           const botId = chatId.current++;
           const fail =
-            result.error || "No se pudo eliminar el registro.";
+            result.error || "No se pudieron eliminar los registros.";
           const next = [
             ...messagesRef.current,
             {
@@ -8592,27 +10248,59 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         }
         return;
       }
+      const deletedSet = new Set(result.deletedIds);
+      const deletedRows = targets.filter((r) => deletedSet.has(Number(r.id)));
       const totalBefore = items.length;
-      setItems((prev) => prev.filter((row) => Number(row.id) !== Number(target.id)));
-      if (selectedProduct?.id != null && Number(selectedProduct.id) === Number(target.id)) {
+      setItems((prev) =>
+        prev.filter((row) => !deletedSet.has(Number(row.id))),
+      );
+      if (
+        selectedProduct?.id != null &&
+        deletedSet.has(Number(selectedProduct.id))
+      ) {
         setSelectedProduct(null);
       }
       rememberMutation({
         kind: "delete",
-        summary: `Eliminé etiqueta ${target.etiqueta || target.id}`,
+        summary:
+          deletedRows.length === 1
+            ? `Eliminé etiqueta ${deletedRows[0].etiqueta || deletedRows[0].id}`
+            : `Eliminé ${deletedRows.length} registros${
+                plan.origen ? ` de ${plan.origen}` : ""
+              }`,
         totalBefore,
-        totalAfter: Math.max(0, totalBefore - 1),
-        count: 1,
-        ids: [Number(target.id)],
+        totalAfter: Math.max(0, totalBefore - deletedRows.length),
+        count: deletedRows.length,
+        ids: result.deletedIds,
         chatId: activeChatIdRef.current,
-        fact: `Eliminado: ${target.etiqueta || target.id} (${target.articulo || "sin artículo"})`,
+        fact: `Eliminados ${deletedRows.length}: ${deletedRows
+          .slice(0, 5)
+          .map((r) => r.etiqueta || r.id)
+          .join(", ")}`,
       });
-      const label =
-        String(target.etiqueta ?? "").trim() || `ID ${target.id}`;
-      const ok =
-        `Listo: eliminé **${label}**${
-          target.articulo ? ` — ${target.articulo}` : ""
-        } del inventario.`;
+      const fallback = formatDeleteDoneFallback({
+        rows: deletedRows,
+        origen: plan.origen,
+        wholeOrigen: plan.wholeOrigen,
+        deletedCount: deletedRows.length,
+      });
+      const polished = await polishInventoryReply({
+        userText: "confirmación de eliminación",
+        kind: "delete_done",
+        fallback,
+        sessionId: activeChatIdRef.current,
+        facts: {
+          deleted_count: deletedRows.length,
+          origen: plan.origen || "",
+          whole_origen: Boolean(plan.wholeOrigen),
+          sample: deletedRows.slice(0, 5).map((r) => ({
+            etiqueta: String(r.etiqueta ?? "").trim(),
+            articulo: String(r.articulo ?? "").trim(),
+          })),
+          plantilla_sugerida: fallback,
+          tono: "claro_conversacional",
+        },
+      });
       const sessionId = activeChatIdRef.current;
       if (sessionId) {
         const botId = chatId.current++;
@@ -8621,10 +10309,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           {
             id: botId,
             from: "bot" as const,
-            text: ok,
+            text: polished.reply || fallback,
             at: Date.now(),
             resultItems: [],
             qr: [],
+            followUps: polished.followUps,
           },
         ];
         messagesRef.current = next;
@@ -8633,7 +10322,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     } finally {
       setChatDeleteBusy(false);
-      setPendingChatDeleteRow(null);
+      setPendingChatDeletePlanSafe(null);
     }
   };
 
@@ -8647,8 +10336,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       viewerOverview?: ViewerOverview;
       viewerFocus?: string;
       exportFiles?: ChatExportFile[];
+      followUps?: ChatFollowUp[];
     },
   ) => {
+    const followUps =
+      side?.followUps ||
+      buildChatFollowUps({
+        resultItems: side?.resultItems,
+        qr: side?.qr,
+        viewerOverview: side?.viewerOverview,
+        viewerFocus: side?.viewerFocus,
+      });
     const finalMessages = messagesRef.current.map((m) =>
       m.id === botId
         ? {
@@ -8656,6 +10354,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             text: reply,
             at: Date.now(),
             importProgress: undefined,
+            followUps,
             ...(side
               ? {
                   resultItems: side.resultItems || [],
@@ -8848,6 +10547,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         destLabel && destLabel !== sourceLabel
           ? `${sourceLabel} → ${destLabel}`
           : sourceLabel;
+      // Pintar el cuadro de importación de inmediato (antes del primer lote).
+      {
+        const starting = messagesRef.current.map((m) =>
+          m.id === botId
+            ? {
+                ...m,
+                text: `Importando “${progressLabel}”… 0/${total}`,
+                at: Date.now(),
+                importProgress: { label: progressLabel, done: 0, total },
+              }
+            : m,
+        );
+        messagesRef.current = starting;
+        setMessages(starting);
+        await new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => resolve());
+        });
+      }
       for (let i = 0; i < rows.length; i += CHAT_IMPORT_CHUNK) {
         if (
           requestGen !== chatRequestGenRef.current ||
@@ -8962,6 +10679,208 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         qr: [],
       });
     };
+
+    // Confirmar / cancelar eliminación pendiente (sí → modal; no → cancelar)
+    {
+      const pendingDel =
+        pendingChatDeletePlanRef.current || pendingChatDeletePlan;
+      if (pendingDel?.phase === "await_yes") {
+        if (isNegativeChat(text)) {
+          setPendingChatDeletePlanSafe(null);
+          const cancelReply =
+            "Listo, cancelé el borrado. No toqué ningún registro.";
+          try {
+            await ensureTypingPause(cancelReply);
+            finishBotReply(sessionId, botId, cancelReply);
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        if (isAffirmativeChat(text)) {
+          try {
+            const nextPlan: ChatDeletePlan = {
+              ...pendingDel,
+              phase: "modal",
+            };
+            setPendingChatDeletePlanSafe(nextPlan);
+            const replyText = formatDeleteModalPrompt(nextPlan);
+            await ensureTypingPause(replyText);
+            finishBotReply(sessionId, botId, replyText, {
+              resultItems: nextPlan.rows
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+            });
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+      }
+    }
+
+    // Confirmar / cancelar merge “todos los demás → Inventario N”.
+    {
+      const pendingMerge = pendingOrigenMergeRef.current;
+      if (pendingMerge) {
+        if (isNegativeChat(text)) {
+          pendingOrigenMergeRef.current = null;
+          const cancelReply =
+            `De acuerdo, **cancelé** la carga a **${pendingMerge.dest}**. ` +
+            `No moví ni copié ningún registro de ${pendingMerge.sources
+              .map((s) => `**${s}**`)
+              .join(", ")}. Cuando quieras lo retomamos.`;
+          try {
+            await ensureTypingPause(cancelReply);
+            finishBotReply(sessionId, botId, cancelReply);
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        if (isAffirmativeChat(text)) {
+          try {
+            pendingOrigenMergeRef.current = null;
+            const foldOrig = (o: string) =>
+              o
+                .toLowerCase()
+                .normalize("NFD")
+                .replace(/\p{M}/gu, "")
+                .replace(/\s+/g, " ")
+                .trim();
+            const destFold = foldOrig(pendingMerge.dest);
+            let destEtq = new Set(
+              items
+                .filter((row) => foldOrig(String(row.origen ?? "")) === destFold)
+                .map((row) => String(row.etiqueta ?? "").trim().toLowerCase())
+                .filter(Boolean),
+            );
+            const savedAll: InventarioRow[] = [];
+            const skippedDup: string[] = [];
+            let lastError = "";
+            for (const source of pendingMerge.sources) {
+              const sourceFold = foldOrig(source);
+              const sourceRows = items.filter(
+                (row) =>
+                  foldOrig(String(row.origen ?? "")) === sourceFold &&
+                  String(row.etiqueta ?? "").trim(),
+              );
+              const toCopy: InventarioRow[] = [];
+              const seen = new Set<string>();
+              for (const row of sourceRows) {
+                const key = String(row.etiqueta ?? "").trim().toLowerCase();
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                if (destEtq.has(key)) {
+                  skippedDup.push(`${key} (${source})`);
+                  continue;
+                }
+                toCopy.push(row);
+              }
+              if (!toCopy.length) continue;
+              const payload = toCopy.map((row) =>
+                rowToNewInventarioItem(row, pendingMerge.dest),
+              );
+              for (let i = 0; i < payload.length; i += CHAT_IMPORT_CHUNK) {
+                if (
+                  requestGen !== chatRequestGenRef.current ||
+                  controller.signal.aborted
+                ) {
+                  throw new DOMException("Aborted", "AbortError");
+                }
+                const chunk = payload.slice(i, i + CHAT_IMPORT_CHUNK);
+                const progressing = messagesRef.current.map((m) =>
+                  m.id === botId
+                    ? {
+                        ...m,
+                        text: `Copiando **${source}** → **${pendingMerge.dest}**… ${Math.min(i + chunk.length, payload.length)}/${payload.length}`,
+                        at: Date.now(),
+                      }
+                    : m,
+                );
+                messagesRef.current = progressing;
+                setMessages(progressing);
+                const result = await addInventarioBulkAction(chunk);
+                if (result.success && result.data?.length) {
+                  savedAll.push(...result.data);
+                  for (const row of result.data) {
+                    const k = String(row.etiqueta ?? "").trim().toLowerCase();
+                    if (k) destEtq.add(k);
+                  }
+                } else if (result.error) {
+                  lastError = result.error;
+                }
+              }
+            }
+            if (!savedAll.length) {
+              const fail =
+                lastError ||
+                `No quedó nada nuevo que importar a **${pendingMerge.dest}**` +
+                  (skippedDup.length
+                    ? ` (muchas etiquetas ya estaban: p. ej. ${skippedDup
+                        .slice(0, 5)
+                        .join(", ")})`
+                    : "") +
+                  `.`;
+              await ensureTypingPause(fail);
+              finishBotReply(sessionId, botId, fail);
+              return;
+            }
+            const stamp = new Date().toISOString();
+            const totalBefore = items.length;
+            setItems((prev) => [
+              ...savedAll.map((row) => ({ ...row, updated_at: stamp })),
+              ...prev,
+            ]);
+            rememberMutation({
+              kind: "import",
+              summary: `Merge → ${pendingMerge.dest}: +${savedAll.length}`,
+              totalBefore,
+              totalAfter: totalBefore + savedAll.length,
+              count: savedAll.length,
+              ids: savedAll
+                .map((row) => row.id)
+                .filter((id): id is number => id != null),
+              chatId: sessionId,
+              fact: `Merge ${pendingMerge.sources.join("+")}→${pendingMerge.dest}: +${savedAll.length}`,
+            });
+            const lines = pendingMerge.sources
+              .map((s) => `• **${s}**`)
+              .join("\n");
+            const doneReply =
+              `Listo, ya confirmaste y terminé la carga.\n\n` +
+              `Metí en **${pendingMerge.dest}** los registros nuevos desde:\n${lines}\n\n` +
+              `**${savedAll.length.toLocaleString("es-MX")}** filas nuevas` +
+              (skippedDup.length
+                ? `; omití **${skippedDup.length.toLocaleString("es-MX")}** etiquetas que ya existían en el destino`
+                : "") +
+              `.\n\n` +
+              `Puedes pedir el Excel de **${pendingMerge.dest}**, ver áreas o seguir con otra consulta.`;
+            await ensureTypingPause(doneReply);
+            finishBotReply(sessionId, botId, doneReply, {
+              resultItems: savedAll
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview: "recent",
+              viewerFocus: pendingMerge.dest,
+            });
+          } catch (err: unknown) {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            pendingOrigenMergeRef.current = null;
+            finishBotReply(
+              sessionId,
+              botId,
+              err instanceof Error
+                ? err.message
+                : "No pude completar la carga a ese inventario.",
+            );
+          }
+          return;
+        }
+      }
+    }
 
     // Confirmar / cancelar traspaso masivo pendiente
     {
@@ -9262,40 +11181,91 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
-    // Eliminar registro → aviso modal (mismo estilo que borrar chat)
-    if (looksLikeDeleteRecordAsk(userText || text)) {
+    // Eliminar 1 / N / listado / inventario entero / multi → ¿seguro? → modal
+    if (
+      looksLikeDeleteInventoryAsk(userText || text) ||
+      looksLikeDeleteRecordAsk(userText || text)
+    ) {
       try {
-        let target =
-          resolveRecordRowsFromPrompt(userText || text, "", items, 1)[0] ||
-          resolveContextualRecordRows(
+        const intent = detectChatDeleteIntent(
+          userText || text,
+          listExistingOrigens(items),
+        );
+        const wipeAll =
+          Boolean(intent?.wipeAllOrigens) ||
+          looksLikeWipeAllInventariosAsk(userText || text);
+        const contextRows = contextRowsForDelete();
+        let rows: InventarioRow[] = [];
+        if (intent) {
+          rows = resolveChatDeleteRows({
+            intent,
+            inventory: items,
+            contextRows,
+          });
+        }
+        // Fallback: etiquetas / “estos” — NUNCA si pediste vaciar todos los inventarios.
+        if (!rows.length && !wipeAll) {
+          const fromPrompt = resolveRecordRowsFromPrompt(
+            userText || text,
+            "",
             items,
-            messagesRef.current.map((m) => ({
-              from: m.from,
-              text: m.text || "",
-            })),
-            1,
-          )[0] ||
-          null;
-        if (!target) {
-          const ask =
-            "Claro. Para eliminar necesito la **etiqueta** (o el id) del registro.\n\n" +
-            "Ejemplo: `elimina la etiqueta 310285`.\n\n" +
-            "Siempre te pediré confirmación antes de borrarlo.";
+            40,
+          );
+          if (fromPrompt.length) rows = fromPrompt;
+          else if (contextRows.length && /\b(est[oa]s?|esos|esas)\b/i.test(userText || text)) {
+            rows = contextRows;
+          } else {
+            const one = resolveContextualRecordRows(
+              items,
+              messagesRef.current.map((m) => ({
+                from: m.from,
+                text: m.text || "",
+              })),
+              1,
+            )[0];
+            if (one) rows = [one];
+          }
+        }
+
+        // Si hay origen y etiquetas ambiguas sin match, avisar
+        if (!rows.length) {
+          const ask = wipeAll
+            ? "No hay registros en ningún inventario para eliminar."
+            : intent?.wholeOrigen
+            ? `No encontré registros en **${intent.origen}** para eliminar.`
+            : intent?.includeScopedList
+              ? `Para borrar ese listado necesito los registros de arriba (pide antes «últimos registros» o una búsqueda) y, si aplica, el inventario. Ejemplo: «elimina estos del Inventario 4».`
+              : "Para eliminar necesito la **etiqueta**, el listado de arriba o un inventario entero.\n\n" +
+                "Ejemplos: `elimina la etiqueta 310285`, `quita estos 10 del Inventario 4`, `elimina todo el Inventario 4`, `elimina todos los inventarios`.";
           await ensureTypingPause(ask);
           finishBotReply(sessionId, botId, ask);
           return;
         }
-        setPendingChatDeleteRow(target);
-        const label =
-          String(target.etiqueta ?? "").trim() ||
-          (target.id != null ? `ID ${target.id}` : "el registro");
-        const art = String(target.articulo ?? "").trim();
-        const replyText =
-          `Voy a eliminar **${label}**${art ? ` — ${art}` : ""}.\n\n` +
-          `Confirma en el aviso: **Borrar** para continuar o **Cancelar** para dejarlo.`;
+
+        const plan: ChatDeletePlan = {
+          mode:
+            intent?.mode ||
+            (wipeAll
+              ? "whole_all_origens"
+              : rows.length > 1
+                ? "mixed"
+                : "etiquetas"),
+          origen: intent?.origen,
+          etiquetas: intent?.etiquetas || [],
+          includeScopedList: Boolean(intent?.includeScopedList),
+          wholeOrigen: Boolean(intent?.wholeOrigen) || wipeAll,
+          wipeAllOrigens: wipeAll,
+          phase: "await_yes",
+          rows,
+          askedAt: Date.now(),
+        };
+        setPendingChatDeletePlanSafe(plan);
+        const replyText = formatDeleteSoftConfirm(plan);
         await ensureTypingPause(replyText);
         finishBotReply(sessionId, botId, replyText, {
-          resultItems: [rowToChatApiItem(target)],
+          resultItems: rows
+            .slice(0, CHAT_SIDE_RESULT_CAP)
+            .map((row) => rowToChatApiItem(row)),
           qr: [],
         });
       } catch {
@@ -9697,10 +11667,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // Confirmar importación Excel/CSV pendiente
-    const pendingRows = pendingChatImportRef.current?.length
+    // Confirmar importación Excel/CSV pendiente (memoria → session → tarjetas del visor)
+    let pendingRows = pendingChatImportRef.current?.length
       ? pendingChatImportRef.current
       : pendingChatImport;
+    if (!pendingRows?.length) {
+      const fromSession = loadPendingImportFromSession(sessionId);
+      if (fromSession?.length) {
+        pendingRows = fromSession;
+        setPendingChatImportSafe(fromSession);
+      }
+    }
+    if (!pendingRows?.length && isChatImportConfirm(text)) {
+      const recovered = recoverPendingImportFromMessages(messagesRef.current);
+      if (recovered?.length) {
+        pendingRows = recovered;
+        setPendingChatImportSafe(recovered);
+      }
+    }
     // Pendiente + destino explícito (“importar a Inventario 1” / “a S/O”).
     if (pendingRows?.length) {
       const existingOrigens = [
@@ -9729,13 +11713,23 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           botId,
           `Listo: reasigné los **${formatNumber(remapped.length)}** registros pendientes a **${forceOrigen}**.\n\n` +
             `¿Confirmas la importación? Responde **sí** o **importalos**.`,
+          {
+            resultItems: importItemsToChatApi(
+              remapped.slice(0, CHAT_SIDE_RESULT_CAP),
+            ),
+            viewerFocus: forceOrigen,
+          },
         );
         return;
       }
     }
     if (pendingRows?.length && isChatImportConfirm(text)) {
       try {
-        await runBulkChatImport(pendingRows, "archivo pendiente");
+        const origenLabel =
+          String(pendingRows[0]?.origen ?? "").trim() || "archivo pendiente";
+        await runBulkChatImport(pendingRows, origenLabel, {
+          destLabel: origenLabel,
+        });
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setPendingChatImportSafe(null);
@@ -9746,6 +11740,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         );
       }
       return;
+    }
+    // “sí” tras preview de import sin filas → no mandar a n8n
+    if (isChatImportConfirm(text)) {
+      const lastBotAsk = [...messagesRef.current]
+        .reverse()
+        .find((m) => m.from === "bot" && looksLikeImportPreviewAsk(m.text || ""));
+      if (lastBotAsk) {
+        finishBotReply(
+          sessionId,
+          botId,
+          "Se me perdió el Excel pendiente. Vuelve a subirlo y confirma con **sí** o **importalos**.",
+        );
+        return;
+      }
     }
 
     // Adjuntar Excel/CSV → parsear; importar ya o pedir confirmación
@@ -9812,33 +11820,28 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             };
           });
           setPendingChatImportSafe(mixedItems);
-          const mixLines = plan.counts
+          const mixSummary = plan.counts
             .slice(0, 8)
             .map(
               (c) =>
-                `• **${c.origen}:** ${formatNumber(c.count)} registro${c.count === 1 ? "" : "s"}`,
+                `**${c.origen}** → ${formatNumber(c.count)} registro${c.count === 1 ? "" : "s"}`,
             )
-            .join("\n");
-          const sample = mixedItems
-            .slice(0, 5)
-            .map(
-              (item) =>
-                `• ${item.etiqueta} — ${item.articulo} (${item.origen})`,
-            )
-            .join("\n");
-          const more =
-            nBase > 5 ? `\n…y ${formatNumber(nBase - 5)} más.` : "";
+            .join(" · ");
           finishBotReply(
             sessionId,
             botId,
             buildChatImportMixedReply({
               fileName: attach.name,
               sheetName: parsed.sheetName,
-              mixLines,
-              dupNote,
-              sample,
-              more,
+              mixSummary,
+              dupNote: dupNote.trim(),
             }),
+            {
+              resultItems: importItemsToChatApi(
+                mixedItems.slice(0, CHAT_SIDE_RESULT_CAP),
+              ),
+              viewerFocus: "Vista previa Excel",
+            },
           );
           return;
         }
@@ -9870,12 +11873,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           origen,
         }));
         setPendingChatImportSafe(itemsForImport);
-        const sample = itemsForImport
-          .slice(0, 5)
-          .map((item) => `• ${item.etiqueta} — ${item.articulo}`)
-          .join("\n");
-        const more =
-          nBase > 5 ? `\n…y ${formatNumber(nBase - 5)} más.` : "";
         finishBotReply(
           sessionId,
           botId,
@@ -9887,9 +11884,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             count: nBase,
             rawValid,
             dups,
-            sample,
-            more,
           }),
+          {
+            resultItems: importItemsToChatApi(
+              itemsForImport.slice(0, CHAT_SIDE_RESULT_CAP),
+            ),
+            viewerFocus: origen,
+          },
         );
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -9965,14 +11966,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     let intentText = resolvedTurn.effectiveText || spokenText;
 
     // Multipetición inventarios: “mete Inv2→Inv3 y omite las que ya existan”.
+    // Nunca reescribir si es comparar listado / inventarios.
     {
-      const multi = detectInventarioMultiPlan(
-        intentText,
-        listExistingOrigens(items),
-      );
-      if (multi?.steps[0]?.kind === "bulk_copy") {
-        intentText = multi.primaryText;
-        resolvedTurn.topic = "fill_inventario";
+      const origensNow = listExistingOrigens(items);
+      const isCompareAsk =
+        Boolean(detectCompareScopedListAsk(intentText, origensNow)) ||
+        Boolean(detectCompareInventariosAsk(intentText, origensNow)) ||
+        /\bcompara\w*\b/i.test(intentText);
+      if (!isCompareAsk) {
+        const multi = detectInventarioMultiPlan(intentText, origensNow);
+        if (multi?.steps[0]?.kind === "bulk_copy") {
+          intentText = multi.primaryText;
+          resolvedTurn.topic = "fill_inventario";
+        }
       }
     }
 
@@ -9998,6 +12004,37 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         return;
       } catch {
         /* abort */
+      }
+    }
+
+    // Acuse conversacional (“bien / perfecto / me parece…”) → chat, no buscar áreas.
+    {
+      const ackNorm = normalizeChatIntent(spokenText);
+      const isShortConfirm =
+        /^(si|sip|sep|dale|ok|okay|okey|vale|claro|correcto|esa|ese|eso|afirmativo)$/.test(
+          ackNorm,
+        );
+      if (isNonConcreteChatAsk(spokenText) && !isShortConfirm) {
+        try {
+          pendingDisambiguationRef.current = null;
+          const fallbackAck = buildConversationalAckReply(spokenText);
+          const polished = await polishInventoryReply({
+            userText: spokenText,
+            sessionId: sessionId,
+            kind: "ack",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackAck,
+            facts: { tone: "acknowledgment", user_text: spokenText },
+          });
+          recordTokenConsumption(null, spokenText, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
+            followUps: polished.followUps,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
       }
     }
 
@@ -10047,17 +12084,36 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (resolved.status === "resolved_area") {
         pendingDisambiguationRef.current = null;
         try {
-          const { reply: localReply, shownRows } = buildExactAreaReply(
+          const { reply: fallbackReply, shownRows } = buildExactAreaReply(
             resolved.area,
             resolved.limit,
           );
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "areaTotal",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackReply,
+            facts: {
+              area: resolved.area.name,
+              total: resolved.area.rows.length,
+              personas: resolved.area.personas,
+              activos: resolved.area.activos,
+              samples: shownRows.slice(0, 5).map((row) => ({
+                etiqueta: String(row.etiqueta ?? "").trim(),
+                articulo: String(row.articulo ?? "").trim(),
+                persona: String(row.persona ?? "").trim(),
+              })),
+            },
+          });
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
             resultItems: shownRows.map((row) => rowToChatApiItem(row)),
             qr: [],
             viewerOverview: "areaTotal",
             viewerFocus: resolved.area.name,
+            followUps: polished.followUps,
           });
         } catch {
           /* abort / nuevo mensaje */
@@ -10067,17 +12123,35 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (resolved.status === "resolved_person") {
         pendingDisambiguationRef.current = null;
         try {
-          const { reply: localReply, shownRows } = buildExactPersonReply(
+          const { reply: fallbackReply, shownRows } = buildExactPersonReply(
             resolved.person,
             resolved.limit,
           );
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "personTotal",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackReply,
+            facts: {
+              persona: resolved.person.name,
+              total: resolved.person.rows.length,
+              activos: resolved.person.activos,
+              samples: shownRows.slice(0, 5).map((row) => ({
+                etiqueta: String(row.etiqueta ?? "").trim(),
+                articulo: String(row.articulo ?? "").trim(),
+                area: String(row.area ?? "").trim(),
+              })),
+            },
+          });
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
             resultItems: shownRows.map((row) => rowToChatApiItem(row)),
             qr: [],
             viewerOverview: "personTotal",
             viewerFocus: resolved.person.name,
+            followUps: polished.followUps,
           });
         } catch {
           /* abort / nuevo mensaje */
@@ -10151,6 +12225,371 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       pendingDisambiguationRef.current = null;
     }
 
+    // Consultas de lectura → n8n (local solo escribe / Excel / QR / confirmaciones).
+    {
+      // Default híbrido: local. Solo n8n-first si CHAT_CONSULTAS=n8n.
+      const preferN8nConsultas =
+        String(process.env.NEXT_PUBLIC_CHAT_CONSULTAS || "local")
+          .trim()
+          .toLowerCase() === "n8n";
+      const keepLocal = shouldKeepLocalWritePipeline(
+        intentText || userText || text,
+        items,
+        { pendingNewInventario: Boolean(pendingNewInventarioRef.current) },
+      );
+      if (preferN8nConsultas && !keepLocal) {
+        const memoryBlock = [
+          formatChatMemoryForPrompt(),
+          resolvedTurn.threadHint,
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+        const threadFocus: N8nThreadFocus = {};
+        for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+          const m = chatHistory[i];
+          if (m.from !== "bot") continue;
+          const focus = String(m.viewerFocus || "").trim();
+          const ov = m.viewerOverview;
+          if (focus) {
+            threadFocus.focus = focus;
+            if (ov === "personTotal" || ov === "personMatches") {
+              threadFocus.persona = focus;
+            } else if (ov === "areaTotal" || ov === "areaMatches") {
+              threadFocus.area = focus;
+            } else if (/^inventario\b/i.test(focus)) {
+              threadFocus.origen = focus;
+            }
+          }
+          if (ov) threadFocus.overview = ov;
+          break;
+        }
+        const recentUserBits = chatHistory
+          .filter((m) => m.from === "user")
+          .slice(-3)
+          .map((m) => String(m.text || "").trim())
+          .filter(Boolean);
+        const threadSummary = recentUserBits.length
+          ? recentUserBits.map((t, idx) => `${idx + 1}. ${t.slice(0, 160)}`).join(" | ")
+          : null;
+        const n8nMessage = memoryBlock
+          ? `${memoryBlock}\n\nUsuario: ${intentText}`
+          : intentText;
+        try {
+          const n8nRes = await enviarMensajeN8n(n8nMessage, sessionId, {
+            signal: controller.signal,
+            context: {
+              threadFocus,
+              lastUser: spokenText || userText || text,
+              threadSummary,
+            },
+          });
+          if (
+            requestGen !== chatRequestGenRef.current ||
+            controller.signal.aborted
+          ) {
+            return;
+          }
+          const panelAccion = pickMostrarPanelAccion(n8nRes.acciones);
+          ejecutarAcciones(
+            (n8nRes.acciones || []).filter((a) => a?.tipo !== "mostrar_panel"),
+          );
+          const panelSide = resolveN8nMostrarPanel(panelAccion, items);
+          let replyText =
+            (n8nRes.reply || "").trim() ||
+            "No obtuve respuesta del asistente n8n.";
+          recordTokenConsumption(null, userText || text, replyText);
+          await ensureTypingPause(replyText);
+          finishBotReply(sessionId, botId, replyText, {
+            resultItems: panelSide?.resultItems || [],
+            qr: [],
+            viewerOverview: panelSide?.viewerOverview,
+            viewerFocus: panelSide?.viewerFocus,
+          });
+          return;
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+          // n8n caído → DeepSeek (sin pasar por detectores locales de lectura).
+          try {
+            const data = await askInventoryChat(intentText, history, {
+              signal: controller.signal,
+              memory: memoryBlock,
+              model: activeLlmMeta.model,
+              sessionId: sessionId,
+            });
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted ||
+              data.error === "aborted"
+            ) {
+              return;
+            }
+            const replyText =
+              (data.reply || "").trim() ||
+              "No pude completar la consulta. Intenta de nuevo.";
+            recordTokenConsumption(data.usage, userText || text, replyText);
+            await ensureTypingPause(replyText);
+            finishBotReply(sessionId, botId, replyText, {
+              resultItems: data.items || [],
+              qr: data.qr || [],
+            });
+          } catch (err2) {
+            if (
+              (err2 instanceof DOMException && err2.name === "AbortError") ||
+              (err2 instanceof Error && err2.name === "AbortError")
+            ) {
+              return;
+            }
+            const fail =
+              "No pude contactar n8n ni el asistente local. Revisa la conexión.";
+            try {
+              await ensureTypingPause(fail);
+              finishBotReply(sessionId, botId, fail);
+            } catch {
+              /* abort */
+            }
+          }
+          return;
+        }
+      }
+    }
+
+    // 1b0-new-record. “cómo crear un registro en Inventario 5” (con pending o nombre).
+    {
+      const nRec = normalizeChatIntent(userText || text);
+      const wantsForm =
+        /\b(nuevo\s+registro|subir(le)?\s+(un\s+)?registro|opciones\s+a\s+llenar|como\s+crear|alta\s+(de\s+)?registro|llenar\s+(el\s+)?formulario)\b/.test(
+          nRec,
+        );
+      if (wantsForm) {
+        const origensNow = listExistingOrigens(items);
+        const named =
+          matchOrigenFromPrompt(userText || text, origensNow) ||
+          pendingNewInventarioRef.current?.name ||
+          undefined;
+        // “crealo” / crear inventario N en el mismo mensaje
+        const createAsk = detectCreateInventarioAsk(userText || text, origensNow);
+        const dest =
+          createAsk?.name ||
+          named ||
+          (/\binventarios?\s*\d+\b/.test(nRec)
+            ? matchOrigenFromPrompt(userText || text, [
+                ...origensNow,
+                `Inventario ${nRec.match(/\binventarios?\s*(\d+)\b/)?.[1] || ""}`,
+              ])
+            : undefined) ||
+          nextInventarioName(origensNow);
+        if (dest) {
+          try {
+            pendingNewInventarioRef.current = {
+              name: dest,
+              emptyOk: true,
+              askedAt: Date.now(),
+            };
+            setAddModalDestino(dest);
+            setIsAddModalOpen(true);
+            const ask =
+              `Perfecto: **${dest}** queda listo para altas. Te abrí el formulario de **nuevo registro**.\n\n` +
+              `Llena al menos **etiqueta** y **artículo**; también área, persona, marca, modelo, serie, cantidad y estado. ` +
+              `El destino/origen será **${dest}**. Si prefieres, escanea un QR o sube un Excel.`;
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          } catch {
+            /* abort */
+          }
+        }
+      }
+    }
+
+    // 1b0-catalog. “qué inventarios tenemos / cuál podemos crear”.
+    {
+      const nCat = normalizeChatIntent(userText || text);
+      const asksCatalog =
+        /\b(inventarios?)\b/.test(nCat) &&
+        /\b(tenemos|hay|existen|hechos|creados|cual|cuales|list|muestra|dime)\b/.test(
+          nCat,
+        ) &&
+        (/\b(crear|creamos|podremos|podemos|nuevo|siguiente)\b/.test(nCat) ||
+          /\b(tenemos|hay|existen|hechos|creados|cuales?\s+hay)\b/.test(nCat));
+      if (asksCatalog) {
+        try {
+          const existing = listExistingOrigens(items);
+          const counts = existing.map((origen) => ({
+            origen,
+            n: items.filter((r) => String(r.origen ?? "").trim() === origen)
+              .length,
+          }));
+          const next = nextInventarioName(existing);
+          const bits = counts
+            .map((c) => `**${c.origen}** (${c.n.toLocaleString("es-MX")})`)
+            .join(", ");
+          const localReply =
+            !items.length || counts.length === 0
+              ? pickChatVariant(
+                  [
+                    `En este momento **no hay inventarios**. El primero podría ser **${next}**: ¿lo creamos o importas un Excel?`,
+                    `Todavía no hay nada que listar. Si quieres, empezamos con **${next}** o subimos un archivo.`,
+                    `Ahora mismo el inventario está vacío. ¿Preparo **${next}** o cargas un Excel/CSV?`,
+                  ],
+                  "catalog-empty",
+                )
+              : pickChatVariant(
+                  [
+                    `Estos son los inventarios: ${bits}. En total **${items.length.toLocaleString("es-MX")}** registros. El siguiente disponible sería **${next}**.`,
+                    `Tienes ${bits}. **${items.length.toLocaleString("es-MX")}** fichas en total. ¿Creamos **${next}**, importamos ahí o agregamos un registro?`,
+                  ],
+                  "catalog-list",
+                );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply);
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b0-excel. “dame su excel” / “excel del Inventario 5” — respeta hilo (persona/área).
+    {
+      const excelAsk = detectExcelExportAsk(intentText || userText || text);
+      if (excelAsk) {
+        try {
+          const resolved = resolveExcelExportSource({
+            userText: userText || text,
+            excelAsk,
+            inventory: items,
+            chatHistory,
+            messages: messagesRef.current,
+            lastConcrete: lastConcreteSideRef.current,
+          });
+          let sourceRows = resolved.rows;
+          let focusName = resolved.focusName;
+          // Solo dump genérico si NO hay anáfora/foco de hilo.
+          if (
+            !sourceRows.length &&
+            !excelAsk.origen &&
+            !excelAsk.fromContext &&
+            !resolved.usedThread
+          ) {
+            sourceRows = items.slice(0, 500);
+            focusName = focusName || "consulta";
+          }
+          if (!sourceRows.length) {
+            const ask = resolved.usedThread
+              ? "No encontré registros de esa persona/área en el hilo para armar el Excel. Nombra a la persona o el inventario."
+              : "No hay registros para armar el Excel. Dime persona, área o inventario.";
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const files =
+            excelAsk.count <= 1
+              ? [
+                  await buildInventarioExcelFile(sourceRows, {
+                    focus: focusName || excelAsk.theme || "consulta",
+                  }),
+                ]
+              : await buildInventarioExcelFiles(
+                  splitRowsForExcelGroups(
+                    sourceRows,
+                    excelAsk.count,
+                    excelAsk.theme,
+                  ).map((g, idx) => ({
+                    rows: g.rows,
+                    focus:
+                      g.focus ||
+                      (focusName
+                        ? `${focusName} ${idx + 1}`
+                        : `Inventario ${idx + 1}`),
+                    index: idx + 1,
+                  })),
+                );
+          const localReply = buildExcelExportReply(files);
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, { exportFiles: files });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b0-origen-field. “áreas / personas del Inventario 5”.
+    {
+      const fieldAsk = detectOrigenFieldAsk(userText || text, items);
+      if (fieldAsk) {
+        try {
+          const sourceRows = items.filter(
+            (row) => String(row.origen ?? "").trim() === fieldAsk.origen,
+          );
+          if (!sourceRows.length) {
+            const ask = `**${fieldAsk.origen}** aún no tiene registros para desglosar.`;
+            recordTokenConsumption(null, userText || text, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const fallbackReply = formatScopedListFieldReply(
+            sourceRows,
+            fieldAsk.field,
+          );
+          const overviewForField: ViewerOverview =
+            fieldAsk.field === "area"
+              ? "areas"
+              : fieldAsk.field === "persona"
+                ? "personas"
+                : "estado";
+          recordTokenConsumption(null, userText || text, fallbackReply);
+          await ensureTypingPause(fallbackReply);
+          finishBotReply(sessionId, botId, fallbackReply, {
+            resultItems: sourceRows
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: overviewForField,
+            viewerFocus: fieldAsk.origen,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b0-origen. “qué hay en el Inventario 1” → listado por origen (no área).
+    {
+      const origenBrowse = detectOrigenBrowseAsk(userText || text, items);
+      if (origenBrowse) {
+        try {
+          const { reply: localReply, shownRows } = buildOrigenBrowseReply(
+            origenBrowse.origen,
+            items,
+            origenBrowse.limit,
+          );
+          recordTokenConsumption(null, userText || text, localReply);
+          await ensureTypingPause(localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: shownRows.length ? "recent" : undefined,
+            viewerFocus: origenBrowse.origen,
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
     // 1b. Personas de un inventario concreto (Inventario 1…) — texto, sin visor.
     {
       const origenPeople = detectOrigenPersonasAsk(userText || text, items);
@@ -10163,6 +12602,87 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           return;
         } catch {
           /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b-copy-all. “mete al Inv 5 todos los registros de todos los demás” (antes que tag/persona).
+    {
+      const mergeAsk = detectBulkCopyAllOthersToInventarioAsk(
+        intentText,
+        listExistingOrigens(items),
+      );
+      if (mergeAsk) {
+        try {
+          const foldOrig = (o: string) =>
+            o
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/\p{M}/gu, "")
+              .replace(/\s+/g, " ")
+              .trim();
+          const destFold = foldOrig(mergeAsk.dest);
+          const destEtq = new Set(
+            items
+              .filter((row) => foldOrig(String(row.origen ?? "")) === destFold)
+              .map((row) => String(row.etiqueta ?? "").trim().toLowerCase())
+              .filter(Boolean),
+          );
+          const breakdown = mergeAsk.sources.map((source) => {
+            const sourceFold = foldOrig(source);
+            const rows = items.filter(
+              (row) =>
+                foldOrig(String(row.origen ?? "")) === sourceFold &&
+                String(row.etiqueta ?? "").trim(),
+            );
+            const seen = new Set<string>();
+            let willCopy = 0;
+            let already = 0;
+            for (const row of rows) {
+              const key = String(row.etiqueta ?? "").trim().toLowerCase();
+              if (!key || seen.has(key)) continue;
+              seen.add(key);
+              if (destEtq.has(key)) already += 1;
+              else willCopy += 1;
+            }
+            return { source, total: seen.size, willCopy, already };
+          });
+          const totalCopy = breakdown.reduce((a, b) => a + b.willCopy, 0);
+          const totalAlready = breakdown.reduce((a, b) => a + b.already, 0);
+          const lines = breakdown
+            .map(
+              (b) =>
+                `• **${b.source}**: ${b.total.toLocaleString("es-MX")} registros` +
+                (b.willCopy
+                  ? ` → copiaría **${b.willCopy.toLocaleString("es-MX")}** nuevos`
+                  : " → nada nuevo") +
+                (b.already
+                  ? ` (omite ${b.already.toLocaleString("es-MX")} que ya están en el destino)`
+                  : ""),
+            )
+            .join("\n");
+          pendingOrigenMergeRef.current = {
+            dest: mergeAsk.dest,
+            sources: mergeAsk.sources,
+            askedAt: Date.now(),
+          };
+          const ask =
+            `Entendido: quieres concentrar en **${mergeAsk.dest}** todo lo que hay en los demás inventarios.\n\n` +
+            `Voy a meter (copiar) registros desde:\n${lines}\n\n` +
+            `En total serían **${totalCopy.toLocaleString("es-MX")}** altas nuevas` +
+            (totalAlready
+              ? ` y **${totalAlready.toLocaleString("es-MX")}** etiquetas se omitirían porque ya existen en **${mergeAsk.dest}**`
+              : "") +
+            `.\n\n` +
+            `No borro los inventarios de origen: solo se **copian** al destino.\n\n` +
+            `¿Lo confirmo?\n` +
+            `Responde **sí** / **confirmo** para ejecutarlo, o **no** para cancelar.`;
+          recordTokenConsumption(null, spokenText, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        } catch {
+          /* abort */
         }
       }
     }
@@ -10881,6 +13401,38 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ? detectFillNewInventarioAsk(prompt, pending, origensNow)
           : undefined;
 
+      // Crear + “nuevo registro / opciones a llenar” → inventario listo + modal de alta.
+      const wantsNewRecordForm =
+        /\b(nuevo\s+registro|subir(le)?\s+(un\s+)?registro|opciones\s+a\s+llenar|como\s+crear|alta\s+(de\s+)?registro|llenar\s+(el\s+)?formulario)\b/.test(
+          normalizeChatIntent(prompt),
+        );
+
+      if (createAsk && wantsNewRecordForm) {
+        try {
+          pendingNewInventarioRef.current = {
+            name: createAsk.name,
+            emptyOk: true,
+            askedAt: Date.now(),
+          };
+          setAddModalDestino(createAsk.name);
+          setIsAddModalOpen(true);
+          const ask =
+            `Listo: **${createAsk.name}** queda preparado. Te abrí el formulario de **nuevo registro** con destino **${createAsk.name}**.\n\n` +
+            `Campos a llenar:\n` +
+            `- **Etiqueta** (obligatoria)\n` +
+            `- **Artículo**, marca, modelo, serie\n` +
+            `- **Área** y **persona**\n` +
+            `- **Cantidad**, estado, observaciones\n\n` +
+            `También puedes escanear un **QR** o importar un Excel/CSV. Al guardar, el origen será **${createAsk.name}**.`;
+          recordTokenConsumption(null, prompt, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+
       // Creación sin contenido en el mismo mensaje → preguntar qué meter.
       if (createAsk && (!fill || fill.kind === "unclear")) {
         try {
@@ -11016,6 +13568,245 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
+    // 1b0--. “esos 10 / últimos: ¿en qué áreas/personas?” → agregar del listado.
+    {
+      const fieldAsk = detectScopedListFieldAsk(userText || text);
+      if (fieldAsk && items.length) {
+        try {
+          let sourceRows = contextRowsForDelete();
+          // Si no hay listado en el hilo pero hablan de “últimos”, usa los 10 recientes.
+          if (
+            !sourceRows.length &&
+            /\b(ultimos?|recientes?)\b/i.test(userText || text)
+          ) {
+            sourceRows = getRecentInventoryRows(items, 10, false);
+          }
+          if (!sourceRows.length) {
+            const ask =
+              `Para decirte en qué **${
+                fieldAsk.field === "area"
+                  ? "áreas"
+                  : fieldAsk.field === "persona"
+                    ? "personas"
+                    : fieldAsk.field === "origen"
+                      ? "inventarios"
+                      : "estados"
+              }** están, necesito el listado de arriba. Pide primero «últimos registros» (o una búsqueda) y vuelve a preguntar.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const fallbackReply = formatScopedListFieldReply(
+            sourceRows,
+            fieldAsk.field,
+          );
+          const groups = aggregateFieldCounts(sourceRows, fieldAsk.field);
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "scoped_list_field",
+            threadHint:
+              resolvedTurn.threadHint ||
+              `Hilo: áreas/campos del listado actual (${sourceRows.length}).`,
+            fallback: fallbackReply,
+            facts: {
+              field: fieldAsk.field,
+              list_count: sourceRows.length,
+              groups: groups.slice(0, 10).map((g) => ({
+                name: g.name,
+                count: g.count,
+                samples: g.samples,
+              })),
+              plantilla_sugerida: fallbackReply,
+              tono: "claro_conversacional",
+            },
+          });
+          const overviewForField: ViewerOverview =
+            fieldAsk.field === "area"
+              ? "areas"
+              : fieldAsk.field === "persona"
+                ? "personas"
+                : fieldAsk.field === "estado"
+                  ? "estado"
+                  : "recent";
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
+            resultItems: sourceRows
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: overviewForField,
+            followUps: polished.followUps,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b0-. “¿es de los últimos?” → sí/no del registro del hilo (no listar 10).
+    {
+      if (detectIsAmongRecentAsk(userText || text) && items.length) {
+        try {
+          const focusEt =
+            resolveThreadFocusEtiqueta(
+              userText || text,
+              messagesRef.current,
+              lastConcreteSideRef.current?.resultItems || null,
+            ) || "";
+          if (!focusEt) {
+            const ask =
+              `¿Te refieres a alguna etiqueta en concreto? Dime el código (ej. **272949**) o pídeme primero el registro, y te digo si está entre los últimos.`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const limit = 10;
+          const recent = getRecentInventoryRows(items, limit, false);
+          const focusKey = focusEt.toLowerCase();
+          const idx = recent.findIndex(
+            (r) =>
+              String(r.etiqueta ?? "").trim().toLowerCase() === focusKey,
+          );
+          const focusRows = items.filter(
+            (r) =>
+              String(r.etiqueta ?? "").trim().toLowerCase() === focusKey,
+          );
+          const sample = focusRows[0];
+          const art = String(sample?.articulo ?? "").trim();
+          const label = art ? `**${focusEt}** (${art})` : `**${focusEt}**`;
+          const topBrief = recent
+            .slice(0, 3)
+            .map((r) => {
+              const et = String(r.etiqueta ?? "").trim() || "S/E";
+              const a = String(r.articulo ?? "").trim() || "—";
+              return `**${et}** (${a})`;
+            })
+            .join(", ");
+          const fallbackReply =
+            idx >= 0
+              ? pickChatVariant(
+                  [
+                    `Sí: ${label} está entre los **${limit}** más recientes (lugar **${idx + 1}**). ¿Quieres ver el listado completo o generar QR?`,
+                    `Correcto: ${label} sí aparece en los últimos **${limit}** movimientos (posición **${idx + 1}**). ¿Seguimos con otra consulta?`,
+                    `Así es: ${label} forma parte de los registros más nuevos (puesto **${idx + 1}** de ${limit}). ¿Lo abro en el panel?`,
+                  ],
+                  focusEt,
+                )
+              : pickChatVariant(
+                  [
+                    `No: ${label} **no** está entre los **${limit}** registros más recientes. Ahora encabezan ${topBrief}. ¿Quieres que te muestre esos ${limit} o seguimos con ${focusEt}?`,
+                    `No coincide: ${label} no sale en los últimos **${limit}**. Los más nuevos empiezan con ${topBrief}. ¿Vemos el listado reciente o algo más de esta etiqueta?`,
+                    `Esa etiqueta no está en el top **${limit}** reciente. ${label} es del hilo anterior; los movimientos más nuevos son ${topBrief}. ¿Qué hacemos?`,
+                  ],
+                  focusEt,
+                );
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "among_recent",
+            threadHint:
+              resolvedTurn.threadHint ||
+              `Hilo: pregunta si ${focusEt} está entre los últimos ${limit}.`,
+            fallback: fallbackReply,
+            facts: {
+              etiqueta: focusEt,
+              articulo: art,
+              among_recent: idx >= 0,
+              position: idx >= 0 ? idx + 1 : null,
+              limit,
+              top_sample: recent.slice(0, 3).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+              })),
+              plantilla_sugerida: fallbackReply,
+              tono: "claro_conversacional",
+            },
+          });
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
+            resultItems: (idx >= 0 ? [recent[idx]] : focusRows.length ? focusRows : recent)
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: idx >= 0 ? "recent" : undefined,
+            followUps: polished.followUps,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b0-excl. “que no sea recientes” / “no los últimos” → otro N del hilo.
+    {
+      const excludeAsk = detectExcludeRecentRefineAsk(userText || text);
+      if (excludeAsk && items.length) {
+        try {
+          const prevCount =
+            lastConcreteSideRef.current?.resultItems?.length ||
+            parseRequestedCount(
+              [...messagesRef.current]
+                .reverse()
+                .find((m) => m.from === "user" && m.id !== userId)?.text ||
+                "",
+            ) ||
+            excludeAsk.limit;
+          const limit = Math.max(
+            1,
+            Math.min(50, excludeAsk.limit || Number(prevCount) || 10),
+          );
+          const excludeN = Math.max(
+            limit,
+            Number(lastConcreteSideRef.current?.resultItems?.length) || 10,
+          );
+          const rows = getNonRecentInventoryRows(items, limit, excludeN);
+          const fallbackReply = buildNonRecentRecordsReply(
+            rows,
+            { limit },
+            { userText: userText || text },
+          );
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "recent",
+            threadHint:
+              (resolvedTurn.threadHint || "") +
+              " | Usuario pidió registros que NO sean los más recientes; respeta el hilo.",
+            fallback: fallbackReply,
+            facts: {
+              limit,
+              exclude_recent: excludeN,
+              count: rows.length,
+              samples: rows.slice(0, 5).map((row) => ({
+                etiqueta: String(row.etiqueta ?? "").trim(),
+                articulo: String(row.articulo ?? "").trim(),
+                area: String(row.area ?? "").trim(),
+                persona: String(row.persona ?? "").trim(),
+              })),
+            },
+          });
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
+            resultItems: rows.map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: limit === 1 ? undefined : "recent",
+            followUps: polished.followUps,
+          });
+          return;
+        } catch {
+          /* abort / nuevo mensaje */
+        }
+      }
+    }
+
     // 1b0. Último / recientes (global) — antes del follow-up de área/persona.
     {
       const recentAsk = detectRecentRecordsAsk(userText || text);
@@ -11026,13 +13817,34 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             recentAsk.limit,
             recentAsk.soloHoy,
           );
-          const localReply = buildRecentRecordsReply(rows, recentAsk);
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
+          const fallbackReply = buildRecentRecordsReply(rows, recentAsk, {
+            userText: userText || text,
+          });
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "recent",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackReply,
+            facts: {
+              limit: recentAsk.limit,
+              solo_hoy: recentAsk.soloHoy,
+              count: rows.length,
+              samples: rows.slice(0, 5).map((row) => ({
+                etiqueta: String(row.etiqueta ?? "").trim(),
+                articulo: String(row.articulo ?? "").trim(),
+                area: String(row.area ?? "").trim(),
+                persona: String(row.persona ?? "").trim(),
+              })),
+            },
+          });
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
             resultItems: rows.map((row) => rowToChatApiItem(row)),
             qr: [],
             viewerOverview: recentAsk.limit === 1 ? undefined : "recent",
+            followUps: polished.followUps,
           });
           return;
         } catch {
@@ -11041,15 +13853,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 1b1-origen. “etiqueta 283586 de qué inventario venía / antes”.
+    // 1b1-origen. “etiqueta 283586 en qué inventarios / de dónde venía”.
     {
-      const origenAsk = detectEtiquetaOrigenAsk(intentText, items);
+      const origenAsk = detectEtiquetaOrigenAsk(
+        intentText || userText || text,
+        items,
+      );
       if (origenAsk) {
         try {
           const localReply = buildEtiquetaOrigenReply(origenAsk, items);
           recordTokenConsumption(null, spokenText, localReply);
           await ensureTypingPause(localReply);
-          // Una ficha por inventario/origen, ordenadas (Inv 1, Inv 2…).
           const byOrigen = new Map<string, InventarioRow>();
           for (const row of origenAsk.rows) {
             const key = String(row.origen ?? "").trim() || "Sin origen";
@@ -11067,6 +13881,44 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             qr: [],
             viewerOverview: undefined,
             viewerFocus: undefined,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
+    // 1b1-origen-persona. “en qué inventarios está María Elena / esa persona”.
+    {
+      const personInvAsk = detectPersonInventariosAsk(
+        intentText || userText || text,
+        items,
+        chatHistory,
+      );
+      if (personInvAsk) {
+        try {
+          const localReply = buildPersonInventariosReply(personInvAsk);
+          recordTokenConsumption(null, spokenText, localReply);
+          await ensureTypingPause(localReply);
+          const byOrigen = new Map<string, InventarioRow>();
+          for (const row of personInvAsk.rows) {
+            const key = String(row.origen ?? "").trim() || "Sin origen";
+            if (!byOrigen.has(key)) byOrigen.set(key, row);
+          }
+          const sideRows = [...byOrigen.values()].sort(
+            (a, b) =>
+              origenCurrencyRank(String(a.origen ?? "")) -
+              origenCurrencyRank(String(b.origen ?? "")),
+          );
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: (sideRows.length
+              ? sideRows
+              : personInvAsk.rows.slice(0, 80)
+            ).map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: sideRows.length ? undefined : "personTotal",
+            viewerFocus: personInvAsk.person,
           });
           return;
         } catch {
@@ -11135,6 +13987,119 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     // 1b1. Diff real entre inventarios (antes de áreas: “comparar” ≠ “Compras”).
     {
       const origens = listExistingOrigens(items);
+      const scopedCompare = detectCompareScopedListAsk(intentText, origens);
+      if (scopedCompare) {
+        try {
+          const priorItems =
+            lastConcreteSideRef.current?.resultItems ||
+            [...messagesRef.current]
+              .reverse()
+              .find(
+                (m) =>
+                  m.from === "bot" &&
+                  Array.isArray(m.resultItems) &&
+                  m.resultItems.length > 0,
+              )?.resultItems ||
+            [];
+          const sourceRows: InventarioRow[] = [];
+          const seenEt = new Set<string>();
+          for (const it of priorItems) {
+            const et = String(it.etiqueta ?? "").trim().toLowerCase();
+            if (!et || seenEt.has(et)) continue;
+            seenEt.add(et);
+            const hit =
+              items.find(
+                (r) =>
+                  Number(r.id) === Number(it.id) &&
+                  it.id != null &&
+                  !Number.isNaN(Number(it.id)),
+              ) ||
+              items.find(
+                (r) =>
+                  String(r.etiqueta ?? "").trim().toLowerCase() === et &&
+                  (!it.origen ||
+                    String(r.origen ?? "").trim() === String(it.origen).trim()),
+              ) ||
+              items.find(
+                (r) => String(r.etiqueta ?? "").trim().toLowerCase() === et,
+              );
+            if (hit) sourceRows.push(hit);
+          }
+          if (!sourceRows.length) {
+            const ask =
+              `Para comparar **esta consulta** con **${scopedCompare.dest}** necesito el listado de arriba. ` +
+              `Pide primero unos registros (p. ej. últimos registros o una persona) y luego dime ` +
+              `«compáralos con ${scopedCompare.dest}».`;
+            recordTokenConsumption(null, spokenText, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+          const diff = diffRowsAgainstInventario(
+            sourceRows,
+            scopedCompare.dest,
+            items,
+            "este listado",
+          );
+          const fallbackReply = formatInventarioDiffReply(diff);
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "compare_scoped",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackReply,
+            facts: {
+              scope: "listado_actual",
+              list_count: sourceRows.length,
+              dest: scopedCompare.dest,
+              iguales: diff.same.length,
+              faltan_en_destino: diff.onlyLeft.length,
+              sobran: 0,
+              cambiaron: new Set(
+                diff.changed.map((c) => c.etiqueta.toLowerCase()),
+              ).size,
+              veredicto:
+                !diff.onlyLeft.length && !diff.changed.length
+                  ? "todas_coinciden"
+                  : diff.onlyLeft.length && !diff.same.length
+                    ? "ninguna_en_destino"
+                    : "parcial",
+              tono: "claro_conversacional",
+              plantilla_sugerida: fallbackReply,
+              faltan_sample: diff.onlyLeft.slice(0, 5).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+              })),
+            },
+          });
+          const sideRows = [
+            ...diff.onlyLeft,
+            ...diff.same,
+            ...diff.changed
+              .map((c) =>
+                items.find(
+                  (row) =>
+                    Number(row.id) === Number(c.rightId) ||
+                    Number(row.id) === Number(c.leftId),
+                ),
+              )
+              .filter(Boolean),
+          ] as InventarioRow[];
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
+            resultItems: sideRows
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            followUps: polished.followUps,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+
       const compare = detectCompareInventariosAsk(intentText, origens);
       const wantsCompare =
         /\b(compara|comparar|comparacion|diff|diferencia|diferencias)\b/i.test(
@@ -11144,20 +14109,68 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         try {
           if (!compare || origens.length < 1) {
             const ask =
-              `Para comparar necesito al menos un inventario con datos. ` +
-              `Ahora veo: ${
-                origens.length
-                  ? origens.map((o) => `**${o}**`).join(", ")
-                  : "ningún origen cargado"
-              }. ` +
-              `Importa otro Excel o dime p. ej. **compara Inventario 1 vs Inventario 2**.`;
+              origens.length < 1
+                ? pickChatVariant(
+                    [
+                      "En este momento **no hay inventarios** con los que empezar a comparar. Cuando importes o crees uno (por ejemplo **Inventario 1**), lo vemos juntos.",
+                      "Ahora mismo el inventario está vacío: no hay nada que comparar. ¿Importamos un Excel o creamos un inventario nuevo?",
+                      "Todavía no existe un inventario para comparar. Si quieres, empezamos creando uno o cargando un archivo.",
+                    ],
+                    "compare-empty-none",
+                  )
+                : pickChatVariant(
+                    [
+                      `Claro. Dime los dos, por ejemplo: **compara Inventario 1 vs Inventario 4**. Ahora tengo: ${origens.map((o) => `**${o}**`).join(", ")}.`,
+                      `Para comparar, nómbrame ambos inventarios (ej. **Inventario 1** y **Inventario 4**). Disponibles: ${origens.map((o) => `**${o}**`).join(", ")}.`,
+                      `¿Cuáles quieres comparar? Puedo usar, por ejemplo, ${origens
+                        .slice(0, 3)
+                        .map((o) => `**${o}**`)
+                        .join(" y ")}${origens.length > 3 ? "…" : ""}.`,
+                    ],
+                    "compare-empty-need-pair",
+                  );
             recordTokenConsumption(null, spokenText, ask);
             await ensureTypingPause(ask);
             finishBotReply(sessionId, botId, ask);
             return;
           }
           const diff = diffInventarios(items, compare.left, compare.right);
-          const localReply = formatInventarioDiffReply(diff);
+          const fallbackReply = formatInventarioDiffReply(diff);
+          const polished = await polishInventoryReply({
+            userText: userText || text,
+            sessionId: sessionId,
+            kind: "compare",
+            threadHint: resolvedTurn.threadHint || "",
+            fallback: fallbackReply,
+            facts: {
+              left: diff.left,
+              right: diff.right,
+              left_count: diff.leftCount,
+              right_count: diff.rightCount,
+              iguales: diff.same.length,
+              faltan: diff.onlyLeft.length,
+              sobran: diff.onlyRight.length,
+              cambiaron: new Set(
+                diff.changed.map((c) => c.etiqueta.toLowerCase()),
+              ).size,
+              veredicto:
+                !diff.onlyLeft.length &&
+                !diff.onlyRight.length &&
+                !diff.changed.length
+                  ? "todas_coinciden"
+                  : "parcial",
+              tono: "claro_conversacional",
+              plantilla_sugerida: fallbackReply,
+              faltan_sample: diff.onlyLeft.slice(0, 5).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+              })),
+              sobran_sample: diff.onlyRight.slice(0, 5).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+              })),
+            },
+          });
           const sideRows = [
             ...diff.onlyLeft,
             ...diff.onlyRight,
@@ -11181,11 +14194,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             uniqueSide.push(row);
             if (uniqueSide.length >= 80) break;
           }
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
+          recordTokenConsumption(null, userText || text, polished.reply);
+          await ensureTypingPause(polished.reply);
+          finishBotReply(sessionId, botId, polished.reply, {
             resultItems: uniqueSide.map((row) => rowToChatApiItem(row)),
             qr: [],
+            followUps: polished.followUps,
           });
           return;
         } catch {
@@ -11453,18 +14467,36 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (personQuery.candidates.length === 1) {
         const singlePerson = personQuery.candidates[0];
         try {
-          const { reply: localReply, shownRows } = buildExactPersonReply(
-            singlePerson,
-            personQuery.limit,
-          );
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply, {
-            resultItems: shownRows.map((row) => rowToChatApiItem(row)),
-            qr: [],
-            viewerOverview: "personTotal",
-            viewerFocus: singlePerson.name,
-          });
+          const wantsEtq = looksLikePersonEtiquetasAsk(userText || text);
+          if (wantsEtq) {
+            const allRows = singlePerson.rows;
+            const localReply =
+              `**${singlePerson.name}** tiene **${allRows.length.toLocaleString("es-MX")}** etiqueta` +
+              `${allRows.length === 1 ? "" : "s"} en total.\n\n` +
+              `El listado completo está en el visor derecho.`;
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: allRows
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerFocus: singlePerson.name,
+            });
+          } else {
+            const { reply: localReply, shownRows } = buildExactPersonReply(
+              singlePerson,
+              personQuery.limit,
+            );
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: shownRows.map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview: "personTotal",
+              viewerFocus: singlePerson.name,
+            });
+          }
         } catch {
           /* abort / nuevo mensaje */
         }
@@ -11694,99 +14726,30 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 5a0. Excel/CSV descargable con nombre referente a la consulta.
+    // 5a0. Excel (mismo criterio de hilo que 1b0-excel; por si no se atrapó antes).
     {
       const excelAsk = detectExcelExportAsk(intentText || userText || text);
       if (excelAsk) {
         try {
-          const foldOrig = (o: string) =>
-            o
-              .toLowerCase()
-              .normalize("NFD")
-              .replace(/\p{M}/gu, "")
-              .replace(/\s+/g, " ")
-              .trim();
-
-          let sourceRows: InventarioRow[] = [];
-          let focusName: string | null = null;
-
-          // Prioridad 1: “excel del Inventario 3” → TODAS las filas de ese origen.
-          if (excelAsk.origen) {
-            const want = foldOrig(excelAsk.origen);
-            const existing = listExistingOrigens(items);
-            const canon =
-              existing.find((o) => foldOrig(o) === want) ||
-              existing.find((o) => foldOrig(o).includes(want)) ||
-              excelAsk.origen;
-            sourceRows = items.filter(
-              (row) => foldOrig(String(row.origen ?? "")) === foldOrig(canon),
-            );
-            focusName = canon;
+          const resolved = resolveExcelExportSource({
+            userText: userText || text,
+            excelAsk,
+            inventory: items,
+            chatHistory,
+            messages: messagesRef.current,
+            lastConcrete: lastConcreteSideRef.current,
+          });
+          let sourceRows = resolved.rows;
+          let focusName = resolved.focusName;
+          if (
+            !sourceRows.length &&
+            !excelAsk.origen &&
+            !excelAsk.fromContext &&
+            !resolved.usedThread
+          ) {
+            sourceRows = items.slice(0, 500);
+            focusName = focusName || "consulta";
           }
-
-          // Prioridad 2: consulta/persona/área previa (solo si NO pidió Inventario N).
-          if (!sourceRows.length && !excelAsk.origen) {
-            const prevItems =
-              lastBotResultItems(messagesRef.current).length > 0
-                ? lastBotResultItems(messagesRef.current)
-                : lastConcreteSideRef.current?.resultItems || [];
-            const prevFocus =
-              lastBotViewerFocus(messagesRef.current) ||
-              lastConcreteSideRef.current?.viewerFocus ||
-              null;
-            if (excelAsk.fromContext && prevItems.length) {
-              sourceRows = chatApiItemsToRows(prevItems, items);
-              focusName = prevFocus;
-            }
-
-            const catalog = getAllPersonCatalog(items);
-            const named =
-              detectPersonTotalAsk(userText || text, items, chatHistory) ||
-              findPersonInText(userText || text, items);
-            const focusCandidate =
-              named || (excelAsk.fromContext ? prevFocus : null);
-            if (focusCandidate) {
-              const exact =
-                catalog.find((p) => p.name === focusCandidate) ||
-                catalog.find((p) =>
-                  normalizeChatIntent(p.name).includes(
-                    normalizeChatIntent(focusCandidate),
-                  ),
-                ) ||
-                catalog.find((p) =>
-                  normalizeChatIntent(focusCandidate).includes(
-                    normalizeChatIntent(p.name),
-                  ),
-                );
-              if (exact?.rows?.length) {
-                sourceRows = exact.rows;
-                focusName = exact.name;
-              }
-            }
-
-            if (!sourceRows.length) {
-              const areaHit = matchAreaFromPrompt(userText || text, items);
-              if (areaHit) {
-                sourceRows = items.filter((row) =>
-                  areaMatchesNeedle(String(row.area ?? ""), areaHit),
-                );
-                focusName = areaHit;
-              }
-            }
-
-            if (!sourceRows.length && excelAsk.theme) {
-              const needle = normalizeChatIntent(excelAsk.theme);
-              sourceRows = items.filter((row) =>
-                normalizeChatIntent(String(row.area ?? "")).includes(needle),
-              );
-            }
-            if (!sourceRows.length && excelAsk.fromContext && prevItems.length) {
-              sourceRows = chatApiItemsToRows(prevItems, items);
-              focusName = prevFocus;
-            }
-            if (!sourceRows.length) sourceRows = items.slice(0, 500);
-          }
-
           if (!sourceRows.length) {
             const ask =
               "No hay registros para armar el Excel. Primero consulta una persona/área o dime qué inventario quieres exportar.";
@@ -11809,7 +14772,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               excelAsk.count,
               excelAsk.theme,
             );
-            // Si el tema es Oficina y no hay focus por persona, forzar nombres Oficina N.
             files = await buildInventarioExcelFiles(
               groups.map((g, idx) => ({
                 rows: g.rows,
@@ -11828,7 +14790,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           const localReply = buildExcelExportReply(files);
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
-          // Solo tarjeta Excel: no abrir/actualizar el visor derecho.
           finishBotReply(sessionId, botId, localReply, {
             exportFiles: files,
           });
@@ -11984,26 +14945,22 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           userText || text,
         );
         if (localReply) {
-          const openPanel = shouldAttachSidePanel(
-            userText || text,
-            items,
-            chatHistory,
-          );
+          const openPanel =
+            shouldAttachSidePanel(userText || text, items, chatHistory) ||
+            earlyOverview === "personas" ||
+            earlyOverview === "areas" ||
+            earlyOverview === "estado" ||
+            earlyOverview === "marcas" ||
+            earlyOverview === "stats" ||
+            earlyOverview === "full";
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
-          finishBotReply(
-            sessionId,
-            botId,
-            localReply,
-            openPanel
-              ? {
-                  resultItems: [],
-                  qr: [],
-                  viewerOverview: earlyOverview,
-                  viewerFocus: overviewFocus,
-                }
-              : undefined,
-          );
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: [],
+            qr: [],
+            viewerOverview: earlyOverview,
+            viewerFocus: overviewFocus,
+          });
           return;
         }
       } catch {
@@ -12011,13 +14968,99 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    const data = await askInventoryChat(intentText, history, {
-      signal: controller.signal,
-      memory: [formatChatMemoryForPrompt(), resolvedTurn.threadHint]
-        .filter(Boolean)
-        .join("\n\n"),
-      model: activeLlmMeta.model,
-    });
+    // Consultas abiertas (sin detector local): n8n o DeepSeek.
+    // Detectores de arriba ya llenaron panel cuando aplica (híbrido).
+    const preferN8n =
+      String(process.env.NEXT_PUBLIC_CHAT_FALLBACK || "n8n")
+        .trim()
+        .toLowerCase() !== "deepseek";
+    const memoryBlock = [formatChatMemoryForPrompt(), resolvedTurn.threadHint]
+      .filter(Boolean)
+      .join("\n\n");
+    const fallbackThreadFocus: N8nThreadFocus = {};
+    for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+      const m = chatHistory[i];
+      if (m.from !== "bot") continue;
+      const focus = String(m.viewerFocus || "").trim();
+      const ov = m.viewerOverview;
+      if (focus) {
+        fallbackThreadFocus.focus = focus;
+        if (ov === "personTotal" || ov === "personMatches") {
+          fallbackThreadFocus.persona = focus;
+        } else if (ov === "areaTotal" || ov === "areaMatches") {
+          fallbackThreadFocus.area = focus;
+        } else if (/^inventario\b/i.test(focus)) {
+          fallbackThreadFocus.origen = focus;
+        }
+      }
+      if (ov) fallbackThreadFocus.overview = ov;
+      break;
+    }
+    let data: ChatApiResponse = {};
+    let viaN8n = false;
+    let n8nPanelSide: ReturnType<typeof resolveN8nMostrarPanel> = null;
+    if (preferN8n) {
+      try {
+        const n8nMessage = memoryBlock
+          ? `${memoryBlock}\n\nUsuario: ${intentText}`
+          : intentText;
+        const n8nRes = await enviarMensajeN8n(n8nMessage, sessionId, {
+          signal: controller.signal,
+          context: {
+            threadFocus: fallbackThreadFocus,
+            lastUser: spokenText || userText || text,
+            threadSummary: chatHistory
+              .filter((m) => m.from === "user")
+              .slice(-3)
+              .map((m) => String(m.text || "").trim())
+              .filter(Boolean)
+              .map((t, idx) => `${idx + 1}. ${t.slice(0, 160)}`)
+              .join(" | "),
+          },
+        });
+        if (
+          requestGen !== chatRequestGenRef.current ||
+          controller.signal.aborted
+        ) {
+          return;
+        }
+        const panelAccion = pickMostrarPanelAccion(n8nRes.acciones);
+        ejecutarAcciones(
+          (n8nRes.acciones || []).filter((a) => a?.tipo !== "mostrar_panel"),
+        );
+        n8nPanelSide = resolveN8nMostrarPanel(panelAccion, items);
+        data = {
+          reply: n8nRes.reply,
+          items: n8nPanelSide?.resultItems || [],
+          qr: [],
+          mutated: false,
+          used: "n8n",
+          error: n8nRes.error || undefined,
+        };
+        viaN8n = true;
+      } catch (err) {
+        if (
+          (err instanceof DOMException && err.name === "AbortError") ||
+          (err instanceof Error && err.name === "AbortError")
+        ) {
+          return;
+        }
+        // n8n caído → DeepSeek sin romper el chat
+        data = await askInventoryChat(intentText, history, {
+          signal: controller.signal,
+          memory: memoryBlock,
+          model: activeLlmMeta.model,
+          sessionId: sessionId,
+        });
+      }
+    } else {
+      data = await askInventoryChat(intentText, history, {
+        signal: controller.signal,
+        memory: memoryBlock,
+        model: activeLlmMeta.model,
+        sessionId: sessionId,
+      });
+    }
     if (
       requestGen !== chatRequestGenRef.current ||
       controller.signal.aborted ||
@@ -12026,10 +15069,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
     reply = (data.reply || "").trim() || reply;
-    recordTokenConsumption(data.usage, userText || text, reply);
+    // Tokens DeepSeek solo cuando el turno fue por Backend-ia LLM.
+    recordTokenConsumption(viaN8n ? null : data.usage, userText || text, reply);
     sideItems = data.items || [];
     mutated = Boolean(data.mutated);
     qrPayloads = data.qr || [];
+    if (
+      n8nPanelSide?.resultItems?.length &&
+      !sideItems.length
+    ) {
+      sideItems = n8nPanelSide.resultItems;
+    }
 
     // Conservar listado para follow-ups aunque el panel no abra aún.
     if (sideItems.length || qrPayloads.length) {
@@ -12042,7 +15092,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     // Visor solo si el usuario lo pidió (dame/muestra/QR/persona/área) o hubo escritura.
     const forceSidePanel = wantsSidePanelShow(userText || text);
     let openSidePanel =
-      shouldAttachSidePanel(userText || text, items, chatHistory) || mutated;
+      shouldAttachSidePanel(userText || text, items, chatHistory) ||
+      mutated ||
+      Boolean(n8nPanelSide?.viewerOverview) ||
+      Boolean(n8nPanelSide?.resultItems?.length);
     // Si el backend ya dice que el listado está en el visor, abrirlo de verdad.
     if (
       !openSidePanel &&
@@ -12115,8 +15168,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     }
 
     // Pedido de VER: si aún no hay items, armar overview acertado (inventario/áreas…).
-    let forcedOverview: ViewerOverview | undefined;
+    let forcedOverview: ViewerOverview | undefined =
+      n8nPanelSide?.viewerOverview;
     if (
+      !forcedOverview &&
       forceSidePanel &&
       !sideItems.length &&
       !qrPayloads.length &&
@@ -12307,13 +15362,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ? undefined
           : askedOverview || forcedOverview;
     const viewerFocus =
-      overview === "personTotal" && focusPerson
+      n8nPanelSide?.viewerFocus ||
+      (overview === "personTotal" && focusPerson
         ? focusPerson
         : overview === "areaTotal" && focusArea
           ? focusArea
           : overview
             ? resolveOverviewFocus(userText || text, items)
-            : undefined;
+            : undefined);
     if (
       overview &&
       overview !== "areaTotal" &&
@@ -12541,6 +15597,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setPendingChatImportSafe(null);
     setPendingBulkTransferSafe(null);
     changeRail("archivos");
+    // Evita título pegado arriba por scroll residual del chat anterior.
+    requestAnimationFrame(() => {
+      const stage = chatStageRef.current;
+      if (stage) {
+        stage.scrollTop = 0;
+        delete stage.dataset.chatScrollMax;
+      }
+      if (chatLogRef.current) chatLogRef.current.scrollTop = 0;
+    });
   }, [changeRail]);
 
   const chatSessionsRef = useRef(chatSessions);
@@ -13313,6 +16378,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
           {rail === "archivos" ? (
             <div
+              key={
+                chatStarted
+                  ? "chat-stage-conversation"
+                  : `chat-stage-home-${activeChatId || "new"}`
+              }
               ref={chatStageRef}
               className={
                 chatStarted
@@ -13323,7 +16393,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               <section className="chat-shell" aria-label="Chat del inventario">
                 <div className="chat-main">
                   {!chatStarted ? (
-                    <div className="chat-home">
+                    <div className="chat-home" key={`home-hero-${activeChatId || "new"}`}>
                       <div className="chat-home-hero">
                         <h2 className="chat-home-title">
                           Hola. ¿Qué quieres consultar del inventario?
@@ -13369,8 +16439,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                         return chatTurns.map((turn, turnIndex) => {
                         const isLatest = turnIndex === latestAnchorIndex;
                         const renderUser = (message: ChatMessage) => {
+                          const parsed = parseUserAttachDisplay(message.text);
+                          const displayText = parsed.body;
+                          const showFileCard = Boolean(
+                            parsed.attach &&
+                              (parsed.attach.kind === "file" ||
+                                isSpreadsheetFileName(parsed.attach.name)),
+                          );
+                          const sheetName = parsed.attach?.name || "";
+                          const isSheet = isSpreadsheetFileName(sheetName);
                           const canCollapse =
-                            message.text.trim().length > CHAT_USER_COLLAPSE_AT;
+                            displayText.trim().length > CHAT_USER_COLLAPSE_AT;
                           const expanded = expandedUserMsgs.includes(message.id);
                           const isEditing = editingUserMsgId === message.id;
                           if (isEditing) {
@@ -13422,15 +16501,55 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                   </button>
                                 </div>
                                 <div className="chat-user-card">
-                                  <p
-                                    className={
-                                      canCollapse && !expanded
-                                        ? "chat-bubble is-collapsed"
-                                        : "chat-bubble"
-                                    }
-                                  >
-                                    {message.text}
-                                  </p>
+                                  {showFileCard && parsed.attach ? (
+                                    <div
+                                      className="chat-export-files is-user-upload"
+                                      aria-label="Archivo adjunto"
+                                    >
+                                      <div
+                                        className="chat-export-card"
+                                        role="status"
+                                        title={parsed.attach.name}
+                                      >
+                                        <span className="chat-export-card-title">
+                                          {parsed.attach.name}
+                                        </span>
+                                        <span className="chat-export-card-meta">
+                                          <span
+                                            className="chat-export-card-badge"
+                                            aria-hidden="true"
+                                          >
+                                            X
+                                          </span>
+                                          <span>
+                                            {isSheet
+                                              ? sheetName.toLowerCase().endsWith(".csv")
+                                                ? "CSV"
+                                                : "XLSX"
+                                              : "ARCHIVO"}
+                                          </span>
+                                          <span className="chat-export-card-count">
+                                            Adjuntado
+                                          </span>
+                                        </span>
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {displayText ||
+                                  (!showFileCard && parsed.attach) ? (
+                                    <p
+                                      className={
+                                        canCollapse && !expanded
+                                          ? "chat-bubble is-collapsed"
+                                          : "chat-bubble"
+                                      }
+                                    >
+                                      {displayText ||
+                                        (parsed.attach
+                                          ? `[Imagen: ${parsed.attach.name}]`
+                                          : message.text)}
+                                    </p>
+                                  ) : null}
                                   {canCollapse ? (
                                     <button
                                       type="button"
@@ -13544,7 +16663,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                 </span>
                               </div>
                               <div className="chat-response">
-                                {renderChatRichText(message.text)}
+                                {renderChatRichText(message.text, {
+                                  onAsk: (prompt) => {
+                                    void sendChat(prompt);
+                                  },
+                                })}
                               </div>
                               {Array.isArray(message.exportFiles) &&
                               message.exportFiles.length > 0 ? (
@@ -13580,6 +16703,38 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                   ))}
                                 </div>
                               ) : null}
+                              {(() => {
+                                const chips =
+                                  Array.isArray(message.followUps) &&
+                                  message.followUps.length > 0
+                                    ? message.followUps
+                                    : buildChatFollowUps({
+                                        resultItems: message.resultItems,
+                                        qr: message.qr,
+                                        viewerOverview: message.viewerOverview,
+                                        viewerFocus: message.viewerFocus,
+                                      });
+                                if (!chips.length) return null;
+                                return (
+                                  <div
+                                    className="chat-follow-ups"
+                                    aria-label="Siguientes pasos"
+                                  >
+                                    {chips.map((chip) => (
+                                      <button
+                                        key={`${message.id}-${chip.prompt}`}
+                                        type="button"
+                                        className="chat-follow-up"
+                                        onClick={() => {
+                                          void sendChat(chip.prompt);
+                                        }}
+                                      >
+                                        {chip.label}
+                                      </button>
+                                    ))}
+                                  </div>
+                                );
+                              })()}
                               <div
                                 className="chat-response-actions"
                                 aria-label="Acciones de la respuesta"
@@ -13934,7 +17089,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                             </div>
                             <div className="chat-token-popover-model">
                               <strong>{activeTokenMeter.modelLabel}</strong>
-                              <span>Key #{activeTokenMeter.keyFingerprint.slice(0, 6)}</span>
+                              <span>
+                                Key #
+                                {(activeTokenMeter.keyFingerprint || "default").slice(
+                                  0,
+                                  6,
+                                )}
+                              </span>
                             </div>
                             <div className="chat-token-popover-bar">
                               <span
@@ -14342,11 +17503,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       {/* Modal para añadir nuevo producto (QR o Manual) */}
       <AddProductModal
         isOpen={isAddModalOpen}
-        onClose={() => setIsAddModalOpen(false)}
+        onClose={() => {
+          setIsAddModalOpen(false);
+          setAddModalDestino(null);
+        }}
         onCreated={handleProductCreated}
         existingAreas={existingAreas}
         existingPeople={existingPeople}
         items={items}
+        preferredDestino={addModalDestino}
       />
 
       {/* Modal de Detalle y Modificación / Eliminación de Producto */}
@@ -14362,29 +17527,62 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         catalogItems={items}
       />
 
-      {pendingChatDeleteRow ? (
+      {pendingChatDeletePlan?.phase === "modal" ? (
         <ChatChoiceModal
           titleId="chat-delete-record-title"
-          title="Eliminar registro"
-          subtitle={`${String(pendingChatDeleteRow.etiqueta ?? "").trim() || `ID ${pendingChatDeleteRow.id}`}${
-            pendingChatDeleteRow.articulo
-              ? ` — ${pendingChatDeleteRow.articulo}`
-              : ""
-          }`}
+          title={
+            pendingChatDeletePlan.wholeOrigen && pendingChatDeletePlan.origen
+              ? `Eliminar todo ${pendingChatDeletePlan.origen}`
+              : pendingChatDeletePlan.rows.length > 1
+                ? `Eliminar ${pendingChatDeletePlan.rows.length} registros`
+                : "Eliminar registro"
+          }
+          subtitle={
+            pendingChatDeletePlan.rows.length === 1
+              ? `${String(pendingChatDeletePlan.rows[0].etiqueta ?? "").trim() || `ID ${pendingChatDeletePlan.rows[0].id}`}${
+                  pendingChatDeletePlan.rows[0].articulo
+                    ? ` — ${pendingChatDeletePlan.rows[0].articulo}`
+                    : ""
+                }`
+              : pendingChatDeletePlan.wholeOrigen && pendingChatDeletePlan.origen
+                ? `${pendingChatDeletePlan.rows.length.toLocaleString("es-MX")} registros de ${pendingChatDeletePlan.origen}`
+                : pendingChatDeletePlan.rows
+                    .slice(0, 4)
+                    .map(
+                      (r) =>
+                        String(r.etiqueta ?? "").trim() || `ID ${r.id}`,
+                    )
+                    .join(", ") +
+                  (pendingChatDeletePlan.rows.length > 4
+                    ? ` y ${pendingChatDeletePlan.rows.length - 4} más`
+                    : "") +
+                  (pendingChatDeletePlan.origen
+                    ? ` · ${pendingChatDeletePlan.origen}`
+                    : "")
+          }
           onDismiss={() => {
-            if (!chatDeleteBusy) setPendingChatDeleteRow(null);
+            if (!chatDeleteBusy) setPendingChatDeletePlanSafe(null);
           }}
           keep={{
             title: "Cancelar",
-            body: "El registro se queda en el inventario. No se borra nada.",
+            body:
+              pendingChatDeletePlan.rows.length > 1
+                ? "Los registros se quedan en el inventario. No se borra nada."
+                : "El registro se queda en el inventario. No se borra nada.",
             action: "Volver al chat",
             disabled: chatDeleteBusy,
-            onClick: () => setPendingChatDeleteRow(null),
+            onClick: () => setPendingChatDeletePlanSafe(null),
           }}
           drop={{
             title: chatDeleteBusy ? "Eliminando…" : "Borrar",
-            body: "No podrás deshacerlo desde el chat. El artículo sale del inventario.",
-            action: "Eliminar registro",
+            body:
+              pendingChatDeletePlan.rows.length > 1
+                ? "No podrás deshacerlo desde el chat. Salen del inventario."
+                : "No podrás deshacerlo desde el chat. El artículo sale del inventario.",
+            action:
+              pendingChatDeletePlan.rows.length > 1
+                ? "Eliminar registros"
+                : "Eliminar registro",
             disabled: chatDeleteBusy,
             onClick: () => {
               void confirmChatDeleteRecord();
