@@ -95,10 +95,14 @@ const INTENT_VOCAB = [
   "quiero",
   "necesito",
   "esa",
+  "esas",
   "ese",
+  "esos",
   "eso",
   "esta",
+  "estas",
   "este",
+  "estos",
 ] as const;
 
 const VOCAB_SET = new Set<string>(INTENT_VOCAB);
@@ -218,7 +222,9 @@ export function normalizeChatSpelling(raw: string): string {
 
 export function looksLikeTransferVerb(text: string): boolean {
   const n = normalizeChatSpelling(text);
-  return /\b(agrega\w*|pasa\w*|copia\w*|mete\w*|mueve\w*|mover\w*|traslad\w*|traspas\w*|importa\w*|trae\w*|traer\w*|pon\w*|llena\w*|continua\w*|contin\w*)\b/.test(
+  // No usar pasa\w* suelto: “compara” no es transferir.
+  if (/\bcompara\w*\b/.test(n)) return false;
+  return /\b(agrega\w*|pasame|pasalo|pasala|pasalos|pasalas|pasar\w*|pasa|pase|pases|copia\w*|mete\w*|mueve\w*|mover\w*|traslad\w*|traspas\w*|importa\w*|trae\w*|traer\w*|llena\w*|continua\w*)\b/.test(
     n,
   );
 }

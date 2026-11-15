@@ -134,10 +134,12 @@ function detectTopicFromText(text: string): ChatTopicKind {
     return "create_inventario";
   }
   if (
-    /\betiqueta/.test(n) &&
-    /\b(origen|fuente|venia|vino|antes|de que inventario|que inventario)\b/.test(
+    (/\betiqueta/.test(n) || /\b\d{4,}\b/.test(n)) &&
+    (/\b(origen|fuente|venia|vino|antes|de que inventario|que inventario|en que inventario)\b/.test(
       n,
-    )
+    ) ||
+      (/\binventari/.test(n) &&
+        /\b(encuentra|aparece|esta|estan|donde|ubicad)\b/.test(n)))
   ) {
     return "etiqueta_origen";
   }
@@ -262,11 +264,25 @@ export function resolveChatTurnContext(input: {
     }
   }
 
+  // “todos los demás inventarios / todos los registros” ≠ anáfora de 1 etiqueta.
+  const wantsAllOthersMerge =
+    /\b(todos?\s+los\s+demas|todas?\s+las\s+demas|todos?\s+los\s+otros|resto\s+de\s+(los\s+)?inventarios|demas\s+inventarios|otros\s+inventarios)\b/.test(
+      spelled,
+    ) ||
+    (/\b(todos?|todas?)\b/.test(spelled) &&
+      /\b(demas|otros|otras|resto)\b/.test(spelled) &&
+      /\b(inventarios?|registros?|regsitros|etiquetas?)\b/.test(spelled)) ||
+    (/\b(todos?\s+los\s+registros?|todas?\s+las\s+etiquetas?|todo\s+el\s+inventario)\b/.test(
+      spelled,
+    ) &&
+      /\b(demas|otros|inventarios?)\b/.test(spelled));
+
   // “agrega esa / esa etiqueta a Inventario 2” → etiqueta del mensaje de arriba
-  // (solo si NO pidió omitir/excluir).
+  // (solo si NO pidió omitir/excluir ni un merge masivo).
   if (
     !fromContext &&
     !wantsOmit &&
+    !wantsAllOthersMerge &&
     looksLikeTransferVerb(spelled) &&
     userInvs.length >= 1 &&
     (looksLikeEtiquetaAnaphora(spelled) ||

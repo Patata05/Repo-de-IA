@@ -486,34 +486,12 @@ function fieldText(row: InventarioRow, field: (typeof DIFF_FIELDS)[number]): str
   return String(val).trim();
 }
 
-/**
- * Diff real entre dos orígenes (p. ej. Inventario 2 vs S/O).
- * Reporta faltan / sobran / cambiaron por etiqueta.
- */
-export function diffInventarios(
-  rows: InventarioRow[],
-  leftOrigen: string,
-  rightOrigen: string,
+function diffEtiquetaMaps(
+  leftLabel: string,
+  rightLabel: string,
+  leftMap: Map<string, InventarioRow>,
+  rightMap: Map<string, InventarioRow>,
 ): InventarioDiffResult {
-  const left = leftOrigen.trim() || ORIGEN_SIN_ORIGEN;
-  const right = rightOrigen.trim() || ORIGEN_SIN_ORIGEN;
-  const leftMap = new Map<string, InventarioRow>();
-  const rightMap = new Map<string, InventarioRow>();
-
-  for (const row of rows) {
-    const origen = origenOf(row);
-    const etq = String(row.etiqueta ?? "").trim().toLowerCase();
-    if (!etq) continue;
-    if (origen === left) {
-      const prev = leftMap.get(etq);
-      if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) leftMap.set(etq, row);
-    }
-    if (origen === right) {
-      const prev = rightMap.get(etq);
-      if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) rightMap.set(etq, row);
-    }
-  }
-
   const onlyLeft: InventarioRow[] = [];
   const onlyRight: InventarioRow[] = [];
   const same: InventarioRow[] = [];
@@ -547,8 +525,8 @@ export function diffInventarios(
   }
 
   return {
-    left,
-    right,
+    left: leftLabel,
+    right: rightLabel,
     leftCount: leftMap.size,
     rightCount: rightMap.size,
     same,
@@ -556,6 +534,135 @@ export function diffInventarios(
     onlyRight,
     changed,
   };
+}
+
+/**
+ * Diff real entre dos orígenes (p. ej. Inventario 2 vs S/O).
+ * Reporta faltan / sobran / cambiaron por etiqueta.
+ */
+export function diffInventarios(
+  rows: InventarioRow[],
+  leftOrigen: string,
+  rightOrigen: string,
+): InventarioDiffResult {
+  const left = leftOrigen.trim() || ORIGEN_SIN_ORIGEN;
+  const right = rightOrigen.trim() || ORIGEN_SIN_ORIGEN;
+  const leftMap = new Map<string, InventarioRow>();
+  const rightMap = new Map<string, InventarioRow>();
+
+  for (const row of rows) {
+    const origen = origenOf(row);
+    const etq = String(row.etiqueta ?? "").trim().toLowerCase();
+    if (!etq) continue;
+    if (origen === left) {
+      const prev = leftMap.get(etq);
+      if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) leftMap.set(etq, row);
+    }
+    if (origen === right) {
+      const prev = rightMap.get(etq);
+      if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) rightMap.set(etq, row);
+    }
+  }
+
+  return diffEtiquetaMaps(left, right, leftMap, rightMap);
+}
+
+/**
+ * Compara un listado concreto (p. ej. últimos 10 del chat) contra un Inventario N.
+ * “Faltan” = están en el listado y no en el destino; “sobran” no aplica al destino completo
+ * (solo etiquetas del listado que también están en destino con cambios / iguales).
+ */
+export function diffRowsAgainstInventario(
+  sourceRows: InventarioRow[],
+  destOrigen: string,
+  catalog: InventarioRow[],
+  leftLabel = "este listado",
+): InventarioDiffResult {
+  const right = destOrigen.trim() || ORIGEN_SIN_ORIGEN;
+  const leftMap = new Map<string, InventarioRow>();
+  for (const row of sourceRows) {
+    const etq = String(row.etiqueta ?? "").trim().toLowerCase();
+    if (!etq) continue;
+    const prev = leftMap.get(etq);
+    if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) leftMap.set(etq, row);
+  }
+  const rightMap = new Map<string, InventarioRow>();
+  for (const row of catalog) {
+    if (origenOf(row) !== right) continue;
+    const etq = String(row.etiqueta ?? "").trim().toLowerCase();
+    if (!etq || !leftMap.has(etq)) continue;
+    const prev = rightMap.get(etq);
+    if (!prev || rowTimestamp(row) >= rowTimestamp(prev)) rightMap.set(etq, row);
+  }
+  // Solo etiquetas del listado: no reportar “sobran” todo el inventario destino.
+  const onlyLeft: InventarioRow[] = [];
+  const same: InventarioRow[] = [];
+  const changed: InventarioFieldDiff[] = [];
+  for (const [etq, leftRow] of leftMap) {
+    const rightRow = rightMap.get(etq);
+    if (!rightRow) {
+      onlyLeft.push(leftRow);
+      continue;
+    }
+    let fieldChanges = 0;
+    for (const field of DIFF_FIELDS) {
+      const from = fieldText(leftRow, field);
+      const to = fieldText(rightRow, field);
+      if (from.localeCompare(to, "es", { sensitivity: "base" }) === 0) continue;
+      fieldChanges += 1;
+      changed.push({
+        etiqueta: String(leftRow.etiqueta ?? rightRow.etiqueta ?? etq),
+        field,
+        from: from || "(vacío)",
+        to: to || "(vacío)",
+        leftId: leftRow.id,
+        rightId: rightRow.id,
+      });
+    }
+    if (!fieldChanges) same.push(rightRow);
+  }
+  return {
+    left: leftLabel,
+    right,
+    leftCount: leftMap.size,
+    rightCount: rightMap.size,
+    same,
+    onlyLeft,
+    onlyRight: [],
+    changed,
+  };
+}
+
+/** “compara estos / esta consulta / el listado con Inventario N”. */
+export function detectCompareScopedListAsk(
+  text: string,
+  existing: string[] = [],
+): { dest: string } | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  const wants =
+    /\bcompara\w*\b/.test(n) ||
+    /\b(diff|diferencia|diferencias)\b/.test(n) ||
+    /\bvs\b/.test(n);
+  if (!wants) return undefined;
+  const scoped =
+    /\b(est[oa]s?|esos|esas|esta\s+consulta|esta\s+lista|este\s+listado|lo\s+de\s+arriba|los\s+de\s+arriba|el\s+listado|mis\s+registros|la\s+consulta)\b/.test(
+      n,
+    ) ||
+    /\b(ultimos?|recientes?)\s+\d+\s+registros?\b/.test(n) ||
+    /\best[oa]s?\s+(ultimos?|recientes?)\b/.test(n) ||
+    /\b(registros?|etiquetas?|resultados?)\s+(con|vs|contra|y)\s+(el\s+)?inventario/.test(
+      n,
+    ) ||
+    /\b(con|vs|contra)\s+(lo\s+que\s+es\s+)?(el\s+)?inventario\s*\d+\b/.test(n);
+  if (!scoped) return undefined;
+  const nums = collectInventarioNumsFromText(n);
+  if (!nums.length) return undefined;
+  const destNum = nums[nums.length - 1];
+  const dest =
+    existing.find((o) => inventarioNumber(o) === destNum) ||
+    `Inventario ${destNum}`;
+  return { dest };
 }
 
 /**
@@ -574,6 +681,11 @@ export function detectCompareInventariosAsk(
     /\bvs\b/.test(n) ||
     /^comparar\s+inventarios?$/.test(n);
   if (!wants) return undefined;
+
+  // “estos registros con Inv N” lo maneja detectCompareScopedListAsk.
+  if (detectCompareScopedListAsk(text, existing)) {
+    return undefined;
+  }
 
   const found: string[] = [];
   const numbered = [...n.matchAll(/\binventarios?\s*(\d+)\b/g)];
@@ -610,11 +722,9 @@ export function detectCompareInventariosAsk(
     }
     return { left: a, right: b };
   }
-  if (found.length === 1 && found[0] !== ORIGEN_SIN_ORIGEN) {
-    const others = sortInventariosNewestFirst(
-      existing.filter((o) => o !== found[0]),
-    );
-    if (others[0]) return { left: others[0], right: found[0] };
+  // Un solo Inventario N sin “estos…”: pedir el otro, no inventar pareja.
+  if (found.length === 1) {
+    return undefined;
   }
 
   // “comparar inventarios” sin nombres → dos más recientes (o último vs S/O).
@@ -633,65 +743,246 @@ export function detectCompareInventariosAsk(
   return undefined;
 }
 
+/** Cantidad en palabras (1–20) o dígitos; para prosa clara. */
+export function countWordsEs(n: number, noun: "etiqueta" | "registro" = "etiqueta"): string {
+  const words = [
+    "",
+    "una",
+    "dos",
+    "tres",
+    "cuatro",
+    "cinco",
+    "seis",
+    "siete",
+    "ocho",
+    "nueve",
+    "diez",
+    "once",
+    "doce",
+    "trece",
+    "catorce",
+    "quince",
+    "dieciséis",
+    "diecisiete",
+    "dieciocho",
+    "diecinueve",
+    "veinte",
+  ];
+  const abs = Math.max(0, Math.floor(n));
+  const num =
+    abs >= 1 && abs <= 20 ? words[abs] : abs.toLocaleString("es-MX");
+  const plural = abs === 1 ? noun : noun === "etiqueta" ? "etiquetas" : "registros";
+  if (abs === 1 && noun === "etiqueta") return `la etiqueta`;
+  if (abs === 1) return `el registro`;
+  if (abs >= 1 && abs <= 20) return `las ${num} ${plural}`;
+  return `las ${num} ${plural}`;
+}
+
+function pickDiffVariant(variants: string[], salt: string): string {
+  if (!variants.length) return "";
+  let h = 17;
+  for (let i = 0; i < salt.length; i += 1) {
+    h = (h + salt.charCodeAt(i) * (i + 3)) % 997;
+  }
+  return variants[Math.abs(h) % variants.length];
+}
+
+function briefDiffRows(
+  rows: Array<{ etiqueta?: string | null; articulo?: string | null }>,
+  max = 3,
+): string {
+  return rows
+    .slice(0, max)
+    .map((r) => {
+      const et = String(r.etiqueta ?? "").trim() || "S/E";
+      const art = String(r.articulo ?? "").trim() || "—";
+      return `**${et}** (${art})`;
+    })
+    .join(", ");
+}
+
+/**
+ * Respuesta clara de comparación (prosa). No menciona ceros ni “esta consulta (N)”.
+ */
 export function formatInventarioDiffReply(diff: InventarioDiffResult): string {
   const faltan = diff.onlyLeft.length;
   const sobran = diff.onlyRight.length;
   const iguales = diff.same.length;
   const cambiaron = new Set(diff.changed.map((c) => c.etiqueta.toLowerCase())).size;
-  const lines: string[] = [
-    `Comparé **${diff.left}** (${diff.leftCount.toLocaleString("es-MX")}) vs **${diff.right}** (${diff.rightCount.toLocaleString("es-MX")}):`,
-    "",
-    `• **Iguales:** **${iguales.toLocaleString("es-MX")}** (misma etiqueta y mismos datos)`,
-    `• **Faltan en ${diff.right}:** **${faltan.toLocaleString("es-MX")}** (están en ${diff.left})`,
-    `• **Sobran en ${diff.right}:** **${sobran.toLocaleString("es-MX")}** (no están en ${diff.left})`,
-    `• **Cambiaron:** **${cambiaron.toLocaleString("es-MX")}** etiqueta${cambiaron === 1 ? "" : "s"} con campos distintos`,
-  ];
+  const totalLeft = diff.leftCount || iguales + faltan + cambiaron;
+  const dest = diff.right;
+  const salt = `${diff.left}|${dest}|${iguales}|${faltan}|${sobran}|${cambiaron}`;
 
   if (!diff.leftCount && !diff.rightCount) {
-    lines.push(
-      "",
-      `Ninguno de los dos orígenes tiene etiquetas para comparar. Importa o elige otros inventarios.`,
+    return pickDiffVariant(
+      [
+        `Revisé **${diff.left}** y **${dest}**, pero ninguno tiene etiquetas para comparar. Importa un Excel o elige otros inventarios y lo volvemos a hacer.`,
+        `No hay etiquetas en **${diff.left}** ni en **${dest}** todavía. Cuando cargues algo, lo comparamos otra vez.`,
+      ],
+      salt,
     );
-    return lines.join("\n");
-  }
-  if (!diff.leftCount) {
-    lines.push(
-      "",
-      `**${diff.left}** está vacío: todo lo de **${diff.right}** cuenta como sobrante.`,
-    );
-  } else if (!diff.rightCount) {
-    lines.push(
-      "",
-      `**${diff.right}** está vacío: todo lo de **${diff.left}** falta en ese inventario.`,
-    );
-  } else if (!faltan && !sobran && !cambiaron) {
-    lines.push("", "Los inventarios coinciden al 100% en etiquetas y campos comparados.");
   }
 
-  if (faltan) {
-    const sample = diff.onlyLeft
-      .slice(0, 5)
-      .map((r) => `• **${String(r.etiqueta ?? "").trim()}** · ${String(r.articulo ?? "").trim() || "—"}`);
-    lines.push("", `Ejemplos que faltan en ${diff.right}:`, ...sample);
-  }
-  if (sobran) {
-    const sample = diff.onlyRight
-      .slice(0, 5)
-      .map((r) => `• **${String(r.etiqueta ?? "").trim()}** · ${String(r.articulo ?? "").trim() || "—"}`);
-    lines.push("", `Ejemplos que sobran en ${diff.right}:`, ...sample);
-  }
-  if (diff.changed.length) {
-    const sample = diff.changed.slice(0, 6).map(
-      (c) =>
-        `• **${c.etiqueta}** · **${c.field}** · “${c.from}” → “${c.to}”`,
+  const scoped =
+    /^esta consulta/i.test(diff.left) ||
+    /^este listado/i.test(diff.left) ||
+    /^listado/i.test(diff.left);
+
+  // Todo coincide
+  if (totalLeft > 0 && !faltan && !sobran && !cambiaron) {
+    const qty = countWordsEs(totalLeft || iguales);
+    if (scoped) {
+      return pickDiffVariant(
+        [
+          `${qty.charAt(0).toUpperCase()}${qty.slice(1)} del listado ya coinciden en **${dest}**. ¿Te gustaría hacer otra consulta?`,
+          `${qty.charAt(0).toUpperCase()}${qty.slice(1)} ya están correctas en **${dest}**. ¿Las quieres ver en el panel de la derecha?`,
+          `${qty.charAt(0).toUpperCase()}${qty.slice(1)} ya están en **${dest}**. ¿Gustas que te exporte un Excel de ese inventario?`,
+          `Todo el listado (${totalLeft}) ya está alineado con **${dest}**: mismas etiquetas y mismos datos. ¿Seguimos con otra acción?`,
+        ],
+        salt,
+      );
+    }
+    return pickDiffVariant(
+      [
+        `**${diff.left}** y **${dest}** coinciden: ${qty} iguales, sin faltantes ni cambios. ¿Quieres ver el detalle en el panel o exportar un Excel?`,
+        `Entre **${diff.left}** y **${dest}** no hay diferencias: ${qty} coinciden. ¿Te ayudo con otra consulta?`,
+        `Comparación lista: **${diff.left}** y **${dest}** están alineados (${qty}). ¿Las ves en el panel o exportamos Excel?`,
+      ],
+      salt,
     );
-    lines.push("", "Ejemplos de cambios:", ...sample);
   }
-  lines.push(
-    "",
-    "El detalle está en el visor derecho. ¿Quieres ver solo los que faltan, los que sobran, los iguales o los que cambiaron?",
-  );
-  return lines.join("\n");
+
+  const parts: string[] = [];
+
+  if (scoped) {
+    const qty = countWordsEs(totalLeft || iguales + faltan);
+    if (faltan && !cambiaron && iguales === 0) {
+      parts.push(
+        `De ${qty} del listado, ninguna está aún en **${dest}**. Por ejemplo: ${briefDiffRows(diff.onlyLeft)}.`,
+      );
+    } else if (faltan && !cambiaron) {
+      parts.push(
+        `De ${qty} del listado, **${iguales.toLocaleString("es-MX")}** ya coinciden en **${dest}** y **${faltan.toLocaleString("es-MX")}** todavía no están ahí` +
+          (faltan ? ` (por ejemplo ${briefDiffRows(diff.onlyLeft)})` : "") +
+          `.`,
+      );
+    } else if (!faltan && cambiaron) {
+      parts.push(
+        `${qty.charAt(0).toUpperCase()}${qty.slice(1)} del listado sí están en **${dest}**, pero **${cambiaron.toLocaleString("es-MX")}** tienen datos distintos` +
+          (diff.changed.length
+            ? ` (ej. ${diff.changed
+                .slice(0, 2)
+                .map((c) => `**${c.etiqueta}**: ${c.field} “${c.from}” → “${c.to}”`)
+                .join("; ")})`
+            : "") +
+          `.`,
+      );
+    } else {
+      parts.push(
+        `Comparé el listado (${totalLeft} etiquetas) con **${dest}**: ` +
+          [
+            iguales ? `**${iguales.toLocaleString("es-MX")}** ya coinciden` : "",
+            faltan
+              ? `**${faltan.toLocaleString("es-MX")}** no están en ese inventario`
+              : "",
+            cambiaron
+              ? `**${cambiaron.toLocaleString("es-MX")}** con campos distintos`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(", ") +
+          `.`,
+      );
+      if (faltan) {
+        parts.push(`Las que faltan incluyen ${briefDiffRows(diff.onlyLeft)}.`);
+      }
+    }
+  } else {
+    // Inventario vs inventario: solo mencionar lo que importa (nunca ceros).
+    const lead = pickDiffVariant(
+      [
+        `Al comparar **${diff.left}** con **${dest}**:`,
+        `Esto salió al revisar **${diff.left}** frente a **${dest}**:`,
+        `Entre **${diff.left}** y **${dest}**:`,
+      ],
+      salt,
+    );
+    const chunks: string[] = [];
+    if (iguales) {
+      chunks.push(
+        `**${iguales.toLocaleString("es-MX")}** etiquetas coinciden`,
+      );
+    }
+    if (faltan) {
+      chunks.push(
+        `**${faltan.toLocaleString("es-MX")}** de **${diff.left}** no están en **${dest}**`,
+      );
+    }
+    if (sobran) {
+      chunks.push(
+        `**${sobran.toLocaleString("es-MX")}** solo aparecen en **${dest}**`,
+      );
+    }
+    if (cambiaron) {
+      chunks.push(
+        `**${cambiaron.toLocaleString("es-MX")}** con datos distintos`,
+      );
+    }
+    parts.push(`${lead} ${chunks.join("; ")}.`);
+    if (faltan) {
+      parts.push(
+        `Ejemplos que faltan en **${dest}**: ${briefDiffRows(diff.onlyLeft)}.`,
+      );
+    }
+    if (sobran) {
+      parts.push(
+        `Ejemplos solo en **${dest}**: ${briefDiffRows(diff.onlyRight)}.`,
+      );
+    }
+    if (diff.changed.length) {
+      const sample = diff.changed
+        .slice(0, 3)
+        .map((c) => `**${c.etiqueta}** (${c.field}: “${c.from}” → “${c.to}”)`)
+        .join(", ");
+      parts.push(`Cambios, por ejemplo: ${sample}.`);
+    }
+  }
+
+  const close = faltan
+    ? pickDiffVariant(
+        [
+          `¿Quieres que te muestre solo las que faltan en el panel, o las pasamos a **${dest}**?`,
+          `¿Las ves en el panel derecho o prefieres un Excel con las que faltan?`,
+          `¿Seguimos con las faltantes o con otra consulta?`,
+        ],
+        salt,
+      )
+    : cambiaron
+      ? pickDiffVariant(
+          [
+            `¿Revisamos esos cambios en el panel o exportamos un Excel?`,
+            `¿Quieres ver el detalle en la derecha o hacer otra comparación?`,
+          ],
+          salt,
+        )
+      : sobran
+        ? pickDiffVariant(
+            [
+              `¿Te muestro las que sobran en el panel o hacemos otra consulta?`,
+              `¿Las ves a la derecha o exportamos Excel de **${dest}**?`,
+            ],
+            salt,
+          )
+        : pickDiffVariant(
+            [
+              `¿Te gustaría otra acción?`,
+              `¿Las quieres ver en el panel o exportamos Excel?`,
+              `¿Seguimos con otra consulta?`,
+            ],
+            salt,
+          );
+
+  return [...parts, close].filter(Boolean).join(" ");
 }
 
 export type PendingNewInventario = {
@@ -791,6 +1082,53 @@ export function detectExcludedEtiquetasAsk(
 }
 
 /**
+ * “mete al Inventario 5 todos los registros de todos los demás inventarios”.
+ */
+export function detectBulkCopyAllOthersToInventarioAsk(
+  text: string,
+  existing: string[] = [],
+): { dest: string; sources: string[] } | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  if (
+    /\bcompara\w*\b/.test(n) ||
+    /\b(diff|diferencia|versus)\b/.test(n) ||
+    /\bvs\b/.test(n)
+  ) {
+    return undefined;
+  }
+  const transferVerb =
+    /\b(pasa\w*|copia\w*|mete\w*|mueve\w*|mover\w*|traslad\w*|traspas\w*|importa\w*|trae\w*|traer\w*|pon\w*|agrega\w*)\b/.test(
+      n,
+    );
+  if (!transferVerb) return undefined;
+  const allOthers =
+    /\b(todos?\s+los\s+demas|todas?\s+las\s+demas|todos?\s+los\s+otros|todas?\s+las\s+otras|resto\s+de\s+(los\s+)?inventarios|demas\s+inventarios|otros\s+inventarios)\b/.test(
+      n,
+    ) ||
+    (/\b(todos?|todas?)\b/.test(n) &&
+      /\b(demas|otros|otras|resto)\b/.test(n) &&
+      /\b(inventarios?|registros?|regsitros|etiquetas?)\b/.test(n));
+  if (!allOthers) return undefined;
+  const nums = collectInventarioNumsFromText(n);
+  if (!nums.length) return undefined;
+  const destNum = nums[nums.length - 1];
+  if (!destNum) return undefined;
+  const dest =
+    existing.find((o) => inventarioNumber(o) === destNum) ||
+    `Inventario ${destNum}`;
+  const sources = sortInventariosNewestFirst(
+    existing.filter((o) => {
+      const num = inventarioNumber(o);
+      if (num != null) return num !== destNum;
+      return foldOrigenText(o) !== foldOrigenText(dest);
+    }),
+  );
+  if (!sources.length) return undefined;
+  return { dest, sources };
+}
+
+/**
  * “pasa todas las etiquetas de Inventario 1 al Inventario 3;
  *  si ya existe alguna, notifícame”.
  * También: “importa todos los registros de inventari 1 a inventario 3”.
@@ -875,6 +1213,14 @@ export function detectCopyPersonRecordsToInventarioAsk(
 ): { dest: string } | undefined {
   const n = foldOrigenText(text);
   if (!n) return undefined;
+  // Comparar listado ≠ pasar/copiar.
+  if (
+    /\bcompara\w*\b/.test(n) ||
+    /\b(diff|diferencia|diferencias|versus)\b/.test(n) ||
+    /\bvs\b/.test(n)
+  ) {
+    return undefined;
+  }
   const transferVerb =
     /\b(pasa|pasar|pases|pase|pasame|pasalos|pasalas|copia|copiar|copialos|copialas|mete|meter|mueve|mover|traslada|traspasa|agrega|agregar|importa|importar)\b/.test(
       n,
@@ -888,13 +1234,18 @@ export function detectCopyPersonRecordsToInventarioAsk(
       n,
     ) ||
     /\bsu\s+inventario\b/.test(n) ||
-    // Anáfora al panel de persona: “estos/esas registros/etiquetas”
+    // Anáfora al panel de persona: “estos/esas registros/etiquetas” (sin “últimos N”)
     /\best[oa]s?\s+(registros?|etiquetas?|equipos?|articulos?)\b/.test(n) ||
-    // “registros de hector” / “los de hector”
-    /\b(registros?|etiquetas?|equipos?|articulos?)\s+de\s+[a-z]/.test(n) ||
-    /\blos\s+de\s+[a-z]/.test(n);
+    // “registros de hector” (no “de inventario”)
+    /\b(registros?|etiquetas?|equipos?|articulos?)\s+de\s+(?!inventari)[a-z]/.test(
+      n,
+    ) ||
+    /\blos\s+de\s+(?!inventari)[a-z]/.test(n);
   if (!personBulk) return undefined;
-  // Bulk entre Inventario N→M lo maneja otro detector.
+  // “todos los demás inventarios → Inv N” / bulk N→M tienen prioridad.
+  if (detectBulkCopyAllOthersToInventarioAsk(text, existing)) {
+    return undefined;
+  }
   if (
     /\b(todo|toda|todas|todos)\b/.test(n) &&
     collectInventarioNumsFromText(n).length >= 2 &&
@@ -924,6 +1275,10 @@ export function detectCopyEtiquetasToInventarioAsk(
   const n = foldOrigenText(text);
   if (!n) return undefined;
 
+  // “todos los demás inventarios → Inv N” tiene prioridad.
+  if (detectBulkCopyAllOthersToInventarioAsk(text, existing)) {
+    return undefined;
+  }
   // “todos sus registros → Inv N” lo maneja detectCopyPersonRecordsToInventarioAsk.
   if (detectCopyPersonRecordsToInventarioAsk(text, existing)) {
     return undefined;
@@ -992,9 +1347,19 @@ export function detectCreateInventarioAsk(
   }
 
   // “dame el inventario de Héctor / panorama / totales” ≠ crear Inventario N.
+  // “registro(s)” solo bloquea si NO hay verbo de crear (si no, “crear Inv 5 + un registro” falla).
+  if (/\binventario\s+(general\s+)?de\b/.test(n)) {
+    return undefined;
+  }
   if (
-    /\binventario\s+(general\s+)?de\b/.test(n) ||
-    /\b(panorama|resumen|totales?|registros?)\b/.test(n)
+    /\b(panorama|resumen|totales?)\b/.test(n) &&
+    !/\b(crea|crear|haz|hacer|abre|abrir|genera|generar)\b/.test(n)
+  ) {
+    return undefined;
+  }
+  if (
+    /\bregistros?\b/.test(n) &&
+    !/\b(crea|crear|haz|hacer|abre|abrir|genera|generar|nuevo)\b/.test(n)
   ) {
     return undefined;
   }
@@ -1005,8 +1370,11 @@ export function detectCreateInventarioAsk(
     return undefined;
   }
   const createVerb =
-    /\b(crea|crear|haz|hacer|abre|abrir|genera|generar)\b/.test(n) ||
-    /\b(quiero|necesito)\s+(un\s+)?(nuevo\s+)?inventario\b/.test(n);
+    /\b(crea|crear|crealo|creala|creame|creanos|haz|hacer|abre|abrir|genera|generar|preparo|prepara|preparar)\b/.test(
+      n,
+    ) ||
+    /\b(quiero|necesito)\s+(un\s+)?(nuevo\s+)?inventario\b/.test(n) ||
+    /\b(quiero|necesito)\s+que\s+(me\s+)?(crees|creas|hagas)\b/.test(n);
   const nuevoInventario = /\bnuevo\s+inventario\b/.test(n);
   if (!createVerb && !(nuevoInventario && /\b(llamado|llamada|nombre)\b/.test(n))) {
     return undefined;

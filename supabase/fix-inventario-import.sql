@@ -33,7 +33,7 @@ ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS cantidad INTEGER;
 ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS observaciones TEXT;
 ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS estado VARCHAR(20);
 ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS origen VARCHAR(60);
-ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ; 
 ALTER TABLE public.inventario ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 
 ALTER TABLE public.inventario ALTER COLUMN etiqueta TYPE VARCHAR(255);

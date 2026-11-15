@@ -278,9 +278,11 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
 
   const fromContext =
     !origen &&
-    (/\b(esta|este|esa|ese|estos|estas|esa persona|esta persona|esos|esas|anteriores?|de arriba|consulta|resultado)\b/.test(
-      n,
-    ) ||
+    (/\b(su|sus)\s+(excel|xlsx|xls|csv|archivo|hoja)\b/.test(n) ||
+      /\b(excel|xlsx|xls|csv)\s+(de\s+)?(el|ella|su|sus)\b/.test(n) ||
+      /\b(esta|este|esa|ese|estos|estas|esa persona|esta persona|esos|esas|anteriores?|de arriba|consulta|resultado)\b/.test(
+        n,
+      ) ||
       /\b(de\s+esa|de\s+esta|de\s+ese|de\s+este)\b/.test(n));
 
   let theme: string | null = null;

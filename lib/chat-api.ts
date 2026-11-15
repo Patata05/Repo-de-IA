@@ -113,7 +113,13 @@ export async function fetchChatHealth(): Promise<ChatHealthLlmInfo | null> {
 export async function askInventoryChat(
   message: string,
   history: ChatApiHistoryItem[] = [],
-  options?: { signal?: AbortSignal; memory?: string | null; model?: string | null },
+  options?: {
+    signal?: AbortSignal;
+    memory?: string | null;
+    model?: string | null;
+    /** Id del chat → memoria PydanticAI (messages_json en Supabase). */
+    sessionId?: string | null;
+  },
 ): Promise<ChatApiResponse> {
   const base = getChatApiBaseUrl();
   // Next proxy: /api/chat | Django directo: .../api/chat/
@@ -128,6 +134,7 @@ export async function askInventoryChat(
         history,
         memory: options?.memory || undefined,
         model: options?.model || undefined,
+        session_id: options?.sessionId || undefined,
       }),
       signal: options?.signal,
     });

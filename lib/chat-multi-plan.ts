@@ -52,6 +52,15 @@ export function detectInventarioMultiPlan(
   if (!raw) return null;
   const n = fold(raw);
 
+  // Comparar / consultar ≠ copiar (evita “últimos 10 … inventario 4” → Inv10→Inv4).
+  if (
+    /\bcompara\w*\b/.test(n) ||
+    /\b(diff|diferencia|diferencias|versus)\b/.test(n) ||
+    /\bvs\b/.test(n)
+  ) {
+    return null;
+  }
+
   const hasInv =
     /\binventari/.test(n) ||
     /\balnventario\b/.test(n) ||
@@ -60,14 +69,14 @@ export function detectInventarioMultiPlan(
 
   const transfer =
     looksLikeTransferVerb(n) ||
-    /\b(mete\w*|meter\w*|pasa\w*|copia\w*|mueve\w*|importa\w*|traslad\w*|traspas\w*|continua\w*|contin\w*|llena\w*|intenta\w*|intentar|hazlo|adelante|prueba\w*|reintenta\w*|aver|otra\s+vez)\b/.test(
+    /\b(mete\w*|meter\w*|pasame|pasalo|pasala|pasalos|pasalas|pasar\w*|pasa|pase|pases|copia\w*|mueve\w*|importa\w*|traslad\w*|traspas\w*|continua\w*|llena\w*|intenta\w*|intentar|hazlo|adelante|prueba\w*|reintenta\w*|aver|otra\s+vez)\b/.test(
       n,
     ) ||
-    /\b(todo|toda|todos|todas|registros?|etiquetas?|faltantes?)\b/.test(n) ||
     // “inventario 1 al inventario 3” ya implica copia
     (/\binventari\w*\s*\d+/.test(n) &&
       /\b(a|al|hacia)\s+(?:el\s+)?inventari/.test(n));
 
+  // “registros/etiquetas” solos NO bastan (chocan con comparar / últimos N).
   if (!transfer) return null;
 
   // Necesita al menos 2 inventarios o “del 2 al 3”
@@ -84,9 +93,10 @@ export function detectInventarioMultiPlan(
   }
   if (!bulk) {
     // “del 2 al 3” / “inventario 2 … inventario 3”
+    // Solo números ligados a “inventario N” (no el “10” de “últimos 10”).
     const nums = [
       ...n.matchAll(
-        /\b(?:inventari\w*|invenatrio|invetario)?\s*(\d+)\b/g,
+        /\b(?:inventari\w*|invenatrio|invetario|alnventario)\s*(\d+)\b/g,
       ),
     ]
       .map((m) => Number(m[1]))
@@ -148,13 +158,13 @@ export function detectInventarioMultiPlan(
 export function looksLikeInventarioMultiAsk(text: string): boolean {
   const n = fold(text);
   if (!n) return false;
+  if (/\bcompara\w*\b/.test(n) || /\b(diff|diferencia|versus)\b/.test(n)) {
+    return false;
+  }
   if (!/\binventari|\binvenatrio|\balnventario/.test(n)) return false;
-  const nums = [...n.matchAll(/\b(\d+)\b/g)].length;
-  if (nums < 2 && !/\bdel\s+\d+[\s\S]*\bal\s+\d+\b/.test(n)) {
-    // un solo número pero “todo … inventario 2 al inventario 3” ya tiene 2
-    if (!/\binventari\w*\s*\d+[\s\S]{0,80}\binventari\w*\s*\d+/.test(n)) {
-      return false;
-    }
+  // Exige dos “inventario N” (no el “10” de “últimos 10”).
+  if (!/\binventari\w*\s*\d+[\s\S]{0,80}\binventari\w*\s*\d+/.test(n)) {
+    if (!/\bdel\s+\d+[\s\S]*\bal\s+\d+\b/.test(n)) return false;
   }
   return (
     (/\b(mete\w*|pasa\w*|copia\w*|importa\w*|mueve\w*|continua\w*|intenta\w*|todo|faltantes?|omite\w*|excluy\w*|aver|hazlo)\b/.test(
