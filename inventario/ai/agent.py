@@ -9,9 +9,11 @@ from inventario.ai.tools import OPENAI_TOOLS, dump_tool_result, run_tool
 
 SYSTEM_PROMPT = """Eres el asistente de inventario de oficina (español de México).
 Eres trabajador y proactivo: das contexto útil y ofreces siguientes pasos claros,
-como un buen asistente (estilo Google Gemini), sin inventar datos.
+como un buen asistente de inventario, sin inventar datos.
 
 Respondes SOLO con datos reales de las herramientas. NUNCA inventes totales ni redondees a 1000.
+Unicidad: solo ETIQUETA es irrepetible dentro del mismo origen. Serie/marca/modelo SÍ se repiten.
+No digas que la serie es única. Temperatura conceptual: 0 (determinista).
 
 Ortografía: el usuario puede escribir mal (ej. "generla", "inventaro", "codigos").
 Interpreta la intención más cercana y actúa igual que si estuviera bien escrito.
@@ -80,28 +82,62 @@ Cambios (actualizar / crear / eliminar):
 - Si piden cambiar datos de UN registro: primero busca y PROPÓN el cambio.
 - Formato OBLIGATORIO de la propuesta (una línea por cambio):
   • **ETIQUETA** · **campo** · “valor actual” → “valor nuevo”
-- NUNCA llames actualizar_campo ni crear_articulo hasta que el usuario confirme
-  con sí / confirma / adelante / ok / dale.
-- Tras confirmar, aplica UNA tool de escritura y explica el resultado con detalle útil.
+- Etiqueta ≠ id interno SIEMPRE: cualquier código que el usuario cite
+  (OF-0026, RH-15, 281367, A-004…) es ETIQUETA salvo que diga “id interno”.
+  NUNCA tomes dígitos parciales de una etiqueta como id (OF-0026 ≠ 26).
+  Resuelve con obtener_por_etiqueta o pasa etiqueta= a actualizar_campo.
+- Si el cambio cayó en el registro equivocado (cualquier par de etiquetas):
+  1) restaura el registro mal tocado al valor anterior,
+  2) aplica el cambio en la etiqueta correcta.
+  No abras inventario de persona/área ni “salud del inventario” en su lugar.
+- MULTI-PETICIÓN: si en UN mensaje piden varias cosas (revertir A, corregir B,
+  poner C activo, etc.), resuélvelas juntas en UNA propuesta/confirmación.
+  No ignores la segunda petición ni abras un resumen de inventario.
+- Si el usuario ya dio etiqueta + valor (“activo”, “arreglada”, persona, área),
+  PROPÓN esos campos sin preguntar campo por campo. Máximo UNA pregunta si
+  falta un dato crítico.
+- Si dice “sí” y además corrige otra etiqueta en el mismo mensaje, haz ambas.
+- NUNCA llames actualizar_campo ni crear_articulo hasta confirmación
+  (sí / confirma / adelante / ok / dale), salvo que el front ya arme la propuesta.
+- Tras confirmar, aplica las escrituras necesarias y explica el resultado.
 - Eliminar registros: la app muestra un aviso modal de confirmación (como borrar chat).
   Si el usuario pide borrar, NO digas que no puedes: pide la etiqueta si falta y
   aclara que debe confirmar en el aviso. No inventes borrados.
 - Comparar inventarios (Inventario N vs S/O): resume faltan X / sobran Y / cambiaron Z.
+- “compara estos / últimos N / esta consulta con Inventario M” es COMPARACIÓN
+  del listado en contexto vs ese inventario. NUNCA lo trates como pasar/copiar
+  registros ni preguntes “¿de quién paso…?”. No inventes Inventario N a partir
+  del número de “últimos N”.
+- MULTI-CONSULTA: si piden varias consultas en un mensaje (buscar + comparar,
+  totales + persona, etc.), atiende cada una sin convertir consultas en
+  traspasos. Solo mueve/copia si hay verbo claro (pasa, mete, copia, mueve…).
+- Eliminar: “estos N / listado / etiquetas A y B / todo Inventario N” lo
+  resuelve el FRONT en lote (¿seguro? → aviso modal). NUNCA borres uno solo
+  si pidieron varios, ni digas que solo puedes uno.
+- Hilo: “¿es de los últimos?” tras hablar de una etiqueta = sí/no de ESA
+  etiqueta vs el top reciente. NO listes los 10 como si pedieran “últimos
+  registros”. Reusa el código del turno anterior.
+- MEMORIA / message_history: si el usuario dice “este”, “ese”, “el de antes”,
+  “¿es de los últimos?” o cita un dato del turno previo, USA el historial
+  de la conversación antes de llamar tools genéricas (p. ej. listar_recientes).
+  No ignores la etiqueta o persona del mensaje anterior.
 - Si el mensaje es vago (“no se ven”, “eso”), NO inventes otra búsqueda: pregunta la acción o usa el contexto anterior.
 
 Estilo de respuesta (importante):
-- Habla como un chat real (Gemini / ChatGPT / Claude / DeepSeek): prosa natural,
-  cálida y clara. NUNCA armes menús con viñetas (•) ni “puedo:” + lista de opciones.
-- PROHIBIDO: “Resumen ejecutivo”, “Desglose de acciones”, “Visor derecho:” como
-  encabezados, y cualquier lista con • / - / *. Todo en párrafos.
-- Si ofreces siguientes pasos, intégralos en 1–2 frases conversacionales
-  (“si quieres después vemos el área o generamos QR”), no en bullets.
-- NO des respuestas telegráficas de una sola línea. Sé claro, amable y con sustancia.
-- Explica un poco el resultado y cierra con una pregunta breve.
-- Preferible una tool útil por ronda (salvo varios QR en una sola generar_qr).
-- Detalle tabular / QR / listados largos → visor derecho. En el chat: párrafos cortos.
-- Excepción: propuestas de cambio de campo (etiqueta · campo · de → a) sí van
-  en líneas claras para confirmar.
+- Habla como un asistente profesional en chat: cercano, claro y cortés.
+  Español de México formal-amable. PROHIBIDO slang (bronca, chido, órale,
+  neta, late, wey, etc.).
+- Conversación real, no plantilla: varía aperturas/cierres; no repitas
+  siempre “Estos son…” ni la misma pregunta final.
+- Continuidad: si dicen “¿recuerdas?”, “te pedí…”, “otra vez…”, reconoce
+  el pedido anterior y luego da el dato.
+- NUNCA menús con viñetas (•) ni “puedo:” + lista. PROHIBIDO encabezados
+  tipo “Resumen ejecutivo” / “Visor derecho:”. Todo en párrafos.
+- Siguientes pasos en 1–2 frases conversacionales, no bullets.
+- NO telegráfico: explica un poco y cierra con UNA pregunta breve distinta.
+- Preferible una tool útil por ronda (salvo varios QR en una generar_qr).
+- Detalle tabular / QR / listados largos → visor. Chat: párrafos cortos.
+- Excepción: propuestas de cambio (etiqueta · campo · de → a) en líneas claras.
 
 Visor derecho (regla clara):
 - VER / MOSTRAR (obligatorio panel): "muéstrame", "enséñame", "dame", "créame",
@@ -151,7 +187,7 @@ Memoria entre chats:
 - No digas que no tienes retención si memory trae el cambio o previousTotal.
 """
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 5
 MAX_SIDE_ITEMS = 50
 MAX_HISTORY_TURNS = 10
 MAX_HISTORY_CHARS = 700
@@ -222,41 +258,57 @@ def _is_model_missing(exc: Exception) -> bool:
     )
 
 
-def _chat_with_failover(messages: list[dict]):
+def _chat_with_failover(messages: list[dict], preferred_model: str | None = None):
     endpoints = get_llm_endpoints()
     if not endpoints:
         raise RuntimeError("missing_providers")
 
     last_error: Exception | None = None
     saw_overload = False
-
+    pref = (preferred_model or "").strip().lower()
+    candidates: list[tuple[object, str]] = []
+    seen: set[tuple[str, str]] = set()
+    if pref:
+        for endpoint in endpoints:
+            for model in endpoint.models:
+                if model.lower() == pref:
+                    key = (endpoint.provider, model)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append((endpoint, model))
     for endpoint in endpoints:
         for model in endpoint.models:
-            for attempt in range(MAX_RETRIES_PER_MODEL):
-                try:
-                    completion = endpoint.client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=OPENAI_TOOLS,
-                        tool_choice="auto",
-                        temperature=0.15,
-                        max_tokens=MAX_COMPLETION_TOKENS,
-                    )
-                    label = f"{endpoint.provider}:{model}"
-                    return completion, label
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    if _is_model_missing(exc):
-                        break
-                    if _is_retryable(exc):
-                        saw_overload = True
-                        if attempt < MAX_RETRIES_PER_MODEL - 1:
-                            time.sleep(
-                                RETRY_SLEEP_SEC[min(attempt, len(RETRY_SLEEP_SEC) - 1)]
-                            )
-                            continue
-                        break
+            key = (endpoint.provider, model)
+            if key not in seen:
+                seen.add(key)
+                candidates.append((endpoint, model))
+
+    for endpoint, model in candidates:
+        for attempt in range(MAX_RETRIES_PER_MODEL):
+            try:
+                completion = endpoint.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=OPENAI_TOOLS,
+                    tool_choice="auto",
+                    temperature=0.15,
+                    max_tokens=MAX_COMPLETION_TOKENS,
+                )
+                label = f"{endpoint.provider}:{model}"
+                return completion, label
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if _is_model_missing(exc):
                     break
+                if _is_retryable(exc):
+                    saw_overload = True
+                    if attempt < MAX_RETRIES_PER_MODEL - 1:
+                        time.sleep(
+                            RETRY_SLEEP_SEC[min(attempt, len(RETRY_SLEEP_SEC) - 1)]
+                        )
+                        continue
+                    break
+                break
 
     assert last_error is not None
     if saw_overload:
@@ -526,12 +578,12 @@ def run_chat_agent(
     message: str,
     history: list[dict] | None = None,
     memory: str | None = None,
+    preferred_model: str | None = None,
 ) -> tuple[str, str | None, str | None, list[dict], bool, list[dict]]:
     endpoints = get_llm_endpoints()
     if not endpoints:
         return (
-            "No hay proveedores de IA listos. Configura GROQ_API_KEY y/o GEMINI_API_KEY "
-            "y/o instala Ollama (http://127.0.0.1:11434).",
+            "No hay proveedores de IA listos. Configura DEEPSEEK_API_KEY.",
             "missing_key",
             None,
             [],
@@ -639,7 +691,9 @@ def run_chat_agent(
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            completion, used_label = _chat_with_failover(messages)
+            completion, used_label = _chat_with_failover(
+                messages, preferred_model=preferred_model
+            )
             choice = completion.choices[0].message
             tool_calls = choice.tool_calls or []
 
@@ -728,8 +782,24 @@ def run_chat_agent(
                     }
                 )
 
+        low = (message or "").lower()
+        if "inventario" in low and any(
+            w in low
+            for w in ("pasa", "mete", "copia", "importa", "intenta", "omit", "aver")
+        ):
+            return (
+                "Para copiar entre inventarios prueba: "
+                "«pasa todo Inventario 1 a Inventario 3 omitiendo las que ya existan». "
+                "Solo la **etiqueta** es única por inventario; la **serie** sí se puede repetir.",
+                None,
+                used_label,
+                _side_items_for_reply(collected, qr_payloads),
+                mutated,
+                qr_payloads,
+            )
         return (
-            "La consulta requirió demasiados pasos. Reformula la pregunta de forma más concreta.",
+            "No terminé esa consulta a tiempo. Reformúlala en una sola frase concreta "
+            "(ej. persona, área, etiqueta o «Inventario 1 a Inventario 3»).",
             "max_tool_rounds",
             used_label,
             _side_items_for_reply(collected, qr_payloads),
@@ -740,7 +810,7 @@ def run_chat_agent(
         text = str(exc)
         if text.startswith("llm_unavailable:") or text == "missing_providers" or _is_retryable(exc):
             return (
-                "Ningún proveedor de IA respondió (Groq/Ollama/Gemini). Reintento en unos segundos…",
+                "DeepSeek no respondió. Reintento en unos segundos…",
                 "llm_unavailable",
                 used_label,
                 _side_items_for_reply(collected, qr_payloads),

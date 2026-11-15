@@ -59,8 +59,8 @@ _ACK_REPLIES = (
         "una etiqueta, armar QR o importar un archivo. ¿Qué hacemos?"
     ),
     (
-        "Va. Si quieres, vemos un área o una persona, buscamos una etiqueta, "
-        "traemos lo reciente o te ayudo a importar un Excel. ¿Qué te late?"
+        "De acuerdo. Si quieres, vemos un área o una persona, buscamos una etiqueta, "
+        "revisamos lo reciente o te ayudo a importar un Excel. ¿Cómo seguimos?"
     ),
     (
         "Listo. Estoy aquí para lo que necesites del inventario; "
