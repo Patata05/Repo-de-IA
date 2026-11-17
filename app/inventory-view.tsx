@@ -2101,7 +2101,11 @@ function looksLikeImportPreviewAsk(text: string) {
   return (mentionsFile && asksConfirm) || softPreview;
 }
 
-/** Confirmación explícita de carga (NO ok/okey/vale/dale/perfecto solos). */
+/**
+ * Confirmación de carga del Excel pendiente.
+ * Acepta “si”, “si confirma”, “si ponlo”, “sí, impórtalo”, “adelante súbelo”, “dale”.
+ * No dispara con consultas (dame/busca/compara/…).
+ */
 function isExplicitImportConfirm(value: string): boolean {
   const t = String(value || "").trim();
   if (!t) return false;
@@ -2112,19 +2116,33 @@ function isExplicitImportConfirm(value: string): boolean {
   ) {
     return false;
   }
+  const loadVerb =
+    String.raw`importa\w*|carga\w*|sube\w*|s[uú]be\w*|imp[oó]rta\w*|confirma\w*|` +
+    String.raw`adelante|hazlo|ponlo|ponla|metelo|metela|guardalo|guardala|procede`;
   // Chips / verbos de carga solos
   if (
-    /^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?|imp[oó]rtalo(?:s)?|s[uú]belo(?:s)?)([.!\s]*)$/i.test(
-      t,
-    )
+    new RegExp(
+      String.raw`^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?|imp[oó]rtalo(?:s)?|s[uú]belo(?:s)?|ponlo|ponla)([.!\s]*)$`,
+      "i",
+    ).test(t)
   ) {
     return true;
   }
-  // “sí subelo” / “si, impórtalo” / “confirmo la importación”
+  // “sí subelo” / “si ponlo” / “si, impórtalo” / “si confirma”
   if (
-    /^(sí|si|yes)\s*[,.]?\s*(por\s+favor\s+)?(importa\w*|carga\w*|sube\w*|s[uú]be\w*|confirma\w*|adelante|hazlo)([.!\s]*)?$/i.test(
-      t,
-    )
+    new RegExp(
+      String.raw`^(sí|si|yes)\s*[,.]?\s*(por\s+favor\s+)?(${loadVerb})([.!\s]*)?$`,
+      "i",
+    ).test(t)
+  ) {
+    return true;
+  }
+  // “adelante súbelo” / “dale importalo” / “listo confírmalo”
+  if (
+    new RegExp(
+      String.raw`^(adelante|dale|listo)\s*[,.]?\s*(por\s+favor\s+)?(${loadVerb})?([.!\s]*)?$`,
+      "i",
+    ).test(t)
   ) {
     return true;
   }
@@ -2133,8 +2151,8 @@ function isExplicitImportConfirm(value: string): boolean {
   ) {
     return true;
   }
-  // “sí” / “confirma” cortos — solo válidos si el turno previo fue el preview
-  return /^(sí|si|yes|confirma|confirmo)([.!\s]*)$/i.test(t);
+  // Cortos — solo válidos con preview pendiente en el caller
+  return /^(sí|si|yes|confirma|confirmo|adelante|dale)([.!\s]*)$/i.test(t);
 }
 
 /** Chips fijos tras preview de Excel (prompt dispara confirm/cancel). */
@@ -6786,6 +6804,32 @@ function buildLocalOverviewReply(
   }
 
   return null;
+}
+
+/**
+ * “dame solo las áreas de X / en qué áreas está X” → plantilla de áreas
+ * del inventario de esa persona (no personTotal con registros).
+ */
+function wantsPersonAreasBreakdown(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n || !/\bareas?\b/.test(n)) return false;
+  // Fichas/QR de la persona → no forzar plantilla de áreas.
+  if (
+    /\b(etiqueta|etiquetas|registro|registros|articulo|articulos|equipo|equipos|qr|codigo|codigos)\b/.test(
+      n,
+    ) &&
+    !/\bsolo\s+(las?\s+)?areas?\b/.test(n)
+  ) {
+    return false;
+  }
+  return (
+    /\bsolo\s+(las?\s+)?areas?\b/.test(n) ||
+    /\bareas?\s+(en\s+donde|donde)\b/.test(n) ||
+    /\ben\s+(que\s+)?areas?\s+(esta|estan|tiene|tienen|hay)\b/.test(n) ||
+    /\b(donde|en\s+donde)\s+(esta|estan)\b/.test(n) ||
+    (/\bareas?\s+(de|del)\b/.test(n) &&
+      !/\b(inventario|excel|csv|origen|general|todas|todos|ranking)\b/.test(n))
+  );
 }
 
 /** Pedido de ranking global de áreas (todas / en general / qué áreas hay). */
@@ -12883,18 +12927,27 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
       return;
     }
-    // Otra pregunta con Excel pendiente (p. ej. “okey” / panorama) → limpiar y seguir
-    // Conservar pendiente si el turno sigue siendo preview (usuario aún no confirma).
-    if (pendingRows?.length && !prevTurnIsImportPreview) {
+    // Otra pregunta con Excel pendiente (p. ej. panorama) → limpiar y seguir.
+    // Conservar lote si sigue el preview o si el texto parece afirmación de carga.
+    if (
+      pendingRows?.length &&
+      !prevTurnIsImportPreview &&
+      !isChatImportConfirm(text) &&
+      !isAffirmativeChat(text)
+    ) {
       setPendingChatImportSafe(null);
       pendingRows = null;
     } else if (
       pendingRows?.length &&
       prevTurnIsImportPreview &&
       !isNegativeChat(text) &&
-      !isChatImportConfirm(text)
+      !isChatImportConfirm(text) &&
+      !isAffirmativeChat(text) &&
+      /\b(dame|muestra|busca|compara|cuant|lista|elimina|borra|panorama|ranking)\b/i.test(
+        text,
+      )
     ) {
-      // Pregunta colateral con preview abierto → no importar; limpiar para no bloquear.
+      // Pregunta colateral real con preview abierto → limpiar para no bloquear.
       setPendingChatImportSafe(null);
       pendingRows = null;
     }
@@ -13308,6 +13361,38 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               side.viewerOverview || detectViewerOverview(spokenRaw);
             sideFocus = side.viewerFocus;
             resultItems = side.resultItems || sideItems;
+          }
+
+          // Áreas de una persona → plantilla de áreas (no inventario personTotal).
+          if (wantsPersonAreasBreakdown(spokenRaw)) {
+            const personName =
+              (ctx?.tipo === "persona" && ctx.valor) ||
+              findPersonInText(spokenRaw, items) ||
+              majorityItemField(
+                resultItems.length ? resultItems : sideItems,
+                "persona",
+              ) ||
+              "";
+            if (personName) {
+              let areaRows = resultItems.length ? resultItems : sideItems;
+              if (!areaRows.length) {
+                const pn = normalizeChatIntent(personName);
+                areaRows = items
+                  .filter((r) => {
+                    const p = normalizeChatIntent(String(r.persona || ""));
+                    return Boolean(
+                      p && (p === pn || p.includes(pn) || pn.includes(p)),
+                    );
+                  })
+                  .map((r) => rowToChatApiItem(r));
+              }
+              if (areaRows.length) {
+                sideOverview = "areas";
+                // Sin foco: el visor agrega áreas desde resultItems (listado).
+                sideFocus = undefined;
+                resultItems = areaRows;
+              }
+            }
           }
 
           finishBotReply(sessionId, botId, replyText, {

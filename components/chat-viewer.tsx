@@ -359,11 +359,15 @@ function ChatViewer({
 
     // Listado del chat (preview import / “esos 10 en qué áreas”) → stats desde resultItems.
     // Ranking global overview==="areas" SIN foco: siempre TODO el inventario (no 1 área previa).
+    const focusLabel = String(parsedFocus.label || focusArea || "").trim();
+    const todoInventarioFocus =
+      /^(todo el inventario|en el inventario|general)$/i.test(focusLabel);
     const globalAreasRanking =
-      overview === "areas" &&
-      !String(parsedFocus.label || focusArea || "").trim();
+      overview === "areas" && !focusLabel;
+    // Panorama “Todo el inventario”: métricas del inventario real, no de la muestra (12).
     const scopedFromChat =
       !globalAreasRanking &&
+      !todoInventarioFocus &&
       Array.isArray(resultItems) &&
       resultItems.length > 0 &&
       (overview === "areas" ||

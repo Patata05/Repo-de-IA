@@ -816,6 +816,17 @@ def panorama_inventario_data(
             }
         )
 
+    # Muestra corta solo para lista inferior; métricas = total real.
+    viewer_out = {
+        **viewer,
+        "metricas": {
+            "registros": metrics["registros"],
+            "personas": metrics["personas"],
+            "areas": metrics["areas"],
+            "activos": metrics["activos"],
+        },
+    }
+
     return {
         "ok": True,
         "titulo": f"Panorama de {label}",
@@ -823,8 +834,10 @@ def panorama_inventario_data(
         "general": not bool(canon),
         **metrics,
         "items": sample,
-        "viewer": viewer,
-        "filtro": viewer,
+        "viewer": viewer_out,
+        "filtro": viewer_out,
+        # Sample ≠ total: el front no debe contar solo las 12 filas.
+        "lista_limitada": True,
         "exportar_excel": False,
         "mensaje_agente": (
             f"Redacta el panorama de «{label}» con registros={metrics['registros']}, "
@@ -1869,7 +1882,11 @@ def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
         if locked_viewer:
             break
         if tipo in {"persona", "area", "origen"} and valor:
-            deps.viewer = {"tipo": tipo, "valor": valor}
+            next_viewer: dict[str, Any] = {"tipo": tipo, "valor": valor}
+            raw_metrics = raw.get("metricas")
+            if isinstance(raw_metrics, dict) and raw_metrics:
+                next_viewer["metricas"] = raw_metrics
+            deps.viewer = next_viewer
             break
     # QR: aceptar lista en "qr" o "qrs" (tools legacy usa qrs + qr=True).
     qr_cards = result.get("qr")
@@ -1961,6 +1978,14 @@ def build_contexto_vista_payload(
                 "valor": valor,
                 "lista_limitada": bool(deps.lista_limitada),
             }
+            # Totales reales del panorama (no la muestra de items).
+            raw_metrics = viewer.get("metricas")
+            if isinstance(raw_metrics, dict) and raw_metrics:
+                out["metricas"] = {
+                    k: raw_metrics.get(k)
+                    for k in ("registros", "personas", "areas", "activos")
+                    if raw_metrics.get(k) is not None
+                }
             return out
 
     # Inferir desde items si la tool no marcó viewer.
