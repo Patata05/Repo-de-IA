@@ -76,7 +76,10 @@ def is_affirmative_confirm(message: str) -> bool:
     return bool(
         __import__("re").match(
             r"^(sí|si|yes|ok|okay|okey|vale|dale|claro|listo|adelante|hazlo|"
-            r"procede|confirma|confirmo|de acuerdo)([,.\s].*)?$",
+            r"procede|confirma|confirmo|de acuerdo)"
+            r"([,.\s]+(por\s+favor|pls|please|"
+            r"importa\w*|carga\w*|sube\w*|imp[oó]rta\w*|confirma\w*|"
+            r"ponlo|ponla|metelo|guardalo|hazlo|procede)*)?$",
             t,
         )
     )
