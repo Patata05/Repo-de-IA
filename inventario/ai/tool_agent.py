@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,7 +31,7 @@ def _openai_http_client() -> httpx.AsyncClient:
 
 
 # Bump al cambiar instrucciones/tools del Agent (invalida singleton).
-_AGENT_INSTR_VER = "v9-panorama-export-confirm"
+_AGENT_INSTR_VER = "v13-voz-humana-temp06"
 
 def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, str, str]:
     # No guardar la key completa en logs; fingerprint corto para el dict.
@@ -37,29 +39,47 @@ def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, 
     return (fp, model_name, base_url.rstrip("/"), _AGENT_INSTR_VER)
 
 TOOL_AGENT_INSTRUCTIONS = """
-Eres el asistente de inventario (español de México). Tono cálido, claro y profesional.
-TÚ redactas SIEMPRE la respuesta al usuario en párrafos naturales. Las tools solo
-devuelven datos/estados crudos: NUNCA copies un “mensaje” prefabricado de una tool;
-interpreta los hechos (totales, items, ok/error) y habla como en una conversación real.
+Eres el compañero de inventario del equipo (español de México cotidiano).
+Hablas como una persona real: cercana, relajada y clara — nunca como bot,
+contestadora ni manual de atención al cliente. Las tools solo traen datos
+crudos de Supabase: NUNCA copies mensajes prefabricados; interpreta hechos
+(totales, items, ok/error) y explícalos como si se lo contaras a un colega
+en voz alta, con 100% de exactitud en números y registros.
+
+Personalidad y plática:
+- Sigue el tono de confianza del usuario. Si bromea, comenta o platica,
+  síguele la corriente con empatía y naturalidad un momento, y luego retoma
+  el tema del inventario sin romper el hilo.
+- PROHIBIDO frases de contestadora: “Estoy aquí para ayudarte”, “¿En qué
+  puedo asistirte hoy?”, “Si necesitas consultar algo específico…”,
+  “¿En qué te puedo apoyar?”, “Claro, con gusto te ayudo”, etc.
+- Varía cómo saludas y cierras; no uses siempre la misma fórmula.
+- Adapta formalidad/cercanía al usuario, sin sonar forzado.
+
+Relevancia (obligatorio):
+- Contesta exactamente lo que preguntó en este turno.
+- Solo datos exactos de tools/Supabase; sin inventar ni estimar.
+- Sin relleno ni “voy a…” / “un momento…” si ya tienes el resultado.
+- Pregunta concreta → respuesta concreta; no agregues temas no pedidos.
 
 Reglas de verdad:
 - NUNCA inventes etiquetas, totales, personas, áreas ni marcas.
-- Toda cifra o ficha debe salir de una tool de Supabase. Si la tool no encuentra
-  nada, dilo con naturalidad y ofrece otra búsqueda.
-- Ortografía: interpreta faltas sin corregir al usuario en voz alta; usa la tool
-  con el nombre que entendiste.
-- Usa el hilo reciente y la memoria de sesión: mantén el contexto (persona/área/
-  excel anunciado, confirmaciones pendientes, etc.).
+- Toda cifra o ficha debe salir de una tool de Supabase. Si no hay datos,
+  dilo con naturalidad (como lo diría un colega) y ofrece otra búsqueda.
+- Ortografía: interpreta faltas sin corregir al usuario en voz alta; usa la
+  tool con el nombre que entendiste.
+- Usa el hilo reciente y la memoria de sesión (persona/área/excel,
+  confirmaciones pendientes, etc.).
 
 Estilo:
-- Responde en párrafos naturales y conversacionales (1–3 frases o un párrafo corto).
+- Prosa corta y fluida (1–3 frases o un párrafo breve), como habla cotidiana.
 - PROHIBIDO viñetas (•), guiones (- *) o listas verticales campo por campo.
 - Si piden “últimos registros” o varios artículos: un párrafo breve por ítem
-  (“Etiqueta **269459** — **Laptop HP …** asignada a **Nombre** en **Área**,
+  (“Etiqueta **269459** — **Laptop HP …** de **Nombre** en **Área**,
   estado **Activo**.”). Negritas sutiles; sin bullets.
-- Si te saludan, saluda con amabilidad y pregunta en qué puedes apoyar hoy.
-- Cierra con UNA pregunta breve de seguimiento cuando aporte.
-- No uses slang (chido, órale, neta, wey).
+- Datos reales: cuéntalos con fluidez humana, sin perder ni un dígito.
+- Cierra con una pregunta breve SOLO si encaja en la conversación; si no, no.
+- Evita slang pesado (wey, neta); sí puedes sonar cercano y espontáneo.
 
 Excel / archivos (importante):
 - SUBIR/IMPORTAR ≠ EXPORTAR/DESCARGAR. Son acciones opuestas.
@@ -125,10 +145,12 @@ Tools (elige la mínima necesaria; solo datos):
 - obtener_por_etiqueta → ficha exacta.
 - listar_recientes → últimos / de hoy.
 - buscar_semantico → si la léxica falla o piden “similar a…”.
-- generar_qr → SOLO si piden QR (no para “dame etiquetas”).
-  “todos los QR” / sin N → TODOS los registros (o del origen indicado:
-  excel 1 / Inventario 1). Con N concreto → ese N. El visor recibe la
-  lista completa; en el chat resume el total + 3–5 ejemplos.
+- generar_qr → OBLIGATORIO si piden QR (no para “dame etiquetas”).
+  NO crea artículos nuevos: lista QR de registros YA existentes y los
+  carga en el visor derecho. Pedido general (“dame los qr”, “todos los
+  qr”) → TODOS (o del origen: excel 1 / Inventario 1). Con N o etiqueta
+  concreta → solo esos. NUNCA digas “generando…” sin haber llamado la
+  tool. Chat: total + 3–5 ejemplos; el visor lleva el 100%.
 - listar_criterios → varios filtros (N de aquí y M de TI).
 - preparar/confirmar/cancelar_consolidacion_inventario → crear/copiar en
   Supabase (ver bloque Consolidación). NO exporta Excel.
@@ -413,6 +435,11 @@ def generar_qr_data(
         for c in qrs[:5]
         if str(c.get("etiqueta") or "").strip()
     ]
+    sample_arts = [
+        str(c.get("articulo") or "").strip()
+        for c in qrs[:5]
+        if str(c.get("etiqueta") or "").strip()
+    ]
     focus = (
         (viewer or {}).get("valor")
         if isinstance(viewer, dict)
@@ -428,15 +455,306 @@ def generar_qr_data(
         "viewer": viewer,
         "filtro": viewer,
         "exportar_excel": False,
-        "mensaje_agente": (
-            f"Se generaron {len(qrs)} códigos QR"
-            + (f" de «{focus}»" if focus else "")
-            + " y están en el visor derecho. "
-            f"En el chat resume el total"
-            + (f" y menciona ejemplos: {', '.join(sample)}" if sample else "")
-            + ". NO listes todos los QR en el texto."
-        ),
+        # Solo hechos crudos para que OpenAI redacte (sin prosa fija).
+        "hechos_qr": {
+            "total": len(qrs),
+            "foco": focus,
+            "ejemplos_etiqueta": sample,
+            "ejemplos_articulo": sample_arts,
+            "visor_completo": True,
+        },
     }
+
+
+def _fold_qr_msg(raw: str) -> str:
+    text = unicodedata.normalize("NFD", str(raw or "").lower())
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_qr_request(message: str) -> dict[str, Any] | None:
+    """
+    Detecta pedido de QR. None si no es QR.
+    Pedido general → limit/etiqueta/origen vacíos (todos).
+    Con N o etiqueta → acota; no inventa registros nuevos.
+    """
+    fold = _fold_qr_msg(message)
+    if not fold:
+        return None
+    is_qr = bool(
+        re.search(r"\bqr\b|\bcodigos?\s*qr\b|\bqr\s*codigos?\b", fold)
+        or (
+            re.search(r"\bcodigos?\b", fold)
+            and not re.search(r"\betiquet", fold)
+        )
+    )
+    if not is_qr:
+        return None
+
+    out: dict[str, Any] = {
+        "etiqueta": None,
+        "query": None,
+        "origen": None,
+        "limit": None,
+        "ultimo": False,
+    }
+
+    m_etq = re.search(
+        r"\betiquetas?\s+(\d{3,})\b|\b(?:qr|codigo)\s+(?:de\s+)?(?:la\s+)?"
+        r"etiquetas?\s+(\d{3,})\b",
+        fold,
+    )
+    if m_etq:
+        out["etiqueta"] = (m_etq.group(1) or m_etq.group(2) or "").strip()
+        out["limit"] = 1
+        return out
+
+    if re.search(r"\bultim[oa]s?\b", fold):
+        out["ultimo"] = True
+        out["limit"] = 1
+        return out
+
+    m_or = re.search(
+        r"\b((?:excel|xlsx|xls|csv|ecel|inventario)\s*\d+)\b", fold
+    )
+    if m_or:
+        canon = canonicalize_origen_alias(m_or.group(1)) or m_or.group(1)
+        out["origen"] = canon
+
+    m_lim = re.search(
+        r"\b(\d{1,4})\s*(?:codigos?\s*)?qr\b|\bqr\s*(?:de\s+)?(\d{1,4})\b",
+        fold,
+    )
+    if m_lim:
+        raw_n = m_lim.group(1) or m_lim.group(2)
+        try:
+            n = int(raw_n)
+            if n > 0:
+                out["limit"] = n
+        except ValueError:
+            pass
+
+    # “de Persona/Área” sin origen numérico.
+    if not out["origen"]:
+        m_de = re.search(
+            r"\b(?:de|del|en)\s+([a-z0-9][\w ./-]{1,40})$|"
+            r"\b(?:de|del|en)\s+([a-z0-9][\w ./-]{1,40})\b",
+            fold,
+        )
+        if m_de:
+            cand = (m_de.group(1) or m_de.group(2) or "").strip()
+            if cand and not re.search(
+                r"^(los|las|todos?|todas?|qr|codigos?|inventario|excel)\b",
+                cand,
+            ):
+                out["query"] = cand
+
+    return out
+
+
+def _looks_like_qr_pending_narration(reply: str) -> bool:
+    t = _fold_qr_msg(reply)
+    if not t:
+        return True
+    return bool(
+        re.search(
+            r"\b(generando|voy a generar|un momento|incluira todo|"
+            r"esto incluira|procesando)\b",
+            t,
+        )
+    )
+
+
+def _qr_facts_from_deps(deps: "ToolAgentDeps", message: str) -> dict[str, Any]:
+    samples_etq: list[str] = []
+    samples_art: list[str] = []
+    for card in deps.qr[:5]:
+        if not isinstance(card, dict):
+            continue
+        etq = str(card.get("etiqueta") or "").strip()
+        art = str(card.get("articulo") or "").strip()
+        if etq:
+            samples_etq.append(etq)
+            samples_art.append(art)
+    focus = ""
+    if isinstance(deps.viewer, dict):
+        focus = str(deps.viewer.get("valor") or "").strip()
+    return {
+        "total_qr": len(deps.qr),
+        "foco": focus or None,
+        "ejemplos_etiqueta": samples_etq,
+        "ejemplos_articulo": samples_art,
+        "visor_derecho_completo": True,
+        "pedido": (message or "").strip()[:160],
+    }
+
+
+def compose_qr_natural_reply(
+    message: str,
+    facts: dict[str, Any],
+    *,
+    session_id: str | None = None,
+    preferred_model: str | None = None,
+) -> tuple[str | None, dict]:
+    """OpenAI redacta con hechos crudos (sin plantilla fija). Preferir chat corto."""
+    import json as _json
+
+    from inventario.ai.client import DEFAULT_MODEL, get_llm_endpoints
+    from inventario.ai.usage import count_tokens, empty_usage
+
+    usage = empty_usage()
+    # 1) Chat corto con hechos (rápido). Sin prosa prediseñada.
+    try:
+        endpoints = get_llm_endpoints()
+        ep = endpoints[0] if endpoints else None
+        if ep:
+            api_key = (ep.api_key or "").strip()
+            model_name = (preferred_model or "").strip() or (
+                ep.models[0] if ep.models else DEFAULT_MODEL
+            )
+            system = (
+                "Eres un compañero de inventario (español de México cotidiano): "
+                "cercano, relajado, humano. Explica los HECHOS como se lo "
+                "contarías a un colega en voz alta. Exactitud total en cifras. "
+                "No inventes etiquetas fuera de ejemplos. No digas que estás "
+                "'generando'. Prohibido frases de contestadora "
+                "('Estoy aquí para ayudarte', '¿En qué puedo asistirte…'). "
+                "El listado completo ya está en el visor derecho; en el chat "
+                "resume total + 3–5 ejemplos con naturalidad."
+            )
+            user_payload = _json.dumps(
+                {"pedido": (message or "").strip()[:160], "hechos": facts},
+                ensure_ascii=False,
+            )
+            completion = ep.client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_payload},
+                ],
+                max_tokens=AGENT_MAX_TOKENS,
+                temperature=AGENT_TEMPERATURE,
+            )
+            text = (
+                (completion.choices[0].message.content or "").strip()
+                if completion.choices
+                else ""
+            )
+            pt = int(
+                getattr(getattr(completion, "usage", None), "prompt_tokens", 0)
+                or 0
+            )
+            ct = int(
+                getattr(
+                    getattr(completion, "usage", None), "completion_tokens", 0
+                )
+                or 0
+            )
+            if not pt:
+                pt = count_tokens(system + user_payload, model_name)
+            if not ct and text:
+                ct = count_tokens(text, model_name)
+            usage = empty_usage(
+                model=model_name,
+                api_key=api_key,
+                prompt_tokens=pt,
+                completion_tokens=ct,
+            )
+            if text:
+                return text, usage
+    except Exception:  # noqa: BLE001
+        logger.exception("compose_qr chat corto falló; intento dynamic_reply")
+
+    # 2) Fallback: compose_dynamic_reply (también OpenAI, sin plantilla fija).
+    try:
+        from inventario.ai.dynamic_reply import compose_dynamic_reply
+
+        composed = compose_dynamic_reply(
+            user_text=message,
+            facts=facts,
+            kind="qr_list",
+            session_id=session_id,
+        )
+        if composed and (composed.reply or "").strip():
+            return (composed.reply or "").strip(), usage
+    except Exception:  # noqa: BLE001
+        logger.exception("compose_qr dynamic_reply failed")
+    return None, usage
+
+
+def load_qr_for_ask(
+    deps: "ToolAgentDeps",
+    message: str,
+) -> dict[str, Any] | None:
+    """Carga QR existentes al visor (datos crudos). Sin redactar chat."""
+    ask = parse_qr_request(message)
+    if not ask:
+        return None
+    if deps.qr:
+        return {
+            "ok": True,
+            "count": len(deps.qr),
+            "qr": deps.qr,
+            "viewer": deps.viewer,
+            "hechos_qr": _qr_facts_from_deps(deps, message),
+        }
+    result = generar_qr_data(
+        etiqueta=ask.get("etiqueta"),
+        query=ask.get("query"),
+        origen=ask.get("origen"),
+        limit=ask.get("limit"),
+        ultimo=bool(ask.get("ultimo")),
+    )
+    _absorb(deps, result)
+    return result
+
+
+def ensure_qr_for_ask(
+    deps: "ToolAgentDeps",
+    message: str,
+    reply: str,
+    *,
+    session_id: str | None = None,
+    preferred_model: str | None = None,
+) -> str:
+    """
+    Garantiza payload QR en el visor. Si el chat quedó vacío/a medias,
+    pide a OpenAI una redacción natural con hechos (sin plantilla fija).
+    """
+    ask = parse_qr_request(message)
+    if not ask:
+        return reply
+
+    result = load_qr_for_ask(deps, message)
+    if not deps.qr:
+        if reply and not _looks_like_qr_pending_narration(reply):
+            return reply
+        err_facts = {
+            "ok": False,
+            "error": (result or {}).get("error") if isinstance(result, dict) else None,
+            "pedido": (message or "").strip()[:160],
+        }
+        natural, _ = compose_qr_natural_reply(
+            message,
+            err_facts,
+            session_id=session_id,
+            preferred_model=preferred_model,
+        )
+        return natural or reply
+
+    if reply and not _looks_like_qr_pending_narration(reply):
+        return reply
+
+    facts = _qr_facts_from_deps(deps, message)
+    if isinstance(result, dict) and isinstance(result.get("hechos_qr"), dict):
+        facts = {**result["hechos_qr"], **facts}
+    natural, _ = compose_qr_natural_reply(
+        message,
+        facts,
+        session_id=session_id,
+        preferred_model=preferred_model,
+    )
+    return natural or reply
 
 
 def panorama_inventario_data(
@@ -1580,12 +1898,13 @@ def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
             if isinstance(result.get("count"), int)
             else len(full_qrs)
         )
-        out["mensaje_agente"] = (
-            str(result.get("mensaje_agente") or "")
-            or (
-                f"Se generaron {out['count']} códigos QR en el visor derecho. "
-                "Resume el total en el chat con 3–5 ejemplos; NO listes todos."
-            )
+        # Hechos crudos para el modelo (sin prosa fija).
+        if isinstance(result.get("hechos_qr"), dict):
+            out["hechos_qr"] = result["hechos_qr"]
+        out.pop("mensaje_agente", None)
+        out["qrs_note"] = (
+            f"total_qr={out['count']}; resume en prosa natural; "
+            "visor derecho ya tiene la lista completa; máx 5 ejemplos en chat."
         )
     return out
 
@@ -1682,6 +2001,24 @@ def build_contexto_vista_payload(
                     "lista_limitada": bool(deps.lista_limitada),
                 }
 
+    # QR en deps sin viewer explícito → abrir visor con foco de origen mayoritario.
+    if deps.qr:
+        origenes_qr: dict[str, int] = {}
+        for card in deps.qr:
+            if not isinstance(card, dict):
+                continue
+            o = str(card.get("origen") or "").strip()
+            if o:
+                origenes_qr[o] = origenes_qr.get(o, 0) + 1
+        valor = "Inventario"
+        if origenes_qr:
+            valor = max(origenes_qr.items(), key=lambda kv: kv[1])[0]
+        return {
+            "tipo": "origen",
+            "valor": valor,
+            "lista_limitada": False,
+        }
+
     # Tools sin filtro claro / charla → null (visor oculto).
     if _is_chitchat(reply, user_message):
         return None
@@ -1754,13 +2091,21 @@ def _build_agent(api_key: str, model_name: str, base_url: str = ""):
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
+    from pydantic_ai.settings import ModelSettings
 
     provider = OpenAIProvider(
         api_key=api_key,
         base_url=(base_url or "https://api.openai.com/v1").rstrip("/"),
         http_client=_openai_http_client(),
     )
-    model = OpenAIChatModel(model_name, provider=provider)
+    model = OpenAIChatModel(
+        model_name,
+        provider=provider,
+        settings=ModelSettings(
+            max_tokens=AGENT_MAX_TOKENS,
+            temperature=AGENT_TEMPERATURE,
+        ),
+    )
     agent: Agent[ToolAgentDeps, str] = Agent(
         model,
         deps_type=ToolAgentDeps,
@@ -1777,7 +2122,7 @@ def _build_agent(api_key: str, model_name: str, base_url: str = ""):
         return _run(
             ctx.deps,
             "buscar_inventario",
-            {"query": query, "limit": max(1, min(40, int(limit or 40)))},
+            {"query": query, "limit": max(1, min(2000, int(limit or 40)))},
         )
 
     @agent.tool
@@ -1874,8 +2219,9 @@ def _build_agent(api_key: str, model_name: str, base_url: str = ""):
         ultimo: bool = False,
     ) -> dict[str, Any]:
         """
-        Genera QR. Sin N → todos (inventario completo o del origen/query).
-        Con N → ese máximo. El visor recibe la lista completa.
+        Lista QR de registros existentes (no crea artículos).
+        Sin N → todos (inventario o origen/query). Con N/etiqueta → solo esos.
+        El visor derecho recibe la lista completa.
         """
         try:
             lim: int | None
@@ -2078,9 +2424,12 @@ def get_or_build_agent(api_key: str, model_name: str, base_url: str = ""):
         return agent
 
 
-# Historial corto → menos tokens / menos latencia.
-MAX_HISTORY_MESSAGES = 6
+# Historial corto → menos tokens / menos latencia (últimos 4 turnos).
+MAX_HISTORY_MESSAGES = 4
 _TOOL_RETURN_MAX_CHARS = 280
+# gpt-4o-mini: respuestas rápidas y acotadas.
+AGENT_MAX_TOKENS = 300
+AGENT_TEMPERATURE = 0.6
 
 
 def _fold_user_text(raw: str) -> str:
@@ -2119,58 +2468,171 @@ def _session_has_pending_action(session_id: str | None) -> bool:
     return False
 
 
+_INVENTARIO_INTENT_RE = re.compile(
+    r"\b("
+    r"\d{3,}|"
+    r"etiqueta|etiquetas|persona|personas|area|areas|"
+    r"inventario|inventarios|excel|xlsx|xls|csv|archivo|archivos|"
+    r"export|exporta|exportar|descarg|descarga|descargar|"
+    r"import|importa|importar|sube|subir|"
+    r"compara|comparar|comparacion|diferencias?|"
+    r"consolida|consolidar|traslad\w*|"
+    r"elimina\w*|borra\w*|"
+    r"registro|registros|articulo|articulos|equipo|equipos|"
+    r"proyector|laptop|marca|modelo|serie|origen|ficha|"
+    r"qr|codigos?\s*qr|panorama|resumen|dashboard|"
+    r"cuantos|cuantas|ranking"
+    r")\b"
+)
+
+
 def is_fast_chitchat_message(
     message: str, *, session_id: str | None = None
 ) -> bool:
     """
-    Saludo / charla corta sin pedido de datos.
+    Charla corta sin pedido de inventario/datos.
     False si hay consolidación/export/borrado pendiente (p. ej. «sí»).
     """
     if _session_has_pending_action(session_id):
         return False
     t = _fold_user_text(message)
-    if not t or len(t) > 48:
+    if not t:
         return False
-    import re
-
-    if re.search(
-        r"\b(\d{3,}|etiqueta|persona|area|inventario|excel|xlsx|csv|"
-        r"export|descarg|import|compara|consolida|traslad|elimina|borra|"
-        r"registro|proyector|laptop|qr|panorama|resumen|cuantos|cuantas)\b",
-        t,
-    ):
-        return False
-    if re.fullmatch(
-        r"(hola|holaa*|hey|hi|hello|buenas|buen dia|buenos dias|"
-        r"buena tarde|buenas tardes|buena noche|buenas noches|"
-        r"que tal|como estas|como va|que onda|saludos|"
-        r"gracias|muchas gracias|mil gracias|de nada|"
-        r"adios|hasta luego|nos vemos|buen dia|"
-        r"ok|okay|okey|vale|perfecto|excelente|genial|"
-        r"todo bien|muy bien)( {0,3}\w+){0,3}",
-        t,
-    ):
-        return True
-    # Frases cortas de cortesía (≤6 palabras) solo con tokens de saludo.
+    # Corto: plática tipo «bien y el tuyo», no consultas largas.
     words = t.split()
-    if len(words) <= 6 and re.match(
-        r"^(hola|buenas|hey|hi|gracias|adios|que tal|como estas)\b",
-        t,
-    ):
-        return True
-    return False
+    if len(t) > 80 or len(words) > 14:
+        return False
+    if _INVENTARIO_INTENT_RE.search(t):
+        return False
+    return True
+
+
+def is_fast_qr_message(message: str, *, session_id: str | None = None) -> bool:
+    """Pedido directo de QR (sin pending de consolidación/export/borrado)."""
+    if _session_has_pending_action(session_id):
+        return False
+    return parse_qr_request(message) is not None
+
+
+def run_fast_qr_reply(
+    message: str,
+    *,
+    preferred_model: str | None = None,
+    session_id: str | None = None,
+) -> tuple[str, str | None, str | None, list, bool, list, dict, dict | None]:
+    """
+    QR rápido: hechos crudos desde Supabase + redacción OpenAI natural.
+    Sin plantillas fijas; sin agente/tools (más rápido).
+    """
+    from inventario.ai.usage import empty_usage
+
+    deps = ToolAgentDeps(session_id=session_id)
+    result = load_qr_for_ask(deps, message or "")
+    facts: dict[str, Any]
+    if deps.qr:
+        facts = _qr_facts_from_deps(deps, message or "")
+        if isinstance(result, dict) and isinstance(result.get("hechos_qr"), dict):
+            facts = {**result["hechos_qr"], **facts}
+    else:
+        facts = {
+            "ok": False,
+            "error": (result or {}).get("error")
+            if isinstance(result, dict)
+            else "sin_qr",
+            "pedido": (message or "").strip()[:160],
+            "total_qr": 0,
+        }
+
+    text, usage = compose_qr_natural_reply(
+        message or "",
+        facts,
+        session_id=session_id,
+        preferred_model=preferred_model,
+    )
+    if not text:
+        # Último recurso mínimo (solo si OpenAI falló): cifra cruda, sin plantilla larga.
+        total = int(facts.get("total_qr") or facts.get("total") or 0)
+        text = (
+            f"Hay {total} códigos QR listos en el visor derecho."
+            if total
+            else "No encontré códigos QR para esa consulta."
+        )
+        usage = usage or empty_usage()
+
+    ctx = build_contexto_vista_payload(
+        deps, user_message=message or "", reply=text
+    )
+    return (
+        text,
+        None,
+        "openai-fast-qr",
+        deps.collected[:MAX_SIDE_ITEMS],
+        False,
+        deps.qr,
+        usage,
+        ctx,
+    )
+
+
+def _plain_history_for_chitchat(
+    history: list[dict] | None,
+    session_id: str | None,
+    *,
+    max_n: int = MAX_HISTORY_MESSAGES,
+) -> list[dict[str, str]]:
+    """Últimos N turnos user/assistant (texto corto), sin tools/Supabase."""
+    out: list[dict[str, str]] = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role in {"user", "human"}:
+            role = "user"
+        elif role in {"assistant", "bot", "ai"}:
+            role = "assistant"
+        else:
+            continue
+        content = str(item.get("content") or item.get("text") or "").strip()
+        if not content:
+            continue
+        if len(content) > 280:
+            content = content[:279] + "…"
+        out.append({"role": role, "content": content})
+    if len(out) < max_n and session_id:
+        try:
+            from inventario.ai.session_memory import (
+                history_for_openai_agent,
+            )
+
+            for item in history_for_openai_agent(session_id, None) or []:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role not in {"user", "assistant"}:
+                    continue
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                if len(content) > 280:
+                    content = content[:279] + "…"
+                out.append({"role": role, "content": content})
+        except Exception:  # noqa: BLE001
+            pass
+    return out[-max_n:]
 
 
 def run_fast_chitchat_reply(
     message: str,
     *,
     preferred_model: str | None = None,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, str | None, str | None, list, bool, list, dict, None]:
     """
-    Llamada ligera a gpt-4o-mini: sin tools ni historial.
+    Llamada ligera a gpt-4o-mini: sin tools; solo últimos 4 turnos de prosa.
     Devuelve el mismo shape que run_tool_agent.
     """
-    from inventario.ai.client import DEFAULT_MODEL, OPENAI_BASE_URL, get_llm_endpoints
+    from inventario.ai.client import DEFAULT_MODEL, get_llm_endpoints
     from inventario.ai.usage import count_tokens, empty_usage
 
     try:
@@ -2220,22 +2682,28 @@ def run_fast_chitchat_reply(
     )
     user_msg = (message or "").strip() or "hola"
     system = (
-        "Eres el asistente de inventario (español de México). "
-        "El usuario solo saluda o hace charla corta. "
-        "Responde en 1–2 frases naturales y cordiales. "
-        "NO menciones inventarios, Excel, comparaciones ni acciones previas. "
-        "NO uses herramientas. Cierra invitando a preguntar sobre el inventario."
+        "Eres un compañero de trabajo amable y relajado (español de México "
+        "cotidiano). El usuario solo saluda o platica. "
+        "Responde en 1–2 frases humanas, cercanas y espontáneas; síguele la "
+        "corriente si bromea o comenta. "
+        "PROHIBIDO frases de bot/contestadora ('Estoy aquí para ayudarte', "
+        "'¿En qué puedo asistirte hoy?', 'Si necesitas algo…'). "
+        "NO menciones inventarios, Excel ni acciones previas. "
+        "NO uses herramientas. Varía el cierre; no suenes a script."
     )
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for turn in _plain_history_for_chitchat(
+        history, session_id, max_n=MAX_HISTORY_MESSAGES
+    ):
+        messages.append(turn)
+    messages.append({"role": "user", "content": user_msg})
     try:
         client = ep.client
         completion = client.chat.completions.create(
             model=model_name,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=80,
-            temperature=0.7,
+            messages=messages,
+            max_tokens=min(120, AGENT_MAX_TOKENS),
+            temperature=AGENT_TEMPERATURE,
         )
         text = (
             (completion.choices[0].message.content or "").strip()
@@ -2243,7 +2711,7 @@ def run_fast_chitchat_reply(
             else ""
         )
         if not text:
-            text = "¡Hola! ¿En qué te ayudo con el inventario?"
+            text = "¡Qué tal! Dime."
         prompt_tokens = int(
             getattr(getattr(completion, "usage", None), "prompt_tokens", 0) or 0
         )
@@ -2274,7 +2742,7 @@ def run_fast_chitchat_reply(
     except Exception as exc:  # noqa: BLE001
         logger.exception("fast chitchat failed")
         # Fallback mínimo (sin historial/tools) si OpenAI falla.
-        text = "¡Hola! ¿En qué te ayudo con el inventario?"
+        text = "¡Qué tal! Dime."
         usage = empty_usage(
             model=model_name,
             api_key=api_key,
@@ -2448,9 +2916,22 @@ def run_tool_agent(
     from inventario.ai.usage import empty_usage, usage_from_pydantic_result
     from inventario.supabase_client import get_env
 
-    # Saludo / charla: sin tools ni historial largo.
+    # Saludo / charla: sin tools; solo últimos 4 turnos de prosa.
     if is_fast_chitchat_message(message, session_id=session_id):
-        return run_fast_chitchat_reply(message, preferred_model=preferred_model)
+        return run_fast_chitchat_reply(
+            message,
+            preferred_model=preferred_model,
+            history=history,
+            session_id=session_id,
+        )
+
+    # QR directo: datos + compose corto (sin agente/tools → mucho más rápido).
+    if is_fast_qr_message(message, session_id=session_id):
+        return run_fast_qr_reply(
+            message,
+            preferred_model=preferred_model,
+            session_id=session_id,
+        )
 
     try:
         endpoints = get_llm_endpoints()
@@ -2645,6 +3126,14 @@ def run_tool_agent(
                 "No logré armar una respuesta clara con lo consultado. "
                 "¿Me lo dices de otra forma?"
             )
+        # Pedido QR: datos al visor; si el chat quedó a medias, OpenAI redacta con hechos.
+        text = ensure_qr_for_ask(
+            deps,
+            message or "",
+            text,
+            session_id=session_id,
+            preferred_model=preferred_model,
+        )
         usage = usage_from_pydantic_result(
             result,
             model=model_name,
@@ -2674,9 +3163,29 @@ def run_tool_agent(
         logger.exception("tool_agent run failed")
         err = str(exc)
         usage = empty_usage(model=model_name, api_key=api_key)
-        ctx = build_contexto_vista_payload(
-            deps, user_message=message or "", reply=""
+        # Aun con fallo LLM: si pidieron QR, listar datos + redactar con OpenAI.
+        fallback_reply = ensure_qr_for_ask(
+            deps,
+            message or "",
+            "",
+            session_id=session_id,
+            preferred_model=preferred_model,
         )
+        ctx = build_contexto_vista_payload(
+            deps, user_message=message or "", reply=fallback_reply or ""
+        )
+        if deps.qr:
+            return (
+                fallback_reply
+                or "Listé los códigos QR en el visor derecho.",
+                None,
+                f"pydantic-ai:{model_name}",
+                deps.collected[:MAX_SIDE_ITEMS],
+                deps.mutated,
+                deps.qr,
+                usage,
+                ctx,
+            )
         if "api" in err.lower() or "timeout" in err.lower() or "connect" in err.lower():
             return (
                 "OpenAI no respondió. Reintento en unos segundos…",

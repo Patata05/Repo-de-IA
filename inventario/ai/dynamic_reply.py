@@ -53,6 +53,10 @@ Reglas:
 - kind delete_clarify: no quedó claro qué borrar; pregunta con naturalidad
   (etiqueta, excel N o Inventario N). Sin listas de ejemplos rígidas.
 - kind import_cancel: confirma que cancelaste la carga pendiente sin tocar datos.
+- kind qr_list: facts trae total_qr/foco/ejemplos_etiqueta (datos ya en el
+  visor derecho). Resume en prosa natural el total + 3–5 ejemplos; invita a
+  abrir QR >. PROHIBIDO decir “generando”, “un momento” o listar todos.
+  PROHIBIDO plantillas fijas tipo “Listos N códigos…”. Varía cada vez.
 - Varía la redacción: no uses siempre la misma pregunta final.
 - Si el usuario dice “¿recuerdas?”, “te pedí…”, reconoce el hilo.
 - Prohibido slang (bronca, chido, órale, neta, late, wey).

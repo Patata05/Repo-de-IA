@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 # Tope para listados conversacionales (texto en chat). Export/consolidación/contar_por_campo
 # siguen con límites altos propios.
-CHAT_LIST_CAP = 40
+# Listados etiquetas/búsqueda: respeta N del usuario (sin tope artificial 40/50).
+CHAT_LIST_CAP = 2000
 
 
 def format_inventario_qr_text(row: dict[str, Any]) -> str:

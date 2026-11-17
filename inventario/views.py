@@ -221,15 +221,22 @@ def chat(request):
             }
         )
 
-    # Saludo/charla: respuesta ligera (sin historial gigante ni tools).
+    # Saludo/charla o QR directo: respuesta ligera (sin historial gigante ni agente).
     from inventario.ai.tool_agent import (
         is_fast_chitchat_message,
+        is_fast_qr_message,
         run_fast_chitchat_reply,
+        run_fast_qr_reply,
     )
 
     if is_fast_chitchat_message(message, session_id=session_id):
         reply, error, used_model, items, mutated, qr_list, usage, viewer = (
-            run_fast_chitchat_reply(message, preferred_model=preferred_model)
+            run_fast_chitchat_reply(
+                message,
+                preferred_model=preferred_model,
+                history=history if isinstance(history, list) else None,
+                session_id=session_id,
+            )
         )
         if session_id and reply:
             try:
@@ -256,6 +263,41 @@ def chat(request):
             }
         )
 
+    if is_fast_qr_message(message, session_id=session_id):
+        reply, error, used_model, items, mutated, qr_list, usage, viewer = (
+            run_fast_qr_reply(
+                message,
+                preferred_model=preferred_model,
+                session_id=session_id,
+            )
+        )
+        if session_id and reply:
+            try:
+                from inventario.ai.tool_agent import persist_short_turn
+
+                persist_short_turn(session_id, message, reply)
+            except Exception:  # noqa: BLE001
+                pass
+        acciones = build_acciones_sugeridas(
+            reply or "", items or [], message, viewer
+        )
+        return JsonResponse(
+            {
+                "reply": reply,
+                "error": error,
+                "used": used_model,
+                "items": items or [],
+                "mutated": False,
+                "qr": list(qr_list or []),
+                "usage": usage or {},
+                "memory_engine": "openai-fast-qr" if session_id else None,
+                "acciones_sugeridas": acciones,
+                "exportar_excel": False,
+                "contexto_vista": viewer,
+                "viewer": viewer,
+            }
+        )
+
     # PydanticAI message_history (Supabase messages_json) + recorte de tokens.
     effective_history = history or []
     model_msgs = []
@@ -278,7 +320,7 @@ def chat(request):
         ]
     except Exception:  # noqa: BLE001
         model_msgs = []
-        effective_history = (history or [])[-6:]
+        effective_history = (history or [])[-4:]
 
     reply, error, used_model, items, mutated, qr_list, usage, viewer = run_chat_agent(
         message,
