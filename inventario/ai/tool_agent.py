@@ -31,7 +31,7 @@ def _openai_http_client() -> httpx.AsyncClient:
 
 
 # Bump al cambiar instrucciones/tools del Agent (invalida singleton).
-_AGENT_INSTR_VER = "v13-voz-humana-temp06"
+_AGENT_INSTR_VER = "v15-fastpath-saludos-puros"
 
 def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, str, str]:
     # No guardar la key completa en logs; fingerprint corto para el dict.
@@ -46,15 +46,17 @@ crudos de Supabase: NUNCA copies mensajes prefabricados; interpreta hechos
 (totales, items, ok/error) y explícalos como si se lo contaras a un colega
 en voz alta, con 100% de exactitud en números y registros.
 
-Personalidad y plática:
-- Sigue el tono de confianza del usuario. Si bromea, comenta o platica,
-  síguele la corriente con empatía y naturalidad un momento, y luego retoma
-  el tema del inventario sin romper el hilo.
+Personalidad (compañero de trabajo):
+- Habla natural, amable y cercano — como un colega en la oficina, no como bot.
+- Si el usuario bromea o comenta al margen, responde con calidez en una
+  frase corta y reencauza de inmediato al inventario / a la tarea.
+- PROHIBIDO desviarte a plática personal (“platiquemos de otra cosa”,
+  “¿cómo va tu día?”, “cuéntame de ti”, chisme ajeno al trabajo).
 - PROHIBIDO frases de contestadora: “Estoy aquí para ayudarte”, “¿En qué
   puedo asistirte hoy?”, “Si necesitas consultar algo específico…”,
   “¿En qué te puedo apoyar?”, “Claro, con gusto te ayudo”, etc.
-- Varía cómo saludas y cierras; no uses siempre la misma fórmula.
-- Adapta formalidad/cercanía al usuario, sin sonar forzado.
+- Varía saludos/cierres; adapta formalidad/cercanía sin sonar forzado.
+- Enfoque: ayudar a avanzar con inventario, Excel, QR, consolidación, etc.
 
 Relevancia (obligatorio):
 - Contesta exactamente lo que preguntó en este turno.
@@ -2468,6 +2470,100 @@ def _session_has_pending_action(session_id: str | None) -> bool:
     return False
 
 
+def _looks_like_import_or_confirm_ask(text: str) -> bool:
+    """Último mensaje del bot pide confirmar import/Excel/carga/consolidación."""
+    t = _fold_user_text(text)
+    if not t:
+        return False
+    asks_file = bool(
+        re.search(
+            r"\b(import\w*|cargar?|carga|excel|xlsx|csv|archivo|filas|"
+            r"registros|origen|destino|consolid\w*|export\w*|descarg\w*)\b",
+            t,
+        )
+    )
+    asks_confirm = bool(
+        re.search(
+            r"\b(confirm\w*|importalo|importalos|subelo|subelos|"
+            r"revis\w*|prepar\w*|listo|visto|deseas|quieres|"
+            r"responda?\s+s[ií]|con\s+s[ií])\b",
+            t,
+        )
+    )
+    return asks_file and asks_confirm
+
+
+def _last_assistant_awaits_confirm(
+    history: list[dict] | None,
+    session_id: str | None,
+) -> bool:
+    """True si el último turno assistant espera confirmación (import/Excel/etc.)."""
+    texts: list[str] = []
+    for item in reversed(list(history or [])):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"assistant", "bot", "ai"}:
+            if role in {"user", "human"} and texts:
+                break
+            continue
+        content = str(item.get("content") or item.get("text") or "").strip()
+        if content:
+            texts.append(content)
+            break
+    if not texts and session_id:
+        try:
+            from inventario.ai.session_memory import history_for_openai_agent
+
+            for item in reversed(history_for_openai_agent(session_id, None) or []):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("role") or "").strip().lower() != "assistant":
+                    continue
+                content = str(item.get("content") or "").strip()
+                if content:
+                    texts.append(content)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    return any(_looks_like_import_or_confirm_ask(t) for t in texts)
+
+
+def _is_pending_confirm_phrase(message: str) -> bool:
+    """«sí», «súbelo», «impórtalo», «dale», etc. → no es charla casual."""
+    raw = (message or "").strip()
+    if not raw:
+        return False
+    try:
+        from inventario.ai.pending_consolidacion import is_affirmative_confirm
+
+        if is_affirmative_confirm(raw):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    t = _fold_user_text(raw)
+    if re.match(
+        r"^(si|sí|yes|ok|okay|okey|vale|dale|claro|listo|adelante|hazlo|"
+        r"procede|confirma|confirmo|de acuerdo)"
+        r"([\s,.:;!-]+(por\s+favor|pls|please)?)?$",
+        t,
+    ):
+        return True
+    # Verbos de carga / importación explícitos.
+    return bool(
+        re.match(
+            r"^(si|sí|yes)?\s*"
+            r"(importa(r|los|las|lo|la|me)?|carga(r|los|las|lo|la)?|"
+            r"sube(r|los|las|lo|la)?|subelo|subelos|subela|subelas|"
+            r"importalo|importalos|importala|importalas|"
+            r"guardalo|guardalos|guardala|guardalas|"
+            r"confirmar?\s*(e\s*)?importar?)"
+            r"([\s.!]*)?$",
+            t,
+        )
+    )
+
+
 _INVENTARIO_INTENT_RE = re.compile(
     r"\b("
     r"\d{3,}|"
@@ -2481,30 +2577,59 @@ _INVENTARIO_INTENT_RE = re.compile(
     r"registro|registros|articulo|articulos|equipo|equipos|"
     r"proyector|laptop|marca|modelo|serie|origen|ficha|"
     r"qr|codigos?\s*qr|panorama|resumen|dashboard|"
-    r"cuantos|cuantas|ranking"
+    r"cuantos|cuantas|ranking|duplicad\w*|checa\w*|revisa\w*"
     r")\b"
 )
 
 
 def is_fast_chitchat_message(
-    message: str, *, session_id: str | None = None
+    message: str,
+    *,
+    session_id: str | None = None,
+    history: list[dict] | None = None,
 ) -> bool:
     """
-    Charla corta sin pedido de inventario/datos.
-    False si hay consolidación/export/borrado pendiente (p. ej. «sí»).
+    SOLO saludos / cortesía pura (hola, gracias, ok…).
+    Cualquier pedido de datos, import, duplicados, etc. → agente con tools.
     """
     if _session_has_pending_action(session_id):
         return False
-    t = _fold_user_text(message)
-    if not t:
+    # Confirmación de Excel/import/consolidación pendiente → agente completo.
+    if _last_assistant_awaits_confirm(history, session_id) and _is_pending_confirm_phrase(
+        message
+    ):
         return False
-    # Corto: plática tipo «bien y el tuyo», no consultas largas.
-    words = t.split()
-    if len(t) > 80 or len(words) > 14:
+    t = _fold_user_text(message)
+    if not t or len(t) > 48:
         return False
     if _INVENTARIO_INTENT_RE.search(t):
         return False
-    return True
+    # Frases de carga / consulta nunca son saludo.
+    if re.search(
+        r"\b(importa\w*|sube\w*|carga\w*|checa\w*|revisa\w*|duplicad\w*|"
+        r"guardalo|guardalos|imp[oó]rtalo|confirma\w*)\b",
+        t,
+    ):
+        return False
+    # Whitelist estricta: saludos y cortesía corta.
+    if re.fullmatch(
+        r"(hola|holaa*|hey|hi|hello|buenas|buen dia|buenos dias|"
+        r"buena tarde|buenas tardes|buena noche|buenas noches|"
+        r"que tal|como estas|como va|que onda|saludos|"
+        r"gracias|muchas gracias|mil gracias|de nada|"
+        r"adios|hasta luego|nos vemos|"
+        r"ok|okay|okey|vale|perfecto|excelente|genial|"
+        r"todo bien|muy bien)( {0,2}\w+){0,2}",
+        t,
+    ):
+        return True
+    words = t.split()
+    if len(words) <= 3 and re.match(
+        r"^(hola|buenas|hey|hi|gracias|adios|que tal|como estas)\b",
+        t,
+    ):
+        return True
+    return False
 
 
 def is_fast_qr_message(message: str, *, session_id: str | None = None) -> bool:
@@ -2682,13 +2807,14 @@ def run_fast_chitchat_reply(
     )
     user_msg = (message or "").strip() or "hola"
     system = (
-        "Eres un compañero de trabajo amable y relajado (español de México "
-        "cotidiano). El usuario solo saluda o platica. "
-        "Responde en 1–2 frases humanas, cercanas y espontáneas; síguele la "
-        "corriente si bromea o comenta. "
+        "Eres un compañero de trabajo amable y natural (español de México "
+        "cotidiano). El usuario solo saluda o hace un comentario corto. "
+        "Responde en 1–2 frases humanas y cercanas. "
+        "Si bromea, una reacción breve y reencauza al trabajo del inventario "
+        "sin invitar a plática personal ('¿cómo va tu día?', "
+        "'platiquemos de otra cosa'). "
         "PROHIBIDO frases de bot/contestadora ('Estoy aquí para ayudarte', "
         "'¿En qué puedo asistirte hoy?', 'Si necesitas algo…'). "
-        "NO menciones inventarios, Excel ni acciones previas. "
         "NO uses herramientas. Varía el cierre; no suenes a script."
     )
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
@@ -2917,7 +3043,9 @@ def run_tool_agent(
     from inventario.supabase_client import get_env
 
     # Saludo / charla: sin tools; solo últimos 4 turnos de prosa.
-    if is_fast_chitchat_message(message, session_id=session_id):
+    if is_fast_chitchat_message(
+        message, session_id=session_id, history=history
+    ):
         return run_fast_chitchat_reply(
             message,
             preferred_model=preferred_model,

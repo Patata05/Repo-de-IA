@@ -229,12 +229,15 @@ def chat(request):
         run_fast_qr_reply,
     )
 
-    if is_fast_chitchat_message(message, session_id=session_id):
+    hist_list = history if isinstance(history, list) else None
+    if is_fast_chitchat_message(
+        message, session_id=session_id, history=hist_list
+    ):
         reply, error, used_model, items, mutated, qr_list, usage, viewer = (
             run_fast_chitchat_reply(
                 message,
                 preferred_model=preferred_model,
-                history=history if isinstance(history, list) else None,
+                history=hist_list,
                 session_id=session_id,
             )
         )
