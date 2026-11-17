@@ -550,6 +550,78 @@ def chat(request):
 
 @csrf_exempt
 @require_POST
+def chat_learn(request):
+    """
+    Guarda un turno aprobado (pulgar arriba) o corrección en ai_learned_examples.
+    Body: pregunta_usuario, respuesta_ideal, intencion_y_filtros?, session_id?, vote?
+    """
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "El mensaje no es JSON valido."}, status=400)
+
+    vote = str(payload.get("vote") or payload.get("feedback") or "up").strip().lower()
+    if vote in {"down", "thumbs_down", "dislike", "-1"}:
+        # Pulgar abajo: solo acuse (no se usa como ejemplo ideal).
+        return JsonResponse({"ok": True, "saved": False, "vote": "down"})
+
+    pregunta = str(
+        payload.get("pregunta_usuario")
+        or payload.get("user_text")
+        or payload.get("question")
+        or ""
+    ).strip()
+    respuesta = str(
+        payload.get("respuesta_ideal")
+        or payload.get("bot_text")
+        or payload.get("reply")
+        or ""
+    ).strip()
+    intent = str(
+        payload.get("intencion_y_filtros")
+        or payload.get("intent")
+        or ""
+    ).strip()
+    session_raw = payload.get("session_id") or payload.get("sessionId")
+    session_id = (
+        str(session_raw).strip()
+        if isinstance(session_raw, str) and session_raw.strip()
+        else None
+    )
+    if not pregunta or not respuesta:
+        return JsonResponse(
+            {"error": "Faltan pregunta_usuario o respuesta_ideal."},
+            status=400,
+        )
+
+    try:
+        from inventario.ai.learned_examples import save_learned_example
+
+        row, err = save_learned_example(
+            pregunta_usuario=pregunta,
+            intencion_y_filtros=intent,
+            respuesta_ideal=respuesta,
+            source="thumbs_up",
+            session_id=session_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JsonResponse({"ok": False, "error": str(exc)}, status=500)
+
+    if err:
+        return JsonResponse({"ok": False, "error": err}, status=502)
+    return JsonResponse(
+        {
+            "ok": True,
+            "saved": True,
+            "vote": "up",
+            "id": (row or {}).get("id"),
+            "embedded": bool((row or {}).get("embedded")),
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
 def chat_reiniciar(request):
     """Borra el historial pydantic-ai de la sesión en Supabase."""
     try:
