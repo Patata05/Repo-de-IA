@@ -17,8 +17,8 @@ from inventario.supabase_client import _request_json, _supabase_base_and_keys, g
 logger = logging.getLogger(__name__)
 
 TABLE = "chat_agent_memory"
-# Ventana deslizante: ~4 turnos (user+assistant). Menos tokens → respuesta más rápida.
-MAX_MODEL_MESSAGES = 8
+# Ventana deslizante: ~3 turnos (6 mensajes user+assistant).
+MAX_MODEL_MESSAGES = 6
 
 
 def _adapter():
