@@ -233,14 +233,20 @@ export function detectChatDeleteIntent(
     };
   }
 
+  // “esta etiqueta 281405” / “ese registro …” ≠ borrar el listado del panel.
+  const deixisSingularItem = /\b(esta|ese|esa|este)\s+(etiqueta|registro|articulo|equipo|codigo|ficha)\b/.test(
+    n,
+  );
+
   const includeScopedList =
-    /\b(est[oa]s?|esos|esas|este\s+listado|esta\s+consulta|los\s+de\s+arriba|lo\s+de\s+arriba)\b/.test(
+    !deixisSingularItem &&
+    (/\b(est[oa]s?|esos|esas|este\s+listado|esta\s+consulta|los\s+de\s+arriba|lo\s+de\s+arriba)\b/.test(
       n,
     ) ||
-    // Tras ortografía “esos”→“eso”: “eso 10 registros”
-    /\beso\s+\d+\s+registros?\b/.test(n) ||
-    /\b(ultimos?|recientes?)\s+\d+\b/.test(n) ||
-    /\b(est[oa]s?|esos|esas)\s+\d+\s+registros?\b/.test(n);
+      // Tras ortografía “esos”→“eso”: “eso 10 registros”
+      /\beso\s+\d+\s+registros?\b/.test(n) ||
+      /\b(ultimos?|recientes?)\s+\d+\b/.test(n) ||
+      /\b(est[oa]s?|esos|esas)\s+\d+\s+registros?\b/.test(n));
 
   const etiquetas = extractDeleteEtiquetas(text);
 

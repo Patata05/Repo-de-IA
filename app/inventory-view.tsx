@@ -124,7 +124,10 @@ import {
   ORIGEN_SIN_ORIGEN,
   type PendingNewInventario,
 } from "@/lib/inventario-origen";
-import { normalizeChatSpellingAsync } from "@/lib/chat-spell";
+import {
+  normalizeChatSpelling,
+  normalizeChatSpellingAsync,
+} from "@/lib/chat-spell";
 import {
   detectInventarioMultiPlan,
   looksLikeInventarioMultiAsk,
@@ -2083,32 +2086,50 @@ type PendingImportPayload = {
 
 function looksLikeImportPreviewAsk(text: string) {
   const t = String(text || "");
-  return (
-    /\b(import(?:o|ar|aci[oó]n|alos|alas)?|cargar|carga|excel|archivo)\b/i.test(
-      t,
-    ) &&
-    /\b(confirm|importalo|destino|origen|filas|registros|visto|revis|le[ií]|¿|prepar|listo)\b/i.test(
-      t,
-    )
+  if (!t.trim()) return false;
+  const mentionsFile = /\b(import\w*|cargar?|carga|excel|xlsx|csv|archivo|filas|registros)\b/i.test(
+    t,
   );
+  const asksConfirm = /\b(confirm\w*|importalo|importalos|subelo|subelos|origen|destino|revis\w*|prepar\w*|listo|visto|deseas|quieres|s[ií])\b/i.test(
+    t,
+  );
+  // Preview OpenAI natural: “200 registros… excel 2… ¿confirmas?”
+  const softPreview =
+    /\b(excel|xlsx|csv)\s*\d+\b/i.test(t) &&
+    /\b(\d{2,}|registros?|filas?)\b/i.test(t) &&
+    /\b(confirm\w*|import\w*|sube\w*|visor|panel)\b/i.test(t);
+  return (mentionsFile && asksConfirm) || softPreview;
 }
 
-/** Confirmación explícita de carga (NO ok/okey/vale/dale/perfecto). */
+/** Confirmación explícita de carga (NO ok/okey/vale/dale/perfecto solos). */
 function isExplicitImportConfirm(value: string): boolean {
   const t = String(value || "").trim();
   if (!t) return false;
   if (
-    /\b(compara\w*|diff|diferencia|borra|elimina|pasa|copia|lista|muestra|dame|panorama|inventario\s+total|busca)\b/i.test(
+    /\b(compara\w*|diff|diferencia|borra|elimina|pasa|copia|lista|muestra|dame|panorama|inventario\s+total|busca|checa|duplicad)\b/i.test(
       t,
     )
   ) {
     return false;
   }
-  // Chips / verbos de carga
+  // Chips / verbos de carga solos
   if (
-    /^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?)([.!\s]*)$/i.test(
+    /^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?|imp[oó]rtalo(?:s)?|s[uú]belo(?:s)?)([.!\s]*)$/i.test(
       t,
     )
+  ) {
+    return true;
+  }
+  // “sí subelo” / “si, impórtalo” / “confirmo la importación”
+  if (
+    /^(sí|si|yes)\s*[,.]?\s*(por\s+favor\s+)?(importa\w*|carga\w*|sube\w*|s[uú]be\w*|confirma\w*|adelante|hazlo)([.!\s]*)?$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^(confirma|confirmo)(\s+la\s+importaci[oó]n)?([.!\s]*)$/i.test(t)
   ) {
     return true;
   }
@@ -12743,12 +12764,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     }
 
     const lastConcreteBot = getLastConcreteBotMessage();
+    const lastBotText = String(lastConcreteBot?.text || "");
     const prevTurnIsImportPreview = Boolean(
-      lastConcreteBot && looksLikeImportPreviewAsk(lastConcreteBot.text || ""),
+      lastConcreteBot &&
+        (looksLikeImportPreviewAsk(lastBotText) ||
+          // Pending reciente + bot habla de excel/registros/confirmación (OpenAI natural)
+          (pendingRows?.length &&
+            /\b(excel|xlsx|csv|archivo|registros?|filas?|import\w*|confirm\w*|origen)\b/i.test(
+              lastBotText,
+            ))),
     );
 
     // Excel viejo o ya hubo otra respuesta del bot → descartar pendiente
-    if (pendingRows?.length && !prevTurnIsImportPreview) {
+    // (no limpiar si la confirmación del usuario es explícita: “sí subelo”).
+    if (
+      pendingRows?.length &&
+      !prevTurnIsImportPreview &&
+      !isChatImportConfirm(text)
+    ) {
       setPendingChatImportSafe(null);
       pendingRows = null;
     }
@@ -12807,11 +12840,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         return;
       }
     }
-    if (
-      pendingRows?.length &&
-      prevTurnIsImportPreview &&
-      isNegativeChat(text)
-    ) {
+    if (pendingRows?.length && isNegativeChat(text)) {
       setPendingChatImportSafe(null);
       const cancelFallback =
         "De acuerdo, cancelé la carga. No importé nada del Excel pendiente.";
@@ -12836,11 +12865,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
       return;
     }
-    if (
-      pendingRows?.length &&
-      prevTurnIsImportPreview &&
-      isChatImportConfirm(text)
-    ) {
+    if (pendingRows?.length && isChatImportConfirm(text)) {
       try {
         const origenLabel =
           String(pendingRows[0]?.origen ?? "").trim() || "archivo pendiente";
@@ -12859,7 +12884,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
     // Otra pregunta con Excel pendiente (p. ej. “okey” / panorama) → limpiar y seguir
-    if (pendingRows?.length) {
+    // Conservar pendiente si el turno sigue siendo preview (usuario aún no confirma).
+    if (pendingRows?.length && !prevTurnIsImportPreview) {
+      setPendingChatImportSafe(null);
+      pendingRows = null;
+    } else if (
+      pendingRows?.length &&
+      prevTurnIsImportPreview &&
+      !isNegativeChat(text) &&
+      !isChatImportConfirm(text)
+    ) {
+      // Pregunta colateral con preview abierto → no importar; limpiar para no bloquear.
       setPendingChatImportSafe(null);
       pendingRows = null;
     }
@@ -13122,6 +13157,47 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           pendingCopyEtiquetaDest: Boolean(pendingCopyEtiquetaDestRef.current),
         });
       if (preferAgentConsultas && !keepLocal) {
+        // Plantilla de personas/nombres: local antes del agente (abre el visor).
+        try {
+          const detectText = normalizeChatSpelling(spokenRaw) || spokenRaw;
+          if (
+            detectViewerOverview(detectText) === "personas" &&
+            items.length
+          ) {
+            const ctxVista = getContextoVista();
+            const overviewFocus =
+              resolveOverviewFocus(detectText, items) ||
+              (ctxVista?.tipo === "origen" && ctxVista.valor
+                ? ctxVista.valor
+                : undefined);
+            const localReply = buildLocalOverviewReply(
+              "personas",
+              items,
+              overviewFocus,
+              detectText,
+            );
+            if (localReply) {
+              recordTokenConsumption(null, spokenRaw, localReply);
+              await ensureTypingPause(localReply);
+              finishBotReply(sessionId, botId, localReply, {
+                resultItems: [],
+                qr: [],
+                viewerOverview: "personas",
+                viewerFocus: overviewFocus,
+                userText: spokenRaw,
+              });
+              return;
+            }
+          }
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+          /* caer al agente */
+        }
         const memoryBlock = [
           formatChatMemoryForPrompt(),
           resolvedTurn.threadHint,
