@@ -187,6 +187,17 @@ Tools (elige la mínima necesaria; solo datos):
   TODOS los registros del área (métricas + listado completo). PROHIBIDO
   panorama_inventario, ranking_areas o buscar_inventario con query="ti"
   como texto libre. “inventario general DE [área]” ≠ panorama global.
+- Filtros COMBINADOS (área + Inventario N, persona + origen, etc.):
+  “Atención a Clientes del Inventario 3”, “área X en excel 1”.
+  1) Obtén el conjunto que cumple TODOS los filtros (intersección).
+  2) Usa métricas EXACTAS de ese conjunto (total/personas/equipos) en la
+     prosa; PROHIBIDO inventar totales de muestras recortadas o mezclar
+     otros inventarios/áreas no pedidos en ESTE turno.
+  3) Viewer tipo=area (o persona) con valor canónico + campo origen=
+     “Inventario N” + lista_limitada=true + items = SOLO la intersección.
+     Así el visor derecho muestra el mismo N que el chat (no el total
+     global del área). Preferir buscar_inventario / listar_criterios /
+     filtrar items tras contar_por_campo.
 - Personas/nombres de UN área (“dame los nombres del área de RH”, “quiénes
   están en Ventas”, “personas de Sistemas y TI”) → OBLIGATORIO
   contar_por_campo(campo='area', valor='rh'|'ti'|…) y viewer/filtro
@@ -200,6 +211,7 @@ Tools (elige la mínima necesaria; solo datos):
   Si filtraste por PERSONA → viewer/filtro tipo=persona (NUNCA uses el área
   de un artículo). Si filtraste por ÁREA puntual y pidieron el área/equipos
   → viewer tipo=area. Si pidieron nombres/personas del área → tipo=personas.
+  Si además acotaron un Inventario N → añade origen al viewer.
 - buscar_inventario(query, limit) → listados con filtro real (persona, área,
   marca, código…). NO uses meta-palabras (etiquetas/registros/inventario) como query.
 - obtener_por_etiqueta → ficha exacta.
@@ -2181,6 +2193,99 @@ def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _fold_origen_label(value: str) -> str:
+    t = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return t
+
+
+def _origen_matches(row_origen: str, want: str) -> bool:
+    a = _fold_origen_label(row_origen)
+    b = _fold_origen_label(want)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Inventario 3 ↔ inventario 3 / excel 3 legado no aquí.
+    ma = re.search(r"\b(?:inventario|excel|csv|xls|xlsx)\s*(\d+)\b", a)
+    mb = re.search(r"\b(?:inventario|excel|csv|xls|xlsx)\s*(\d+)\b", b)
+    if ma and mb and ma.group(1) == mb.group(1) and "inventario" in a and "inventario" in b:
+        return True
+    if ma and mb and ma.group(1) == mb.group(1) and a.startswith("inventario") and b.startswith("inventario"):
+        return True
+    return b in a or a in b
+
+
+def _filter_collected_for_contexto(
+    collected: list[dict[str, Any]],
+    ctx: dict[str, Any] | None,
+    user_message: str = "",
+) -> list[dict[str, Any]]:
+    """
+    Alinea items del visor con filtros del turno (área ∩ Inventario N).
+    Evita devolver el área completa cuando el chat habló de un solo inventario.
+    """
+    if not collected:
+        return []
+    out = list(collected)
+    origen_want = ""
+    if isinstance(ctx, dict):
+        origen_want = str(ctx.get("origen") or "").strip()
+    if not origen_want:
+        m = re.search(
+            r"\b((?:inventario|excel|csv|xls|xlsx)\s*\d+)\b",
+            _fold_origen_label(user_message),
+            flags=re.I,
+        )
+        if m:
+            origen_want = m.group(1)
+    if origen_want:
+        filtered = [
+            r
+            for r in out
+            if isinstance(r, dict)
+            and _origen_matches(str(r.get("origen") or ""), origen_want)
+        ]
+        if filtered:
+            out = filtered
+            if isinstance(ctx, dict):
+                ctx["origen"] = origen_want
+                ctx["lista_limitada"] = True
+                pers = {
+                    str(r.get("persona") or "").strip()
+                    for r in out
+                    if str(r.get("persona") or "").strip()
+                }
+                ctx["metricas"] = {
+                    "registros": len(out),
+                    "personas": len(pers),
+                    "activos": sum(
+                        1
+                        for r in out
+                        if str(r.get("estado") or "").strip().lower()
+                        not in {"inactivo", "baja", "no", "0"}
+                    ),
+                }
+    area_want = ""
+    if isinstance(ctx, dict) and str(ctx.get("tipo") or "").lower() in {
+        "area",
+        "personas",
+    }:
+        area_want = str(ctx.get("valor") or "").strip()
+    if area_want:
+        fold_a = _fold_origen_label(area_want)
+        area_filtered = [
+            r
+            for r in out
+            if isinstance(r, dict)
+            and _fold_origen_label(str(r.get("area") or "")) == fold_a
+        ]
+        if area_filtered:
+            out = area_filtered
+    return out
+
+
 def build_contexto_vista_payload(
     deps: ToolAgentDeps,
     *,
@@ -2251,16 +2356,57 @@ def build_contexto_vista_payload(
                     for k in ("registros", "personas", "areas", "activos")
                     if raw_metrics.get(k) is not None
                 }
-            # Pedido de nombres/personas del área → plantilla Personas.
+            # Origen acotado (área ∩ Inventario N) → visor no expande a todos.
+            origen_v = str(viewer.get("origen") or "").strip()
+            if not origen_v and items:
+                origens = {
+                    str(r.get("origen") or "").strip()
+                    for r in items
+                    if isinstance(r, dict) and str(r.get("origen") or "").strip()
+                }
+                if len(origens) == 1:
+                    origen_v = next(iter(origens))
             um = (user_message or "").lower()
+            if not origen_v and re.search(
+                r"\binventario\s*\d+\b|\bexcel\s*\d+\b", um
+            ):
+                m_orig = re.search(r"\b((?:inventario|excel)\s*\d+)\b", um)
+                if m_orig:
+                    origen_v = m_orig.group(1).strip()
+            if origen_v and tipo in {"area", "persona"}:
+                out["origen"] = origen_v
+                out["lista_limitada"] = True
+                # Métricas del payload filtrado (misma fuente que el chat).
+                if items and "metricas" not in out:
+                    pers = {
+                        str(r.get("persona") or "").strip()
+                        for r in items
+                        if isinstance(r, dict) and str(r.get("persona") or "").strip()
+                    }
+                    out["metricas"] = {
+                        "registros": len(items),
+                        "personas": len(pers),
+                        "activos": sum(
+                            1
+                            for r in items
+                            if isinstance(r, dict)
+                            and str(r.get("estado") or "").strip().lower()
+                            not in {"inactivo", "baja", "no", "0"}
+                        ),
+                    }
+            # Pedido de nombres/personas del área → plantilla Personas.
             if tipo == "area" and re.search(
                 r"\b(nombres?|personas?|quien|quienes)\b", um
             ):
-                return {
+                personas_out: dict[str, Any] = {
                     "tipo": "personas",
                     "valor": valor,
                     "lista_limitada": False,
                 }
+                if origen_v:
+                    personas_out["origen"] = origen_v
+                    personas_out["lista_limitada"] = True
+                return personas_out
             return out
 
     # Inferir desde items si la tool no marcó viewer.
@@ -3770,11 +3916,14 @@ def run_tool_agent(
             if not isinstance(ctx, dict):
                 ctx = {"tipo": "origen", "valor": "Todo el inventario"}
             ctx = {**ctx, "exportar_excel": True}
+        side_items = _filter_collected_for_contexto(
+            deps.collected, ctx, message or ""
+        )
         return (
             text,
             None,
             used,
-            deps.collected[:MAX_SIDE_ITEMS],
+            side_items[:MAX_SIDE_ITEMS],
             deps.mutated,
             deps.qr,
             usage,

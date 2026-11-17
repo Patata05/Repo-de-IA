@@ -2479,6 +2479,10 @@ const AREA_STOP_WORDS = new Set([
   "solamente",
   "persona",
   "personas",
+  "nombre",
+  "nombres",
+  "quien",
+  "quienes",
   "des",
   "ahi",
   "alla",
@@ -6304,6 +6308,55 @@ function detectAreaPersonasAsk(
   }
 
   const catalog = getAllAreaCatalog(inventory);
+  // Atajo explícito: “nombres/personas del área de RH|Ventas|Sistemas y TI…”.
+  {
+    const m =
+      n.match(
+        /\b(?:nombres?|personas?|quien|quienes)\b[\s\S]{0,40}?\b(?:area|areas)?\s*(?:de|del|en)\s+(.+)$/,
+      ) ||
+      n.match(
+        /\b(?:area|areas)\s+(?:de|del)\s+(.+?)\b(?:\s+(?:nombres?|personas?|quien|quienes).*)?$/,
+      );
+    const tail = String(m?.[1] || "")
+      .replace(
+        /\b(por\s+favor|gracias|okey|ok|vale|listo|ya|me|los|las|el|la)\b/g,
+        " ",
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+    if (tail) {
+      const direct = findMatchingAreasForPrompt(
+        `área de ${tail}`,
+        inventory,
+      );
+      if (
+        direct &&
+        !direct.uncertain &&
+        direct.candidates.length === 1
+      ) {
+        return {
+          status: "ok",
+          area: direct.candidates[0],
+          rawNeedle: tail,
+        };
+      }
+      const acro = catalog.filter((c) => {
+        const ac = areaAcronym(c.norm);
+        const t = normalizePlain(tail);
+        return ac === t || c.norm === t || areaMatchesNeedle(c.name, t);
+      });
+      if (acro.length === 1) {
+        return { status: "ok", area: acro[0], rawNeedle: tail };
+      }
+      if (acro.length > 1) {
+        return {
+          status: "ask",
+          candidates: acro,
+          rawNeedle: tail,
+        };
+      }
+    }
+  }
   const areaQuery = findMatchingAreasForPrompt(userText, inventory);
   const usesContext =
     /\b(ahi|alla|alli|aqui|esa|ese|eso|la de|del area|de esa)\b/.test(n) ||
@@ -14121,93 +14174,57 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         }
 
         // Personas de un área (RH / TI…) → abrir visor Personas filtrado.
+        // “dame las personas” SIN área → no interceptar aquí (ranking global).
         try {
           const detectText = normalizeChatSpelling(spokenRaw) || spokenRaw;
           const areaPeopleAsk =
             detectAreaPersonasAsk(detectText, items, null) ||
             detectAreaPersonasAsk(spokenRaw, items, null);
-          const areaPeopleFocus =
-            areaPeopleAsk?.status === "ok" && areaPeopleAsk.area
-              ? areaPeopleAsk.area.name
-              : undefined;
-          const wantsPersonasOverview =
-            !isAmbiguousNombresAsk(detectText) &&
-            (Boolean(areaPeopleFocus) ||
-              detectViewerOverview(detectText) === "personas");
-          if (wantsPersonasOverview && items.length) {
-            const ctxVista = getContextoVista();
-            const overviewFocus =
-              areaPeopleFocus ||
-              resolveOverviewFocus(detectText, items) ||
-              (ctxVista?.tipo === "origen" && ctxVista.valor
-                ? ctxVista.valor
-                : undefined);
-            const scoped = areaPeopleFocus
-              ? rowsForAreaExact(items, areaPeopleFocus, CHAT_SIDE_RESULT_CAP)
-              : filterInventoryByOverviewFocus(items, overviewFocus);
-            const personCounts = new Map<string, number>();
-            for (const row of scoped) {
-              const p = String(row.persona ?? "").trim();
-              if (p) personCounts.set(p, (personCounts.get(p) || 0) + 1);
-            }
-            const topPeople = [...personCounts.entries()]
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 8)
-              .map(([name, count]) => ({ name, count }));
-            const focusLabel = overviewFocus || areaPeopleFocus || "";
-            const fallback =
-              (areaPeopleAsk?.status === "ok" && areaPeopleAsk.area
-                ? buildAreaPersonasReply(areaPeopleAsk.area)
-                : null) ||
-              buildLocalOverviewReply(
-                "personas",
-                items,
-                focusLabel || undefined,
-                detectText,
-              ) ||
-              `Hay **${personCounts.size}** persona${personCounts.size === 1 ? "" : "s"}` +
-                (focusLabel ? ` en **${focusLabel}**` : "") +
-                `. El listado está a la derecha.`;
-            let reply = fallback;
-            try {
-              const polished = await polishInventoryReply({
-                userText: spokenRaw,
-                kind: "personas_overview",
-                fallback,
-                facts: {
-                  origen: focusLabel || null,
-                  area: areaPeopleFocus || focusLabel || null,
-                  personas_count: personCounts.size,
-                  registros_count: scoped.length,
-                  top_personas: topPeople,
-                  pedir_nombres: /\bnombres?\b/i.test(detectText),
-                  estilo:
-                    "Prosa natural y cercana (gpt). PROHIBIDO plantillas fijas tipo «Listo:», «Empiezan:», «Mira la plantilla…». Varía el cierre.",
-                },
-                sessionId,
-              });
-              reply = polished.reply || fallback;
-            } catch {
-              /* fallback local */
-            }
+          if (
+            areaPeopleAsk?.status === "ask" &&
+            areaPeopleAsk.candidates?.length &&
+            items.length
+          ) {
+            pendingDisambiguationRef.current = {
+              kind: "area",
+              queryLabel: areaPeopleAsk.rawNeedle,
+              candidates: areaPeopleAsk.candidates.map((c) => c.name),
+              intent: "total",
+              limit: null,
+            };
+            const ask = buildAreaConfirmAskReply(
+              areaPeopleAsk.rawNeedle,
+              areaPeopleAsk.candidates,
+            );
+            recordTokenConsumption(null, spokenRaw, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask, { userText: spokenRaw });
+            return;
+          }
+          if (
+            areaPeopleAsk?.status === "ok" &&
+            areaPeopleAsk.area &&
+            items.length
+          ) {
+            const areaPeopleFocus = areaPeopleAsk.area.name;
+            // Respuesta local inmediata → abre el visor sin esperar polish/red.
+            const reply = buildAreaPersonasReply(areaPeopleAsk.area);
             recordTokenConsumption(null, spokenRaw, reply);
             await ensureTypingPause(reply);
-            if (areaPeopleFocus) {
-              activeAreaContextRef.current = {
-                name: areaPeopleFocus,
-                at: Date.now(),
-              };
-            }
+            activeAreaContextRef.current = {
+              name: areaPeopleFocus,
+              at: Date.now(),
+            };
             finishBotReply(sessionId, botId, reply, {
               resultItems: [],
               qr: [],
               viewerOverview: "personas",
-              viewerFocus: focusLabel || undefined,
+              viewerFocus: areaPeopleFocus,
               userText: spokenRaw,
               skipExpand: true,
               apiViewer: {
                 tipo: "personas",
-                valor: areaPeopleFocus || focusLabel || "general",
+                valor: areaPeopleFocus,
               },
             });
             return;
@@ -14257,6 +14274,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               ? {
                   tipo: String(ctxRaw.tipo || "").trim().toLowerCase(),
                   valor: String(ctxRaw.valor || "").trim(),
+                  origen: String(
+                    (ctxRaw as { origen?: string }).origen || "",
+                  ).trim(),
                   lista_limitada: Boolean(ctxRaw.lista_limitada),
                   comparacion:
                     ctxRaw.comparacion &&
@@ -14281,30 +14301,36 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           // Personas/nombres de un área → plantilla Personas (aunque el agente
           // haya contestado solo en prosa sin contexto_vista/items).
           {
+            const detectText =
+              normalizeChatSpelling(spokenRaw) || spokenRaw;
             const areaPeopleAsk =
-              detectAreaPersonasAsk(
-                normalizeChatSpelling(spokenRaw) || spokenRaw,
-                items,
-                null,
-              ) || detectAreaPersonasAsk(spokenRaw, items, null);
-            if (
-              areaPeopleAsk?.status === "ok" &&
-              areaPeopleAsk.area &&
-              items.length
-            ) {
+              detectAreaPersonasAsk(detectText, items, null) ||
+              detectAreaPersonasAsk(spokenRaw, items, null);
+            const ctxPersonasArea =
+              ctx &&
+              (ctx.tipo === "personas" || ctx.tipo === "area") &&
+              ctx.valor &&
+              /\b(nombres?|personas?|quien|quienes)\b/i.test(detectText)
+                ? String(ctx.valor).trim()
+                : "";
+            const focusName =
+              (areaPeopleAsk?.status === "ok" && areaPeopleAsk.area?.name) ||
+              ctxPersonasArea ||
+              "";
+            if (focusName && items.length) {
               activeAreaContextRef.current = {
-                name: areaPeopleAsk.area.name,
+                name: focusName,
                 at: Date.now(),
               };
               finishBotReply(sessionId, botId, replyText, {
                 resultItems: [],
                 qr: data.qr || [],
                 viewerOverview: "personas",
-                viewerFocus: areaPeopleAsk.area.name,
+                viewerFocus: focusName,
                 exportFiles,
                 apiViewer: {
                   tipo: "personas",
-                  valor: areaPeopleAsk.area.name,
+                  valor: focusName,
                 },
                 userText: spokenRaw,
                 followUps: apiFollowUps.length ? apiFollowUps : undefined,
@@ -14345,16 +14371,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             !wantsGlobalAreasRanking(spokenRaw)
           ) {
             const single = localAreaAsk.candidates[0];
-            const localRows = rowsForAreaNeedle(
+            const origenAsk =
+              matchOrigenFromPrompt(
+                spokenRaw,
+                listExistingOrigens(items),
+              ) || "";
+            let localRows = rowsForAreaExact(
               items,
               single.name,
               CHAT_SIDE_RESULT_CAP,
             );
+            if (origenAsk) {
+              localRows = localRows.filter((row) =>
+                origensMatch(String(row.origen ?? ""), origenAsk),
+              );
+            }
             sideFocus = single.name;
             sideOverview = "areaTotal";
-            resultItems = (localRows.length ? localRows : single.rows).map(
-              (row) => rowToChatApiItem(row),
-            );
+            resultItems = (
+              localRows.length ? localRows : single.rows
+            ).map((row) => rowToChatApiItem(row));
             activeAreaContextRef.current = {
               name: single.name,
               at: Date.now(),
@@ -14443,26 +14479,45 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               };
             }
           } else if (ctx?.tipo === "area" && ctx.valor) {
-            // Área concreta (TI → Sistemas y TI): siempre plantilla areaTotal
-            // con el listado completo local (no preview recortada).
+            // Área concreta → areaTotal. Si el turno acota Inventario N / origen,
+            // NO expandir a todos los inventarios (chat 54 ≠ visor 108).
             sideFocus = ctx.valor;
             sideOverview = "areaTotal";
             activeAreaContextRef.current = {
               name: ctx.valor,
               at: Date.now(),
             };
-            const localAreaRows = rowsForAreaNeedle(
+            const origenAsk =
+              ctx.origen ||
+              matchOrigenFromPrompt(
+                spokenRaw,
+                listExistingOrigens(items),
+              ) ||
+              "";
+            const areaPool = rowsForAreaExact(
               items,
               ctx.valor,
               CHAT_SIDE_RESULT_CAP,
             );
-            if (localAreaRows.length >= resultItems.length) {
-              resultItems = localAreaRows.map((row) => rowToChatApiItem(row));
+            const scopedRows = origenAsk
+              ? areaPool.filter((row) =>
+                  origensMatch(String(row.origen ?? ""), origenAsk),
+                )
+              : areaPool;
+            if (origenAsk || ctx.lista_limitada) {
+              // Fuente de verdad = intersección pedida (o payload del agente).
+              if (scopedRows.length) {
+                resultItems = scopedRows.map((row) => rowToChatApiItem(row));
+              } else if (sideItems.length) {
+                resultItems = sideItems;
+              }
+            } else if (scopedRows.length >= resultItems.length) {
+              resultItems = scopedRows.map((row) => rowToChatApiItem(row));
             } else if (
               resultItems.length < CHAT_SIDE_RESULT_CAP &&
-              localAreaRows.length > 0
+              scopedRows.length > 0
             ) {
-              resultItems = localAreaRows.map((row) => rowToChatApiItem(row));
+              resultItems = scopedRows.map((row) => rowToChatApiItem(row));
             }
           } else if (
             isEtiquetasRegistrosListAsk(spokenRaw) ||
@@ -14560,6 +14615,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                   : undefined,
             skipExpand:
               Boolean(ctx?.lista_limitada) ||
+              Boolean(ctx?.origen) ||
+              Boolean(
+                sideOverview === "areaTotal" &&
+                  matchOrigenFromPrompt(
+                    spokenRaw,
+                    listExistingOrigens(items),
+                  ),
+              ) ||
               sideOverview === "areas" ||
               sideOverview === "personas" ||
               sideOverview === "comparacion" ||

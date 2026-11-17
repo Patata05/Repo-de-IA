@@ -467,16 +467,68 @@ function ChatViewer({
     })();
 
     if (overview === "areaTotal") {
-      // Priorizar coincidencia exacta con el nombre canónico del área para evitar
-      // sumar sub-áreas (ej. "BIBLIOTECA NUEVA" no debe sumar "BIBLIOTECA NUEVA SALA DE COMPUTO 2").
-      const exactRows = focusNorm
-        ? inventory.filter((row) => foldText(row.area) === focusNorm)
-        : [];
-      const areaRows =
-        exactRows.length > 0
+      // Payload del turno (área ∩ Inventario N, etc.) manda sobre el inventario global.
+      const fromTurn = (() => {
+        if (!Array.isArray(resultItems) || !resultItems.length) return null;
+        const byId = new Map(
+          inventory
+            .filter((r) => r.id != null)
+            .map((r) => [Number(r.id), r] as const),
+        );
+        const rows: InventarioRow[] = [];
+        const seen = new Set<string>();
+        for (const it of resultItems) {
+          const id = it.id != null ? Number(it.id) : NaN;
+          const et = String(it.etiqueta ?? "").trim().toLowerCase();
+          const origenWant = String(it.origen ?? "").trim();
+          const key =
+            Number.isFinite(id) && id > 0
+              ? `id:${id}`
+              : et
+                ? `et:${et}:${origenWant || "_"}`
+                : "";
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          const hit =
+            (Number.isFinite(id) && id > 0 ? byId.get(id) : undefined) ||
+            (et
+              ? inventory.find(
+                  (r) =>
+                    String(r.etiqueta ?? "").trim().toLowerCase() === et &&
+                    (!origenWant ||
+                      origensMatch(String(r.origen ?? ""), origenWant) ||
+                      foldText(r.origen) === foldText(origenWant)),
+                )
+              : undefined);
+          if (hit) rows.push(hit);
+          else if (it) rows.push(it as InventarioRow);
+        }
+        if (!rows.length) return null;
+        // Si el foco es un área, conservar solo filas de esa área.
+        if (focusNorm) {
+          const exact = rows.filter((r) => foldText(r.area) === focusNorm);
+          if (exact.length) return exact;
+          const soft = rows.filter((r) =>
+            matchesFocus(foldText(r.area), focusNorm),
+          );
+          if (soft.length) return soft;
+        }
+        return rows;
+      })();
+
+      // Sin payload de turno → total del área en todo el inventario.
+      const exactRows =
+        !fromTurn && focusNorm
+          ? inventory.filter((row) => foldText(row.area) === focusNorm)
+          : [];
+      const areaRows = fromTurn
+        ? fromTurn
+        : exactRows.length > 0
           ? exactRows
           : focusNorm
-            ? inventory.filter((row) => matchesFocus(foldText(row.area), focusNorm))
+            ? inventory.filter((row) =>
+                matchesFocus(foldText(row.area), focusNorm),
+              )
             : [];
       const people = new Set(
         areaRows.map((row) => textOf(row.persona)).filter(Boolean),
@@ -485,7 +537,8 @@ function ChatViewer({
         ...base,
         areaRows,
         areaPersonas: people.size,
-        areaActivos: areaRows.filter((row) => !isInactiveEstado(row.estado)).length,
+        areaActivos: areaRows.filter((row) => !isInactiveEstado(row.estado))
+          .length,
       };
     }
 
@@ -1035,11 +1088,30 @@ function ChatViewer({
         ? `${areasSorted.length} áreas · ${resultItems.length} del listado`
         : `${areasSorted.length} áreas · distribución`
       : overview === "areaTotal"
-        ? listItems.length > 0 && listItems.length < areaRows.length
-          ? `Total del área (${formatNumber(areaRows.length)}) · mostrando ${listItems.length} registros`
-          : listItems.length > 0
-            ? `Total del área · ${formatNumber(areaRows.length)} registros`
-            : "Total del área"
+        ? (() => {
+            const n = areaRows.length || listItems.length;
+            const origens = [
+              ...new Set(
+                (areaRows.length ? areaRows : listItems)
+                  .map((r) =>
+                    canonicalizeOrigenLabel(textOf((r as ChatApiItem).origen)),
+                  )
+                  .filter(Boolean),
+              ),
+            ];
+            const origenBit =
+              origens.length === 1
+                ? ` · ${origens[0]}`
+                : origens.length > 1
+                  ? ` · ${origens.length} inventarios`
+                  : "";
+            if (listItems.length > 0 && listItems.length < areaRows.length) {
+              return `Total del área (${formatNumber(n)})${origenBit} · mostrando ${listItems.length}`;
+            }
+            return n
+              ? `Total del área · ${formatNumber(n)} registros${origenBit}`
+              : "Total del área";
+          })()
         : overview === "areaMatches"
           ? `${areaMatches.length} áreas encontradas (${formatNumber(areaMatchesTotalRows)} registros) · elige cuál consultar`
           : overview === "personTotal"

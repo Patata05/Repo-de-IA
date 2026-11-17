@@ -124,6 +124,7 @@ export type ChatComparacionVista = {
 export type ChatContextoVista = {
   tipo:
     | "persona"
+    | "personas"
     | "area"
     | "origen"
     | "areas"
@@ -132,6 +133,8 @@ export type ChatContextoVista = {
     | "etiquetas"
     | "registros";
   valor: string;
+  /** Origen/inventario acotado cuando el filtro es combinado (área ∩ Inventario N). */
+  origen?: string;
   ranking?: Array<{
     area?: string;
     articulos?: number;
@@ -140,6 +143,12 @@ export type ChatContextoVista = {
   comparacion?: ChatComparacionVista;
   /** true = mostrar solo los items del turno (ej. “dame 8”), sin expandir. */
   lista_limitada?: boolean;
+  metricas?: {
+    registros?: number;
+    personas?: number;
+    areas?: number;
+    activos?: number;
+  };
 };
 
 export type ChatApiResponse = {
@@ -294,17 +303,23 @@ export async function askInventoryChat(
     if (
       !(
         tipo === "persona" ||
+        tipo === "personas" ||
         tipo === "area" ||
         tipo === "origen" ||
         tipo === "areas" ||
         tipo === "areas_general" ||
-        tipo === "comparacion"
+        tipo === "comparacion" ||
+        tipo === "etiquetas" ||
+        tipo === "registros"
       )
     ) {
       return undefined;
     }
     if (
-      (tipo === "persona" || tipo === "area" || tipo === "origen") &&
+      (tipo === "persona" ||
+        tipo === "personas" ||
+        tipo === "area" ||
+        tipo === "origen") &&
       !valor
     ) {
       return undefined;
@@ -316,13 +331,20 @@ export async function askInventoryChat(
       tipo === "comparacion" &&
       rec.comparacion &&
       typeof rec.comparacion === "object"
-        ? (rec.comparacion as ChatContextoVista["comparacion"])
+        ? (rec.comparacion as ChatComparacionVista)
+        : undefined;
+    const origenExtra = String(rec.origen || "").trim();
+    const metricas =
+      rec.metricas && typeof rec.metricas === "object"
+        ? (rec.metricas as ChatContextoVista["metricas"])
         : undefined;
     return {
       tipo: tipo as ChatContextoVista["tipo"],
       valor: valor || "general",
+      origen: origenExtra || undefined,
       ranking,
       comparacion,
+      metricas,
       lista_limitada: Boolean(rec.lista_limitada),
     };
   };
