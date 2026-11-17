@@ -31,7 +31,7 @@ def _openai_http_client() -> httpx.AsyncClient:
 
 
 # Bump al cambiar instrucciones/tools del Agent (invalida singleton).
-_AGENT_INSTR_VER = "v29-area-context-qr-deixis"
+_AGENT_INSTR_VER = "v32-learning-priority-save-fix"
 
 def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, str, str]:
     # No guardar la key completa en logs; fingerprint corto para el dict.
@@ -81,6 +81,19 @@ Reglas de verdad:
   tool con el nombre que entendiste.
 - Usa el hilo reciente y la memoria de sesión (persona/área/excel,
   confirmaciones pendientes, etc.).
+- Si el prompt trae «EJEMPLOS APRENDIDOS», úsalos como guía silenciosa de
+  cómo este usuario resolvió peticiones similares (filtros, visor, tono).
+  NO digas que son ejemplos ni los copies literal.
+- APRENDIZAJE (prioridad máxima): si el mensaje EMPIEZA o CONTIENE
+  «Aprende esta regla», «Aprende:», «Recuerda que», «Guarda esta regla»,
+  «Así no:» o «cuando yo diga/pida», OBLIGATORIO llamar PRIMERO y ÚNICAMENTE
+  a registrar_aprendizaje(pregunta_usuario, intencion_y_filtros, respuesta_ideal).
+  PROHIBIDO en ese turno llamar contar_por_campo, buscar_inventario,
+  ranking_areas, panorama u otras tools de consulta aunque la regla mencione
+  áreas (TI, RH, Sistemas y TI, Recursos Humanos, etc.). No abras visor.
+  Tras guardar: confirma en 1–2 frases que la regla quedó registrada.
+  pregunta_usuario = la frase del usuario; respuesta_ideal = la regla a aplicar;
+  intencion_y_filtros = resumen corto (alias TI→Sistemas y TI, etc.).
 
 Estilo:
 - PROHIBIDO respuestas telegráficas o de una sola línea seca.
@@ -112,9 +125,10 @@ Excel / archivos (importante):
 - Panorama / resumen / “dame el panorama de xlsx 2” ≠ exportar. Usa
   panorama_inventario (o contar_por_campo/resumen). NUNCA digas “archivo listo”
   ni generes descarga. Alias: xlsx/ecel/exel/csv N → excel N real en Supabase.
-- “Inventario general” / “todo el inventario” / “general” SIN persona/área →
-  TODOS los registros (resumen_inventario o panorama_inventario sin origen).
-  NUNCA filtres por la palabra “general” como texto de origen/área.
+- “Inventario general” / “todo el inventario” / “en general” / “general”
+  SIN la palabra “dirección” → TODOS los registros (resumen/panorama sin
+  filtro de área). NUNCA uses “general” como área ni hagas fuzzy match con
+  “Dirección General”. Solo si dicen “dirección general” → esa área.
 - “dame/muéstrame/ver registros|etiquetas” (y typos) SIN persona/área/código →
   listado de etiquetas (visor tipo=etiquetas, items completos). NUNCA panorama
   ni buscar_inventario(query="etiqueta|etiquetas|registro|registros|inventario").
@@ -2561,6 +2575,23 @@ def _is_meta_list_query(query: str) -> bool:
     return has_noun and all(t in _META_LIST_TOKENS for t in tokens)
 
 
+def _is_bare_general_area_needle(raw: str) -> bool:
+    """True si es «general/en general» sin «dirección» (no es Dirección General)."""
+    folded = unicodedata.normalize("NFD", str(raw or "").strip().lower())
+    folded = "".join(c for c in folded if unicodedata.category(c) != "Mn")
+    folded = re.sub(r"\s+", " ", folded).strip()
+    if not folded:
+        return False
+    if "direccion" in folded:
+        return False
+    return bool(
+        folded in {"general", "en general", "ne general"}
+        or re.fullmatch(r"(en|ne) general", folded)
+        or re.search(r"(^|\s)(en|ne) general(\s|$)", folded)
+        or folded == "general"
+    )
+
+
 def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Alias xlsx/ecel→excel; evita filtrar por «general» o meta-listados."""
     out = dict(args or {})
@@ -2570,6 +2601,10 @@ def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
             # Sin filtro → todos los registros (search vacío / panorama).
             out["query"] = ""
             out["_meta_list_all"] = True
+        elif _is_bare_general_area_needle(q):
+            # “en general” ≠ área Dirección General → búsqueda global.
+            out["query"] = ""
+            out["_meta_list_all"] = True
     if name in {
         "contar_por_campo",
         "obtener_por_etiqueta",
@@ -2577,6 +2612,16 @@ def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
         "listar_criterios",
         "comparar_inventarios",
     }:
+        campo_n = str(out.get("campo") or "").strip().lower()
+        if (
+            name == "contar_por_campo"
+            and campo_n in {"area", "área"}
+            and _is_bare_general_area_needle(str(out.get("valor") or ""))
+        ):
+            # Redirigir a panorama global (no Dirección General).
+            out["_skip_origen_general"] = True
+            out["campo"] = "origen"
+            out["valor"] = "general"
         if "valor" in out and str(out.get("campo") or "").strip().lower() == "origen":
             canon = canonicalize_origen_alias(str(out.get("valor") or ""))
             if not canon:
@@ -2957,6 +3002,42 @@ def _build_agent(api_key: str, model_name: str, base_url: str = ""):
     ) -> dict[str, Any]:
         """Lista N por cada criterio (ej. 5 de aquí + 5 de TI). Sin rellenar ni duplicar etiquetas."""
         return _run(ctx.deps, "listar_criterios", {"criterios": criterios or []})
+
+    @agent.tool
+    def registrar_aprendizaje(
+        ctx: RunContext[ToolAgentDeps],
+        pregunta_usuario: str,
+        respuesta_ideal: str,
+        intencion_y_filtros: str = "",
+    ) -> dict[str, Any]:
+        """
+        Guarda en silencio una corrección/regla del usuario (few-shot).
+        Usar cuando diga «no así», «cuando pida X haz Y». No abre visor.
+        """
+        from inventario.ai.learned_examples import save_learned_example
+
+        row, err = save_learned_example(
+            pregunta_usuario=pregunta_usuario,
+            intencion_y_filtros=intencion_y_filtros or "",
+            respuesta_ideal=respuesta_ideal,
+            source="correction",
+            session_id=ctx.deps.session_id,
+        )
+        if err:
+            print(f"[inventario] registrar_aprendizaje FAIL: {err}")
+            logger.warning("registrar_aprendizaje: %s", err)
+            return {"ok": False, "error": err, "mutated": False}
+        print(
+            f"[inventario] registrar_aprendizaje OK id={(row or {}).get('id')} "
+            f"embedded={(row or {}).get('embedded')}"
+        )
+        return {
+            "ok": True,
+            "saved": True,
+            "id": (row or {}).get("id"),
+            "embedded": bool((row or {}).get("embedded")),
+            "mutated": False,
+        }
 
     return agent
 
@@ -3347,6 +3428,80 @@ def _plain_history_for_chitchat(
     return out[-max_n:]
 
 
+def run_fast_learning_reply(
+    message: str,
+    *,
+    preferred_model: str | None = None,
+    session_id: str | None = None,
+    history: list[dict] | None = None,
+) -> tuple[str, str | None, str | None, list, bool, list, dict, None]:
+    """
+    Guarda la regla en ai_learned_examples y confirma (sin tools de inventario).
+    Evita que menciones de TI/RH disparen contar_por_campo.
+    """
+    from inventario.ai.learned_examples import save_learned_example
+    from inventario.ai.usage import empty_usage
+
+    raw = (message or "").strip()
+    row, err = save_learned_example(
+        pregunta_usuario=raw,
+        intencion_y_filtros="regla_usuario",
+        respuesta_ideal=raw,
+        source="correction",
+        session_id=session_id,
+    )
+    if err:
+        print(f"[inventario] fast_learning SAVE fail: {err}")
+        logger.warning("fast_learning save: %s", err)
+        detail = str(err).strip()
+        if len(detail) > 220:
+            detail = detail[:217].rstrip() + "…"
+        reply = (
+            "Quedó claro lo que pediste; intenté guardar la regla pero falló "
+            f"el insert en `ai_learned_examples`: {detail} "
+            "Aun así aplicaré esa preferencia en este chat. "
+            "¿Seguimos con el inventario?"
+        )
+        usage = empty_usage(model=preferred_model or "gpt-4o-mini")
+        return (
+            reply,
+            None,
+            f"fast-learning-error:{preferred_model or 'gpt-4o-mini'}",
+            [],
+            False,
+            [],
+            usage,
+            None,
+        )
+
+    print(
+        f"[inventario] fast_learning SAVE ok id={(row or {}).get('id')} "
+        f"embedded={(row or {}).get('embedded')}"
+    )
+    reply = (
+        "Listo: ya registré esa regla para próximas consultas "
+        "(sin abrir el inventario ahora). "
+        "Cuando vuelvas a pedirlo, lo aplicaré automáticamente. "
+        "¿En qué más te ayudo?"
+    )
+    usage = empty_usage(model=preferred_model or "gpt-4o-mini")
+    try:
+        persist_short_turn(session_id, raw, reply)
+    except Exception:  # noqa: BLE001
+        pass
+    _ = history  # API parity; no tools
+    return (
+        reply,
+        None,
+        f"fast-learning:{preferred_model or 'gpt-4o-mini'}",
+        [],
+        False,
+        [],
+        usage,
+        None,
+    )
+
+
 def run_fast_chitchat_reply(
     message: str,
     *,
@@ -3654,6 +3809,17 @@ def run_tool_agent(
             session_id=session_id,
         )
 
+    # Enseñanza/corrección: guardar regla YA (sin consultar áreas/artículos).
+    from inventario.ai.learned_examples import looks_like_learning_message
+
+    if looks_like_learning_message(message):
+        return run_fast_learning_reply(
+            message,
+            preferred_model=preferred_model,
+            session_id=session_id,
+            history=history,
+        )
+
     # QR directo: datos + compose corto (sin agente/tools → mucho más rápido).
     if is_fast_qr_message(message, session_id=session_id):
         return run_fast_qr_reply(
@@ -3877,6 +4043,21 @@ def run_tool_agent(
         prompt_parts.append(f"Memoria de sesión:\n{mem}")
     if hist_bits:
         prompt_parts.append("Hilo reciente:\n" + "\n".join(hist_bits))
+    # Few-shot dinámico: top-2 ejemplos similares (similitud > 0.80).
+    try:
+        from inventario.ai.learned_examples import (
+            format_learned_block,
+            search_similar_examples,
+        )
+
+        learned = search_similar_examples(
+            message or "", limit=2, threshold=0.80
+        )
+        block = format_learned_block(learned)
+        if block:
+            prompt_parts.append(block)
+    except Exception:  # noqa: BLE001
+        pass
     # Con message_history el turno actual va solo como prompt (sin duplicar hilo).
     prompt_parts.append((message or "").strip())
     prompt = "\n\n".join(p for p in prompt_parts if p)

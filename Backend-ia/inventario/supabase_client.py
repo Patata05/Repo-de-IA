@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import unicodedata
 from pathlib import Path
@@ -306,6 +307,15 @@ def resolve_area_label(
     """
     want = _fold_text(needle)
     if not want:
+        return None
+    # “en general” / “general” / typo “ne general” → inventario global,
+    # NUNCA fuzzy con “Dirección General” (salvo que digan “dirección…”).
+    if "direccion" not in want and (
+        want in {"general", "en general", "ne general"}
+        or re.fullmatch(r"(en|ne)\s+general", want)
+        or re.search(r"(^|\s)(en|ne)\s+general(\s|$)", want)
+        or want == "general"
+    ):
         return None
     if rows is None:
         rows, error, _ = read_inventario()

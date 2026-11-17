@@ -1918,6 +1918,14 @@ export function detectCreateInventarioAsk(
 ): CreateInventarioAsk | undefined {
   const n = foldOrigenText(text);
   if (!n) return undefined;
+  // Enseñanza/corrección (“cuando yo diga crea…”, “aprende…”) ≠ crear inventario.
+  if (
+    /\b(aprende|aprender|recuerda\s+que|asi\s+no|no\s+asi|guarda\s+esta\s+regla|cuando\s+(yo\s+)?(diga|pida|digas|pidas))\b/.test(
+      n,
+    )
+  ) {
+    return undefined;
+  }
   if (/\b(compara|comparar|comparacion|diff|diferencia)\b/.test(n)) {
     return undefined;
   }

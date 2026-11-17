@@ -6481,9 +6481,24 @@ html:not(.theme-dark) .chat-response-actions {
   color: #e8eaed;
 }
 
+.chat-response-action.is-active {
+  color: #8ab4f8;
+  background: rgba(138, 180, 248, 0.12);
+}
+
+.chat-response-action:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
 html:not(.theme-dark) .chat-response-action:hover {
   background: rgba(0, 0, 0, 0.06);
   color: #202124;
+}
+
+html:not(.theme-dark) .chat-response-action.is-active {
+  color: #1a73e8;
+  background: rgba(26, 115, 232, 0.1);
 }
 
 .chat-inline-code {

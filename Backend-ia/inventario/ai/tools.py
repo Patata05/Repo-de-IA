@@ -409,6 +409,34 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "registrar_aprendizaje",
+            "description": (
+                "Guarda en silencio una corrección del usuario para few-shot "
+                "(«no así», «cuando pida X haz Y»). No abre visor ni inventa datos."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pregunta_usuario": {
+                        "type": "string",
+                        "description": "Petición o patrón que el usuario quiere que aprendas",
+                    },
+                    "intencion_y_filtros": {
+                        "type": "string",
+                        "description": "Tool/visor/filtros ideales (área, Inventario N, etc.)",
+                    },
+                    "respuesta_ideal": {
+                        "type": "string",
+                        "description": "Cómo debe responderse o resolverse en adelante",
+                    },
+                },
+                "required": ["pregunta_usuario", "respuesta_ideal"],
+            },
+        },
+    },
 ]
 
 
@@ -1054,6 +1082,25 @@ def run_tool(
                 args.get("criterios") or [],
                 contexto_vista,
             )
+
+        if name == "registrar_aprendizaje":
+            from inventario.ai.learned_examples import save_learned_example
+
+            row, err = save_learned_example(
+                pregunta_usuario=str(args.get("pregunta_usuario") or ""),
+                intencion_y_filtros=str(args.get("intencion_y_filtros") or ""),
+                respuesta_ideal=str(args.get("respuesta_ideal") or ""),
+                source="correction",
+                session_id=session_id,
+            )
+            if err:
+                return {"ok": False, "error": err, "mutated": False}
+            return {
+                "ok": True,
+                "saved": True,
+                "id": (row or {}).get("id"),
+                "mutated": False,
+            }
 
         return {"ok": False, "error": f"Herramienta desconocida: {name}"}
     except Exception as exc:  # noqa: BLE001

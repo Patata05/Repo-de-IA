@@ -405,3 +405,46 @@ export async function resetChatSession(
     };
   }
 }
+
+/** Pulgar arriba → guarda few-shot en ai_learned_examples (pgvector). */
+export async function submitChatLearn(input: {
+  vote: "up" | "down";
+  preguntaUsuario: string;
+  respuestaIdeal: string;
+  intencionYFiltros?: string;
+  sessionId?: string | null;
+}): Promise<{ ok: boolean; saved?: boolean; error?: string }> {
+  const base = getChatApiBaseUrl();
+  const url = base ? `${base}/api/chat/learn/` : "/api/chat/learn";
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        vote: input.vote,
+        pregunta_usuario: input.preguntaUsuario,
+        respuesta_ideal: input.respuestaIdeal,
+        intencion_y_filtros: input.intencionYFiltros || "",
+        session_id: input.sessionId || undefined,
+      }),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      saved?: boolean;
+      error?: string;
+    };
+    if (!response.ok) {
+      return { ok: false, error: data.error || `http_${response.status}` };
+    }
+    return {
+      ok: Boolean(data.ok ?? true),
+      saved: Boolean(data.saved),
+      error: data.error,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "fetch_failed",
+    };
+  }
+}

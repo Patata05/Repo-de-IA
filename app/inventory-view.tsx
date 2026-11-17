@@ -70,6 +70,7 @@ import {
   askInventoryChat,
   fetchChatHealth,
   resetChatSession,
+  submitChatLearn,
   type ChatApiItem,
   type ChatApiResponse,
   type ChatComparacionVista,
@@ -323,6 +324,8 @@ type ChatMessage = {
   viewerFocus?: string;
   /** Chips clicables bajo la respuesta. */
   followUps?: ChatFollowUp[];
+  /** Feedback del usuario (few-shot). */
+  feedback?: "up" | "down";
   /** Progreso visual al importar Excel/CSV. */
   importProgress?: {
     label: string;
@@ -3240,6 +3243,8 @@ function matchSingleAreaVocabularyToken(
   if (AREA_CONNECTOR_STOP.has(rawTok) && !AREA_PROTECTED_ACRONYMS.has(rawTok)) {
     return null;
   }
+  // “general” solo no es área (evita fuzzy → Dirección General).
+  if (rawTok === "general") return null;
   if (allAreaTokens.has(rawTok)) return { token: rawTok, confidence: "exact" };
   // Prefijo o singular/plural simple (ej. "cubiculos" -> "cubiculo", "salas" -> "sala")
   if (rawTok.endsWith("s") && rawTok.length > 3) {
@@ -3323,7 +3328,20 @@ function extractAreaQueryTokens(
         return false;
       }
       if (INTENT_DISCOURSE_LOCK.has(tok)) return false;
-      if (tok === "general" && arr[idx - 1] === "inventario") return false;
+      // “inventario general” / “en general” / “general” solo → NO área.
+      if (tok === "general") {
+        const prev = arr[idx - 1];
+        if (
+          prev === "inventario" ||
+          prev === "en" ||
+          prev === "ne" ||
+          prev !== "direccion"
+        ) {
+          // Solo conservar si viene de “dirección general”.
+          if (prev === "direccion") return true;
+          return false;
+        }
+      }
       return true;
     });
   // Solo conectores / vacío tras limpiar → consulta general (no «Coincidencias: y»).
@@ -3464,6 +3482,9 @@ function findMatchingAreasForPrompt(
   if (isNonConcreteChatAsk(userText) || isExploratoryChatAsk(userText)) {
     return undefined;
   }
+  if (looksLikeLearningCorrectionAsk(userText)) return undefined;
+  // “en general” / “general” sin “dirección” → global, no Dirección General.
+  if (isBareGeneralInventoryAsk(userText)) return undefined;
   // “que no sea recientes” / filtro temporal ≠ área fuzzy (“Atención a Clientes”).
   if (detectExcludeRecentRefineAsk(userText)) return undefined;
   if (looksLikeDeleteRecordAsk(userText) || userAskedQr(userText)) {
@@ -3518,11 +3539,13 @@ function findMatchingAreasForPrompt(
   ) {
     return undefined;
   }
-  // Ranking general de todas las áreas ("todas las áreas", "okey dame areas y gracias")
+  // Ranking general de todas las áreas ("todas las áreas", "okey dame areas y gracias").
+  // “todos los inventarios” ≠ “todas las áreas”.
   if (
     wantsGlobalAreasRanking(userText) ||
     (intentHas(n, "areas", "area") &&
-      (intentHas(n, "todas", "todos", "ranking", "distribucion", "desglose") ||
+      (/\b(todas|todos)\s+(las?\s+)?areas?\b/.test(n) ||
+        intentHas(n, "ranking", "distribucion", "desglose") ||
         /^(que|cuales|cuantas)\s+areas\s+(hay|existen|tiene)/.test(n) ||
         /^(areas|por areas)$/.test(n)))
   ) {
@@ -4118,12 +4141,13 @@ function resolvePendingDisambiguation(
       };
     }
 
-    // 5. ¿Y si el usuario mencionó una combinación de tokens donde los candidatos pendientes no tenían el prefijo
-    // (ej. dijo solo "general" refiriéndose al área base sin sufijo)?
+    // 5. “principal” / “solo” pueden acotar al área base; “general” solo con dirección.
     if (
-      strippedPlain.includes("general") ||
-      strippedPlain.includes("principal") ||
-      strippedPlain.includes("solo")
+      (/\bdireccion\s+general\b/.test(strippedPlain) ||
+        strippedPlain.includes("principal") ||
+        (strippedPlain.includes("solo") &&
+          !/\ben\s+general\b/.test(strippedPlain))) &&
+      !isBareGeneralInventoryAsk(userText)
     ) {
       const shortest = [...pendingCatalog].sort(
         (a, b) => a.tokens.length - b.tokens.length,
@@ -4699,6 +4723,71 @@ function looksLikeRecordMutationAsk(userText: string) {
 }
 
 /**
+ * Enseñanza / corrección few-shot → siempre al agente (registrar_aprendizaje).
+ * Evita que “cuando yo diga crea inventario…” lo tome el parser local.
+ */
+function looksLikeLearningCorrectionAsk(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /\b(aprende|aprender|aprendelo|aprendela|memoriza|memorizar)\b/.test(n)
+  ) {
+    return true;
+  }
+  if (
+    /\b(guarda|guardar|anota|anotar|registra|registrar)\s+(esta\s+)?(regla|correccion|preferencia|instruccion)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  if (/\brecuerda\s+que\b/.test(n) || /\bten\s+en\s+cuenta\s+que\b/.test(n)) {
+    return true;
+  }
+  if (
+    /\b(asi\s+no|no\s+asi|no\s+es\s+asi|esta\s+mal|eso\s+esta\s+mal|incorrecto)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\bcuando\s+(yo\s+)?(diga|pida|digas|pidas|mencione|pregunte)\b/.test(n)
+  ) {
+    return true;
+  }
+  if (
+    /\bla\s+proxima\s+vez\b/.test(n) &&
+    /\b(haz|hacer|usa|usar|filtra|filtrar|abre|abrir|responde)\b/.test(n)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** “en general” / “general” sin “dirección” → inventario global, no área. */
+function isBareGeneralInventoryAsk(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (/\bdireccion(\s+general)?\b/.test(n)) return false;
+  // “área de Legal… en general (de todos los inventarios)” sí nombra un área.
+  if (
+    /\b(esta|este)\s+areas?\b/.test(n) ||
+    /\bareas?\s+(de|del)\s+\S+/.test(n) ||
+    /\b(de|del)\s+(ti|rh|rrhh|sistemas|marketing|contabilidad|legal|recursos|ventas|operaciones|compras|logistica)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  return (
+    /\ben\s+general\b/.test(n) ||
+    /\bne\s+general\b/.test(n) ||
+    /(^|\s)general(\s|$)/.test(n)
+  );
+}
+
+/**
  * Consultas → n8n; estas intenciones siguen el pipeline local
  * (Excel, merge, crear, mutar, borrar, QR, formulario).
  */
@@ -4711,6 +4800,8 @@ function shouldKeepLocalWritePipeline(
     pendingChatImport?: boolean;
   },
 ): boolean {
+  // Enseñanza/corrección → PydanticAI (registrar_aprendizaje), no parsers locales.
+  if (looksLikeLearningCorrectionAsk(userText)) return false;
   if (opts?.pendingNewInventario) return true;
   if (opts?.pendingCopyEtiquetaDest) return true;
   // Excel pendiente + frase afirmativa → no mandar al agente.
@@ -7034,12 +7125,15 @@ function stripAreaAskFillerTokens(user: string): string {
 function wantsGlobalAreasRanking(userText: string): boolean {
   const user = normalizeChatIntent(userText);
   if (!user) return false;
-  // Un área concreta (“de TI”, “área Contabilidad”) no es ranking global.
+  // Enseñanza (“aprende… área…”) ≠ ranking de áreas.
+  if (looksLikeLearningCorrectionAsk(userText)) return false;
+  // “área de Legal… en general de todos los inventarios” → detalle de esa área.
   if (
-    /\b(de|del|en)\s+(ti|rh|rrhh|sistemas|marketing|contabilidad|recursos)\b/.test(
+    /\b(esta|este)\s+areas?\s+(de|del)\b/.test(user) ||
+    /\bareas?\s+(de|del)\s+(?!todas?\b|todos?\b)\S+/.test(user) ||
+    /\b(de|del|en)\s+(ti|rh|rrhh|sistemas|marketing|contabilidad|recursos|legal|cumplimiento|ventas|operaciones|compras|logistica)\b/.test(
       user,
-    ) &&
-    !/\b(todas|todos|general|ranking|hay|existen)\b/.test(user)
+    )
   ) {
     return false;
   }
@@ -7066,6 +7160,7 @@ function wantsGlobalAreasRanking(userText: string): boolean {
     /^(que|cuales|cuantas)\s+areas\s+(hay|existen|tiene)/.test(user) ||
     /\bareas?\s+(hay|existen|tiene|distintas?)\b/.test(user) ||
     /^(areas?|por\s+areas?)$/.test(user) ||
+    // “áreas + general/ranking…” solo si NO hay área concreta (arriba).
     (/\bareas?\b/.test(user) &&
       /\b(general|ranking|distribucion|desglose|panorama)\b/.test(user))
   );
@@ -7216,6 +7311,8 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
   // Solo incidencia visual/contable (estilo Google): no en cada mensaje.
   const user = normalizeChatIntent(userText);
   if (!user || /^(hola|buenas|hey|hi|hello)\b/.test(user)) return undefined;
+  // Reglas de aprendizaje: no abrir Áreas/Personas aunque digan “área”.
+  if (looksLikeLearningCorrectionAsk(userText)) return undefined;
   // Atajos del home (sin nombres inventados tipo “Juan Pérez”).
   if (/^(busqueda|buscar)\s+por\s+personas?$/.test(user)) return "personas";
   if (/^(equipos?|articulos?|registros?)\s+por\s+areas?$/.test(user)) return "areas";
@@ -11792,6 +11889,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     } else if (
       side &&
       !importPreviewLocked &&
+      !looksLikeLearningCorrectionAsk(side.userText || "") &&
       // Nunca pisar área concreta ni Personas filtradas por área.
       side.viewerOverview !== "areaTotal" &&
       side.viewerOverview !== "personas" &&
@@ -11907,6 +12005,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     } else if (
       side &&
       !importPreviewLocked &&
+      !looksLikeLearningCorrectionAsk(side.userText || "") &&
       side.viewerOverview !== "areaTotal" &&
       side.viewerOverview !== "personas" &&
       side.apiViewer?.tipo !== "area" &&
@@ -13971,6 +14070,58 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           pendingChatImport: hasPendingImport,
         });
       if (preferAgentConsultas && !keepLocal) {
+        // Enseñanza/corrección → directo al agente (registrar_aprendizaje).
+        if (looksLikeLearningCorrectionAsk(spokenRaw)) {
+          const memoryBlock = [
+            formatChatMemoryForPrompt(),
+            resolvedTurn.threadHint,
+          ]
+            .filter(Boolean)
+            .join("\n\n");
+          try {
+            const history = messagesRef.current
+              .filter((m) => m.from === "user" || m.from === "bot")
+              .slice(-8)
+              .map((m) => ({
+                role: m.from === "user" ? ("user" as const) : ("assistant" as const),
+                content: String(m.text || ""),
+              }));
+            const data = await askInventoryChat(spokenRaw, history, {
+              signal: controller.signal,
+              memory: memoryBlock || undefined,
+              model: activeLlmMeta.model,
+              sessionId,
+              contextoVista: getContextoVista(spokenRaw),
+            });
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted
+            ) {
+              return;
+            }
+            if (data.error === "aborted") return;
+            const replyText =
+              (data.reply || "").trim() ||
+              "Listo, lo tendré en cuenta.";
+            recordTokenConsumption(data.usage ?? null, spokenRaw, replyText);
+            await ensureTypingPause(replyText);
+            finishBotReply(sessionId, botId, replyText, {
+              userText: spokenRaw,
+              resultItems: [],
+              qr: [],
+              skipExpand: true,
+            });
+            return;
+          } catch (err) {
+            if (
+              (err instanceof DOMException && err.name === "AbortError") ||
+              (err instanceof Error && err.name === "AbortError")
+            ) {
+              return;
+            }
+            /* caer a intercepts / agente normal */
+          }
+        }
         // QR “de esta área” → área activa local (antes del fast-QR global).
         if (looksLikeAreaQrDeixis(spokenRaw) && items.length) {
           const areaName =
@@ -14359,7 +14510,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           let sideComparacion: ChatComparacionVista | null = null;
           let resultItems = sideItems;
 
-          // Prioridad: área concreta pedida (TI) por encima de panorama/ranking.
+          // Prioridad: área concreta pedida (TI / Legal…) por encima de panorama.
           // No si pidieron personas/nombres del área (eso abre plantilla Personas).
           const localAreaAsk = detectAreaPersonasAsk(spokenRaw, items, null)
             ? undefined
@@ -14367,8 +14518,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           if (
             localAreaAsk &&
             !localAreaAsk.uncertain &&
-            localAreaAsk.candidates.length === 1 &&
-            !wantsGlobalAreasRanking(spokenRaw)
+            localAreaAsk.candidates.length === 1
           ) {
             const single = localAreaAsk.candidates[0];
             const origenAsk =
@@ -14418,8 +14568,29 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             ctx?.tipo === "areas" ||
             ctx?.tipo === "areas_general"
           ) {
-            sideOverview = "areas";
-            resultItems = [];
+            // Backend mandó panorama, pero el texto nombra un área concreta.
+            const namedArea =
+              localAreaAsk &&
+              !localAreaAsk.uncertain &&
+              localAreaAsk.candidates.length === 1
+                ? localAreaAsk.candidates[0]
+                : null;
+            if (namedArea) {
+              sideFocus = namedArea.name;
+              sideOverview = "areaTotal";
+              resultItems = rowsForAreaExact(
+                items,
+                namedArea.name,
+                CHAT_SIDE_RESULT_CAP,
+              ).map((row) => rowToChatApiItem(row));
+              activeAreaContextRef.current = {
+                name: namedArea.name,
+                at: Date.now(),
+              };
+            } else {
+              sideOverview = "areas";
+              resultItems = [];
+            }
           } else if (ctx?.tipo === "etiquetas" || ctx?.tipo === "registros") {
             // Plantilla Etiquetas (overview vacío) con listado completo.
             const focusLabel = String(ctx.valor || "").trim();
@@ -20061,17 +20232,89 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                 </button>
                                 <button
                                   type="button"
-                                  className="chat-response-action"
-                                  title="Me gusta"
+                                  className={`chat-response-action${
+                                    message.feedback === "up" ? " is-active" : ""
+                                  }`}
+                                  title="Me gusta — guardar como ejemplo"
                                   aria-label="Me gusta"
+                                  aria-pressed={message.feedback === "up"}
+                                  disabled={message.feedback === "up"}
+                                  onClick={() => {
+                                    if (message.feedback === "up") return;
+                                    const userAsk = (() => {
+                                      const idx = messagesRef.current.findIndex(
+                                        (m) => m.id === message.id,
+                                      );
+                                      for (let i = idx - 1; i >= 0; i -= 1) {
+                                        const m = messagesRef.current[i];
+                                        if (m?.from === "user") {
+                                          return String(m.text || "").trim();
+                                        }
+                                      }
+                                      return "";
+                                    })();
+                                    const intentBits = [
+                                      message.viewerOverview
+                                        ? `visor=${message.viewerOverview}`
+                                        : "",
+                                      message.viewerFocus
+                                        ? `foco=${message.viewerFocus}`
+                                        : "",
+                                    ]
+                                      .filter(Boolean)
+                                      .join("; ");
+                                    const next = messagesRef.current.map((m) =>
+                                      m.id === message.id
+                                        ? { ...m, feedback: "up" as const }
+                                        : m,
+                                    );
+                                    messagesRef.current = next;
+                                    setMessages(next);
+                                    const sid = activeChatIdRef.current;
+                                    if (sid) upsertChatSession(sid, next);
+                                    void submitChatLearn({
+                                      vote: "up",
+                                      preguntaUsuario:
+                                        userAsk || "consulta de inventario",
+                                      respuestaIdeal: String(
+                                        message.text || "",
+                                      ).trim(),
+                                      intencionYFiltros: intentBits,
+                                      sessionId: sid,
+                                    });
+                                  }}
                                 >
                                   <ThumbsUp size={14} strokeWidth={1.8} />
                                 </button>
                                 <button
                                   type="button"
-                                  className="chat-response-action"
+                                  className={`chat-response-action${
+                                    message.feedback === "down"
+                                      ? " is-active"
+                                      : ""
+                                  }`}
                                   title="No me gusta"
                                   aria-label="No me gusta"
+                                  aria-pressed={message.feedback === "down"}
+                                  disabled={message.feedback === "down"}
+                                  onClick={() => {
+                                    if (message.feedback === "down") return;
+                                    const next = messagesRef.current.map((m) =>
+                                      m.id === message.id
+                                        ? { ...m, feedback: "down" as const }
+                                        : m,
+                                    );
+                                    messagesRef.current = next;
+                                    setMessages(next);
+                                    const sid = activeChatIdRef.current;
+                                    if (sid) upsertChatSession(sid, next);
+                                    void submitChatLearn({
+                                      vote: "down",
+                                      preguntaUsuario: "",
+                                      respuestaIdeal: "",
+                                      sessionId: sid,
+                                    });
+                                  }}
                                 >
                                   <ThumbsDown size={14} strokeWidth={1.8} />
                                 </button>
