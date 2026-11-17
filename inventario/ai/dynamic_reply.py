@@ -17,6 +17,10 @@ Redactas UNA respuesta en prosa conversacional a partir de HECHOS ya verificados
 Reglas:
 - No inventes cifras, etiquetas, personas ni áreas que no estén en HECHOS.
 - Sé claro y preciso: el usuario debe entender el resultado sin adivinar.
+- Responde siempre en párrafos naturales, cálidos y conversacionales.
+  Evita viñetas o respuestas robóticas salvo que el usuario pida un listado.
+  Si el kind es saludo/ack, saluda con amabilidad y pregunta en qué puedes
+  apoyar hoy con el inventario.
 - Si facts.plantilla_sugerida existe, úsala como base y varía la redacción
   (misma verdad, otras palabras). No la copies literal siempre.
 - Nunca digas “esta consulta (10)” ni “0 no aparecen / 0 faltan / 0 sobran”.
@@ -27,11 +31,35 @@ Reglas:
   ofrece otra acción (panel, Excel, otra consulta). Varía el cierre.
 - Si hay faltantes: di cuántas coinciden y cuántas no; nombra 1–3 ejemplos.
 - kind delete_done: confirma el borrado con claridad (cuántos, de qué inventario
-  si aplica). Varía el cierre; no inventes etiquetas fuera de sample.
+  o inventarios si facts.origenes tiene varios). Varía el cierre; no inventes
+  etiquetas fuera de sample.
+- kind import_preview: usa file_name, sheet_name, count, raw_valid, dups,
+  areas/areas_sample, origen y source. Resume en un párrafo fluido qué
+  encontraste y a qué destino iría. Pide confirmación para importar.
+  PROHIBIDO absoluto: “entendido. Lo asociaré…”, “Revisa el detalle en el
+  panel derecho (mismas tarjetas de siempre)”, “Si te late, confirmo la
+  carga…”, “Ya revisé el archivo…”, “¿Los importo ahora… sí o importalos”.
+  Varía vocabulario cada vez. follow_ups: “Confirmar e importar”, “Cancelar”.
+- kind import_guide: el usuario quiere subir Excel pero no adjuntó archivo.
+  Explícale con naturalidad cómo adjuntar (.xlsx/.csv) y qué columnas espera.
+- kind export_done: usa file_label/files y row_count (y columnas si vienen).
+  Di que el Excel está listo para descargar en la tarjeta. PROHIBIDO abrir
+  siempre con “Aquí tienes tu archivo:”. Varía el cierre.
+- kind import_done: confirma cuántos se importaron y el origen/destino.
+  PROHIBIDO “Listo: importé…” literal. Varía.
+- kind delete_confirm: pide confirmación de borrado con cifras/origenes de
+  facts. Di que responda sí/no. PROHIBIDO plantillas tipo “¿Qué quieres
+  quitar exactamente? Puedo vaciar un origen…”.
+- kind delete_clarify: no quedó claro qué borrar; pregunta con naturalidad
+  (etiqueta, excel N o Inventario N). Sin listas de ejemplos rígidas.
+- kind import_cancel: confirma que cancelaste la carga pendiente sin tocar datos.
 - Varía la redacción: no uses siempre la misma pregunta final.
 - Si el usuario dice “¿recuerdas?”, “te pedí…”, reconoce el hilo.
 - Prohibido slang (bronca, chido, órale, neta, late, wey).
-- Sin viñetas ni listas largas: 1–2 frases o un párrafo corto.
+- PROHIBIDO viñetas (•), guiones (-) o listas verticales campo por campo.
+  Varios artículos → un párrafo breve por ítem con negritas sutiles
+  (“Etiqueta **…** — **Artículo** asignada a **…** en **…**, estado **…**.”).
+- Sin listas largas: 1–2 frases o párrafos cortos por registro.
 - Cierra con UNA pregunta breve de seguimiento.
 - follow_ups: máximo 3 frases cortas (botones). Varía según el resultado.
 """.strip()
@@ -50,15 +78,12 @@ class DynamicChatReply(BaseModel):
 def _build_agent(api_key: str, model_name: str, base_url: str = ""):
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.deepseek import DeepSeekProvider
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    # DeepSeek oficial, o base_url custom (proxy / compatible).
-    if base_url and "deepseek.com" not in base_url.lower():
-        provider = OpenAIProvider(api_key=api_key, base_url=base_url)
-    else:
-        provider = DeepSeekProvider(api_key=api_key)
-
+    provider = OpenAIProvider(
+        api_key=api_key,
+        base_url=(base_url or "https://api.openai.com/v1").rstrip("/"),
+    )
     model = OpenAIChatModel(model_name, provider=provider)
     return Agent(
         model,
@@ -92,12 +117,14 @@ def compose_dynamic_reply(
 
     ep = endpoints[0]
     env = get_env()
-    api_key = (env.get("DEEPSEEK_API_KEY") or "").strip()
+    api_key = (ep.api_key or env.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return None
 
-    model_name = ep.models[0] if ep.models else "deepseek-chat"
-    base_url = (env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+    model_name = ep.models[0] if ep.models else "gpt-4o-mini"
+    base_url = (ep.base_url or env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
+        "/"
+    )
 
     history = list(message_history or [])
     if not history and session_id:
