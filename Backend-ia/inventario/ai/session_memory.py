@@ -175,6 +175,32 @@ def load_session_messages(session_id: str) -> list[Any]:
     return []
 
 
+def clear_session_messages(session_id: str) -> bool:
+    """Vacía o borra messages_json de la sesión."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    # Preferir vaciar (upsert []) para no romper FK / unicidad.
+    if save_session_messages(sid, []):
+        return True
+    env = get_env()
+    base, attempts = _supabase_base_and_keys(env)
+    if not base or not attempts:
+        return False
+    qs = f"{TABLE}?session_id=eq.{quote(sid, safe='')}"
+    for name, key, send_bearer in attempts:
+        url = f"{base}/rest/v1/{qs}"
+        headers = {"apikey": key, "Accept": "application/json"}
+        if send_bearer:
+            headers["Authorization"] = f"Bearer {key}"
+        _payload, error, _ = _request_json("DELETE", url, headers=headers)
+        if error:
+            logger.warning("clear_session_messages %s: %s", name, error[:300])
+            continue
+        return True
+    return False
+
+
 def save_session_messages(session_id: str, messages: list[Any]) -> bool:
     sid = str(session_id or "").strip()
     if not sid:

@@ -200,8 +200,9 @@ export type ExcelExportAsk = {
 };
 
 /**
- * Detecta pedidos tipo “dame un excel…”, “3 excel de oficinas…”,
- * “excel del inventario 3”.
+ * Detecta pedidos explícitos de DESCARGAR/EXPORTAR Excel (solo clasificación).
+ * La vista previa + confirmación viven en el backend (preparar/confirmar_exportacion_excel).
+ * Panorama/resumen con alias xlsx|excel N → NO exportar.
  */
 export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
   const raw = String(userText || "").trim();
@@ -213,20 +214,44 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!/\b(excel|xlsx|xls|csv|hoja de calculo|spreadsheet)\b/.test(n)) {
-    return null;
-  }
-  // Importar/subir no es exportar.
+
+  // Panorama / resumen ≠ exportar (aunque digan xlsx 2).
   if (
-    /\b(importar|subir|cargar|adjuntar|pasa(?:rme)?)\b/.test(n) &&
-    !/\b(exportar|descargar|genera|generar|dame|muestra|crear|crea|haz|armar|ayud|darme|pasar)\b/.test(
+    /\b(panorama|panorma|resumen|dashboard|totales?|conteo|cuantos?|cuantas?)\b/.test(
       n,
-    )
+    ) &&
+    !/\b(exportar?|descargar?|bajar|descarga)\b/.test(n)
   ) {
     return null;
   }
 
-  // “inventario 3” / “inventari 3” / “inevtario tres”
+  if (!/\b(excel|xlsx|xls|csv|hoja de calculo|spreadsheet|archivo)\b/.test(n)) {
+    return null;
+  }
+
+  const wantsImport =
+    /\b(import\w*|subir\w*|subo|subire|cargar\w*|carga|adjunt\w*|pasarte|mandarte|enviarte|traerte)\b/.test(
+      n,
+    ) ||
+    /\b(como|como)\s+(subo|subir|importo|importar|cargo|cargar|adjunto)\b/.test(n) ||
+    /\b(te\s+voy\s+a|voy\s+a|quiero)\b[\s\S]{0,40}\b(subir|importar|cargar|adjuntar|pasar|mandar|enviar)\b/.test(
+      n,
+    );
+  const wantsExportExplicit =
+    /\b(exportar?|descargar?|bajar|descarga)\b/.test(n) ||
+    /\b(genera|generar|dame|crea|crear|haz|armar|darme)\b[\s\S]{0,32}\b(archivo\s+)?(excel|xlsx|xls|csv)\b/.test(
+      n,
+    ) ||
+    /\b(excel|xlsx|xls|csv)\b[\s\S]{0,32}\b(para\s+descargar|descargable|de\s+descarga)\b/.test(
+      n,
+    );
+  if (wantsImport && !wantsExportExplicit) {
+    return null;
+  }
+  if (!wantsExportExplicit) {
+    return null;
+  }
+
   const wordNum: Record<string, number> = {
     uno: 1,
     una: 1,
@@ -241,37 +266,35 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
     diez: 10,
   };
   let origen: string | null = null;
+  // xlsx/xls/csv/ecel N → excel N (origen real), no “N archivos”.
+  const fileOrigenMatch = n.match(
+    /\b(excel|xlsx|xls|csv|ecel|exel)e?s?\s*(\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b/,
+  );
+  if (fileOrigenMatch) {
+    const rawNum = fileOrigenMatch[2];
+    const num = /^\d+$/.test(rawNum) ? Number(rawNum) : wordNum[rawNum];
+    if (num && Number.isFinite(num)) origen = `excel ${num}`;
+  }
   const origenMatch = n.match(
     /\b(?:al)?(?:inventari[oa]?s?|invenatrio|invetario|inevtario|inventar[ioa]*)\s*(\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b/,
   );
-  if (origenMatch) {
+  if (!origen && origenMatch) {
     const rawNum = origenMatch[1];
     const num = /^\d+$/.test(rawNum) ? Number(rawNum) : wordNum[rawNum];
     if (num && Number.isFinite(num)) origen = `Inventario ${num}`;
   }
 
   let count = 1;
-  // Si ya hay “inventario 3”, ese 3 NO es “3 archivos excel”.
   if (!origen) {
-    const countMatch =
-      n.match(
-        /\b(\d{1,2})\s*(excel|xlsx|xls|csv|archivos?|inventarios?)\b/,
-      ) ||
-      n.match(
-        /\b(excel|xlsx|xls|csv|archivos?|inventarios?)\s*(\d{1,2})\b/,
-      );
+    const countMatch = n.match(
+      /\b(\d{1,2})\s*(excel|xlsx|xls|csv|archivos?|inventarios?)\b/,
+    );
     if (countMatch) {
-      const num = Number(countMatch[1] || countMatch[2]);
+      const num = Number(countMatch[1]);
       if (Number.isFinite(num) && num >= 1) count = Math.min(12, num);
-    } else if (
-      /\b(tres)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
-      /\b(excel|xlsx|archivos|inventarios)\s+(tres)\b/.test(n)
-    ) {
+    } else if (/\b(tres)\s+(excel|xlsx|archivos|inventarios)\b/.test(n)) {
       count = 3;
-    } else if (
-      /\b(dos)\s+(excel|xlsx|archivos|inventarios)\b/.test(n) ||
-      /\b(excel|xlsx|archivos|inventarios)\s+(dos)\b/.test(n)
-    ) {
+    } else if (/\b(dos)\s+(excel|xlsx|archivos|inventarios)\b/.test(n)) {
       count = 2;
     }
   }
@@ -299,4 +322,14 @@ export function detectExcelExportAsk(userText: string): ExcelExportAsk | null {
   }
 
   return { count, theme, fromContext, origen };
+}
+
+/** @deprecated Pendiente local eliminado: la confirmación es del backend. */
+export function hasPendingExcelExport(): boolean {
+  return false;
+}
+
+/** @deprecated Pendiente local eliminado: la confirmación es del backend. */
+export function clearPendingExcelExport(): void {
+  /* no-op */
 }

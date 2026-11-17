@@ -28,6 +28,10 @@ import {
 import type { InventarioRow } from "@/lib/supabase";
 import ModalPortal from "@/components/modal-portal";
 import {
+  canonicalizeOrigenLabel,
+  origensMatch,
+} from "@/lib/inventario-origen";
+import {
   buildSearchIndex,
   indexMatchesPrepared,
   prepareSearch,
@@ -247,7 +251,12 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
         items
           .filter((row) => {
             if (filterArea !== "ALL" && textOf(row.area) !== filterArea) return false;
-            if (filterOrigen !== "ALL" && textOf(row.origen) !== filterOrigen) return false;
+            if (
+              filterOrigen !== "ALL" &&
+              !origensMatch(textOf(row.origen), filterOrigen)
+            ) {
+              return false;
+            }
             return Boolean(textOf(row.persona));
           })
           .map((row) => textOf(row.persona)),
@@ -263,7 +272,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
             if (filterArea !== "ALL" && textOf(row.area) !== filterArea) return false;
             return Boolean(textOf(row.origen));
           })
-          .map((row) => textOf(row.origen)),
+          .map((row) => canonicalizeOrigenLabel(textOf(row.origen))),
       ),
     ].sort();
   }, [items, filterArea]);
@@ -300,7 +309,12 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
       } else if (filterPerson !== "ALL") {
         if (textOf(row.persona) !== filterPerson) continue;
       }
-      if (filterOrigen !== "ALL" && textOf(row.origen) !== filterOrigen) continue;
+      if (
+        filterOrigen !== "ALL" &&
+        !origensMatch(textOf(row.origen), filterOrigen)
+      ) {
+        continue;
+      }
       if (preparedSearch && !indexMatchesPrepared(entry, preparedSearch)) continue;
       filteredRows.push(row);
     }
@@ -417,7 +431,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
   const origenBreakdown = useMemo(() => {
     const map = new Map<string, number>();
     for (const r of reportIncludedItems) {
-      const orig = textOf(r.origen) || "Compra";
+      const orig = canonicalizeOrigenLabel(textOf(r.origen)) || "Compra";
       map.set(orig, (map.get(orig) || 0) + (r.cantidad || 1));
     }
     return [...map.entries()].sort((a, b) => b[1] - a[1]);
@@ -514,7 +528,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
         <td>${textOf(r.area)}</td>
         <td>${textOf(r.persona) || "<em>Sin asignar</em>"}</td>
         <td style="text-align:center;">${r.cantidad ?? 1}</td>
-        <td>${textOf(r.origen) || "Compra"}</td>
+        <td>${canonicalizeOrigenLabel(textOf(r.origen)) || "Compra"}</td>
       </tr>
     `
       )

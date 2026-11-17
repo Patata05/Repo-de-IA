@@ -11,6 +11,11 @@ SYSTEM_PROMPT = """Eres el asistente de inventario de oficina (español de Méxi
 Eres trabajador y proactivo: das contexto útil y ofreces siguientes pasos claros,
 como un buen asistente de inventario, sin inventar datos.
 
+Estilo: párrafos naturales y conversacionales. Evita viñetas o listas largas
+salvo que el usuario pida explícitamente un listado de varios equipos.
+Si te saludan, saluda con amabilidad y pregunta en qué puedes apoyar hoy.
+Usa las tools de Supabase; nunca inventes filas ni totales.
+
 Respondes SOLO con datos reales de las herramientas. NUNCA inventes totales ni redondees a 1000.
 Unicidad: solo ETIQUETA es irrepetible dentro del mismo origen. Serie/marca/modelo SÍ se repiten.
 No digas que la serie es única. Temperatura conceptual: 0 (determinista).
@@ -54,12 +59,13 @@ Consultas:
   "recientes" → últimos movimientos.
   En el chat: texto breve; no satures con tablas largas.
 - "dame un QR", "código QR de …" → generar_qr (etiqueta, id o ultimo=true).
-- Varios QR / códigos QR de un área/persona
-  ("dame 5 QR de Biblioteca", "dame 5 códigos QR de Biblioteca")
-  → UNA sola generar_qr con query="Biblioteca" (o el texto) y limit=N (máx. 7).
+- "dame sus QR" / "QR de [persona]" sin número → generar_qr query=nombre
+  limit=50 (TODOS los de esa persona; no recortes a 7).
+- Varios QR con N concreto ("dame 5 QR de Biblioteca")
+  → generar_qr query=… limit=N (máx. 50).
   Solo si dicen QR / código(s) QR. Si dicen solo "etiquetas", NO generar_qr.
-- Varios QR ya conocidos ("esos 7", lista de ids / etiquetas para QR)
-  → UNA generar_qr con etiquetas=[...] o ids=[...] (máx. 7).
+- Varios QR ya conocidos (lista de ids / etiquetas)
+  → generar_qr con etiquetas=[...] o ids=[...] (máx. 50).
   NUNCA digas que solo puedes uno. Resumen en chat; QR en el visor.
 
 Importación Excel/CSV:
@@ -579,47 +585,42 @@ def run_chat_agent(
     history: list[dict] | None = None,
     memory: str | None = None,
     preferred_model: str | None = None,
-) -> tuple[str, str | None, str | None, list[dict], bool, list[dict]]:
+) -> tuple[str, str | None, str | None, list[dict], bool, list[dict], dict]:
+    from inventario.ai.usage import empty_usage
+
     endpoints = get_llm_endpoints()
     if not endpoints:
         return (
-            "No hay proveedores de IA listos. Configura DEEPSEEK_API_KEY.",
+            "No hay proveedores de IA listos. Configura OPENAI_API_KEY.",
             "missing_key",
             None,
             [],
             False,
             [],
+            empty_usage(),
         )
 
     memory_text = (memory or "").strip()
     if len(memory_text) > MAX_MEMORY_CHARS:
         memory_text = memory_text[: MAX_MEMORY_CHARS - 1] + "…"
 
-    # Saludos / ayuda simple: respuesta local sin round-trip al LLM.
-    msg_l = (message or "").strip().lower().rstrip("!?.")
-    if msg_l in {
-        "hola",
-        "buenas",
-        "hey",
-        "hi",
-        "hello",
-        "qué tal",
-        "que tal",
-        "saludos",
-        "buen dia",
-        "buen día",
-        "buenos dias",
-        "buenos días",
-        "buenas tardes",
-        "buenas noches",
-    }:
-        local_text, local_items = local_chat_answer("hola")
-        return local_text, None, "local:fast", local_items[:MAX_SIDE_ITEMS], False, []
-    if msg_l in {"ayuda", "qué puedes", "que puedes", "que puedes hacer", "qué puedes hacer"}:
-        local_text, local_items = local_chat_answer("ayuda")
-        return local_text, None, "local:fast", local_items[:MAX_SIDE_ITEMS], False, []
+    # Preferir agente pydantic-ai + tools (lecturas ancladas a Supabase).
+    try:
+        from inventario.ai.tool_agent import run_tool_agent
+
+        reply, error, used, items, mutated, qr_list, usage = run_tool_agent(
+            message,
+            history,
+            memory_text,
+            preferred_model=preferred_model,
+        )
+        if error not in ("tool_agent_import", "tool_agent_build"):
+            return reply, error, used, items, mutated, qr_list, usage
+    except Exception:  # noqa: BLE001
+        pass
 
     # Acuses sin pedido concreto: solo texto, sin items/QR.
+    msg_l = (message or "").strip().lower().rstrip("!?.")
     if msg_l in {
         "ok",
         "okay",
@@ -648,19 +649,8 @@ def run_chat_agent(
             [],
             False,
             [],
+            empty_usage(),
         )
-
-    # Conteo / ranking global de áreas (antes del total de un área concreta).
-    areas_fast = _try_areas_count_fast(message)
-    if areas_fast is not None:
-        text, items = areas_fast
-        return text, None, "local:areas-count", items[:MAX_SIDE_ITEMS], False, []
-
-    # Total de un área concreta → una sola consulta local (sin rondas de tools).
-    area_fast = _try_area_total_fast(message)
-    if area_fast is not None:
-        text, items = area_fast
-        return text, None, "local:area-total", items[:MAX_SIDE_ITEMS], False, []
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if memory_text:
@@ -712,6 +702,7 @@ def run_chat_agent(
                             (items2 or side)[:MAX_SIDE_ITEMS],
                             mutated,
                             qr_payloads,
+                            empty_usage(),
                         )
                     local_text, local_items = local_chat_answer(message)
                     if local_text and not local_text.startswith("No encontré coincidencias"):
@@ -722,6 +713,7 @@ def run_chat_agent(
                             (local_items or side)[:MAX_SIDE_ITEMS],
                             mutated,
                             qr_payloads,
+                            empty_usage(),
                         )
                     return (
                         "Me faltó un dato para responder con precisión. "
@@ -732,6 +724,7 @@ def run_chat_agent(
                         side,
                         mutated,
                         qr_payloads,
+                        empty_usage(),
                     )
                 return (
                     text,
@@ -740,6 +733,7 @@ def run_chat_agent(
                     side,
                     mutated,
                     qr_payloads,
+                    empty_usage(),
                 )
 
             messages.append(
@@ -796,6 +790,7 @@ def run_chat_agent(
                 _side_items_for_reply(collected, qr_payloads),
                 mutated,
                 qr_payloads,
+                empty_usage(),
             )
         return (
             "No terminé esa consulta a tiempo. Reformúlala en una sola frase concreta "
@@ -805,17 +800,19 @@ def run_chat_agent(
             _side_items_for_reply(collected, qr_payloads),
             mutated,
             qr_payloads,
+            empty_usage(),
         )
     except Exception as exc:  # noqa: BLE001
         text = str(exc)
         if text.startswith("llm_unavailable:") or text == "missing_providers" or _is_retryable(exc):
             return (
-                "DeepSeek no respondió. Reintento en unos segundos…",
+                "OpenAI no respondió. Reintento en unos segundos…",
                 "llm_unavailable",
                 used_label,
                 _side_items_for_reply(collected, qr_payloads),
                 mutated,
                 qr_payloads,
+                empty_usage(),
             )
         return (
             f"Error al consultar la IA: {exc}",
@@ -824,4 +821,5 @@ def run_chat_agent(
             _side_items_for_reply(collected, qr_payloads),
             mutated,
             qr_payloads,
+            empty_usage(),
         )

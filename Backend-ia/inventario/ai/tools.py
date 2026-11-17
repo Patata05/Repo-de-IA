@@ -68,9 +68,8 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
                 "Cuenta artículos donde un campo contiene un texto y devuelve "
                 "una muestra de items para el visor. "
                 "Ej: campo=persona valor=GARCIA AVILA MARTIN; "
-                "campo=area valor=EDIF B (también 'edificio B' o 'EDIF. B'). "
-                "Usa UNA sola llamada para 'cuántos tiene [persona]' "
-                "o 'dame toda la información de [área]'."
+                "campo=area valor=Biblioteca. "
+                "Usa UNA sola llamada para 'cuántos tiene [persona]'."
             ),
             "parameters": {
                 "type": "object",
@@ -129,16 +128,37 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "buscar_semantico",
+            "description": (
+                "Búsqueda semántica (pgvector). Usar si buscar_inventario no encuentra "
+                "por significado (ej. 'computadora portátil' vs 'MacBook'). "
+                "Hoy puede estar desactivada hasta generar embeddings."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generar_qr",
             "description": (
                 "Genera códigos QR. SOLO si el usuario pide QR / código(s) QR. "
                 "NO uses esta tool para 'dame N etiquetas' (eso es listar_recientes "
                 "o buscar_inventario). "
                 "Uno: etiqueta, id, o ultimo=true. "
-                "Varios conocidos: etiquetas=[...] o ids=[...] (máx. 7). "
-                "N QR de un área/persona (ej. '5 QR de Biblioteca'): "
-                "query='Biblioteca' y limit=5 en UNA sola llamada. "
-                "La UI muestra los QR en el visor; resume breve."
+                "Varios conocidos: etiquetas=[...] o ids=[...]. "
+                "Todos los QR de una persona/área sin número (ej. 'dame sus QR', "
+                "'QR de Ricardo'): query='Ricardo Morales' y limit=50 (o el total). "
+                "Si piden N concreto (ej. '5 QR de Biblioteca'): query + limit=N. "
+                "NUNCA recortes a 7 si el usuario no pidió 7. "
+                "La UI muestra los QR en el visor; resume breve en el chat."
             ),
             "parameters": {
                 "type": "object",
@@ -148,24 +168,25 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
                     "etiquetas": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Lista de etiquetas para varios QR (máx. 7).",
+                        "description": "Lista de etiquetas para varios QR (máx. 50).",
                     },
                     "ids": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Lista de ids para varios QR (máx. 7).",
+                        "description": "Lista de ids para varios QR (máx. 50).",
                     },
                     "query": {
                         "type": "string",
                         "description": (
-                            "Busca artículos (área, persona, etc.) y genera QR de los "
-                            "primeros N. Ej: 'Biblioteca', 'Juan Pérez'."
+                            "Busca artículos (área, persona, etc.) y genera QR. "
+                            "Ej: 'Biblioteca', 'Juan Pérez'."
                         ),
                     },
                     "limit": {
                         "type": "integer",
                         "description": (
-                            "Cuántos QR generar con query / lote (1-7). Default 5."
+                            "Cuántos QR (1-50). Sin número del usuario: 50 "
+                            "(todos los que quepan). Con N: usa N."
                         ),
                     },
                     "ultimo": {
@@ -261,58 +282,13 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "buscar_inventario":
             query = str(args.get("query") or "").strip()
             limit = int(args.get("limit") or 15)
-            limit = max(1, min(50, limit))
-            origen = str(args.get("origen") or "").strip() or None
-
-            # BM25 (ligero)
-            hybrid_items: list[dict] = []
-            engines: dict = {}
-            try:
-                from inventario.ai.rag_engine import hybrid_search, rebuild_index, status
-
-                all_rows, err_all, _used = db.read_inventario()
-                if not err_all and all_rows:
-                    rebuild_index(all_rows)
-                    hybrid_items = hybrid_search(
-                        query, all_rows, top_k=limit, origen=origen
-                    )
-                    engines = status()
-            except Exception as rag_exc:  # noqa: BLE001
-                hybrid_items = []
-                engines = {"error": str(rag_exc)}
-
-            if hybrid_items:
-                areas: dict[str, int] = {}
-                for row in hybrid_items:
-                    area = str(row.get("area") or "Sin área").strip() or "Sin área"
-                    areas[area] = areas.get(area, 0) + 1
-                return {
-                    "ok": True,
-                    "total": len(hybrid_items),
-                    "count": len(hybrid_items),
-                    "areas": areas,
-                    "items": [_compact_row(r) for r in hybrid_items],
-                    "search_mode": "bm25",
-                    "engines": engines,
-                }
-
-            rows, total_matches, error = db.search_inventario_with_total(
-                query, limit=limit
-            )
+            rows, error = db.search_inventario(query, limit=limit)
             if error:
                 return {"ok": False, "error": error}
-            areas = {}
-            for row in rows:
-                area = str(row.get("area") or "Sin área").strip() or "Sin área"
-                areas[area] = areas.get(area, 0) + 1
             return {
                 "ok": True,
-                "total": total_matches,
                 "count": len(rows),
-                "areas": areas,
                 "items": [_compact_row(r) for r in rows],
-                "search_mode": "supabase_fallback",
-                "engines": engines,
             }
 
         if name == "resumen_inventario":
@@ -374,18 +350,36 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "items": [_compact_row(r) for r in rows],
             }
 
+        if name == "buscar_semantico":
+            query = str(args.get("query") or "").strip()
+            limit = int(args.get("limit") or 15)
+            rows, error = db.search_semantico(query, limit=limit)
+            if error:
+                return {"ok": False, "error": error}
+            return {
+                "ok": True,
+                "count": len(rows),
+                "items": [_compact_row(r) for r in rows],
+                "mode": "pgvector",
+            }
+
         if name == "generar_qr":
-            max_batch = 7
+            max_batch = 50
+            query = str(args.get("query") or "").strip()
+            raw_ids = args.get("ids")
+            raw_etiquetas = args.get("etiquetas")
+            # Sin N del usuario: por query/persona devolver todos (hasta 50).
+            default_limit = max_batch if query else 5
             try:
-                limit = int(args.get("limit") or max_batch)
+                if args.get("limit") is None or args.get("limit") == "":
+                    limit = default_limit
+                else:
+                    limit = int(args.get("limit"))
             except (TypeError, ValueError):
-                limit = max_batch
+                limit = default_limit
             limit = max(1, min(max_batch, limit))
             rows_batch: list[dict[str, Any]] = []
 
-            raw_ids = args.get("ids")
-            raw_etiquetas = args.get("etiquetas")
-            query = str(args.get("query") or "").strip()
             if isinstance(raw_ids, list) and raw_ids:
                 for raw_id in raw_ids[:limit]:
                     try:
@@ -405,10 +399,19 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                         continue
                     rows_batch.append(found[0])
             elif query:
-                found, error = db.search_inventario(query, limit=limit)
-                if error:
-                    return {"ok": False, "error": error}
-                rows_batch = list(found or [])
+                # Preferir coincidencia por persona/área para no truncar de más.
+                by_person, _ = db.list_por_campo("persona", query, limit=limit)
+                if len(by_person) >= 1:
+                    rows_batch = list(by_person)
+                else:
+                    by_area, _ = db.list_por_campo("area", query, limit=limit)
+                    if len(by_area) >= 1:
+                        rows_batch = list(by_area)
+                    else:
+                        found, error = db.search_inventario(query, limit=limit)
+                        if error:
+                            return {"ok": False, "error": error}
+                        rows_batch = list(found or [])
             else:
                 row: dict[str, Any] | None = None
                 if args.get("id") is not None:
@@ -549,13 +552,9 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def dump_tool_result(result: dict[str, Any]) -> str:
-    """Payload compacto para el LLM (menos tokens = respuesta más rápida y económica)."""
+    """Payload compacto para el LLM (menos tokens = respuesta más rápida)."""
     if not isinstance(result, dict):
         return json.dumps({"ok": False, "error": "resultado inválido"}, ensure_ascii=False)
-
-    def _slim_item(row: dict[str, Any]) -> dict[str, Any]:
-        keep = ("id", "etiqueta", "articulo", "marca", "modelo", "area", "persona", "estado", "origen")
-        return {k: row[k] for k in keep if row.get(k) not in (None, "")}
 
     slim: dict[str, Any] = {
         k: result[k]
@@ -563,26 +562,17 @@ def dump_tool_result(result: dict[str, Any]) -> str:
         if k in result
     }
     if isinstance(result.get("item"), dict):
-        slim["item"] = _slim_item(result["item"])
+        slim["item"] = _compact_row(result["item"])
     items = result.get("items")
     if isinstance(items, list):
         slim["items"] = [
-            _slim_item(row) if isinstance(row, dict) else row for row in items[:5]
+            _compact_row(row) if isinstance(row, dict) else row for row in items[:8]
         ]
-        if len(items) > 5:
-            slim["items_truncated"] = len(items) - 5
+        if len(items) > 8:
+            slim["items_truncated"] = len(items) - 8
     qrs = result.get("qrs")
     if isinstance(qrs, list):
-        slim["qrs"] = [
-            {
-                "etiqueta": q.get("etiqueta"),
-                "articulo": q.get("articulo"),
-                "area": (q.get("item") or {}).get("area"),
-                "persona": (q.get("item") or {}).get("persona"),
-            }
-            for q in qrs[:7]
-            if isinstance(q, dict)
-        ]
+        slim["qrs"] = qrs[:7]
         slim["count"] = slim.get("count", len(qrs))
     # Resumen / totales: pasar campos numéricos útiles
     for k, v in result.items():

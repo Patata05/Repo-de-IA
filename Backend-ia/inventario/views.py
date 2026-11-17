@@ -28,7 +28,7 @@ def health(request):
             "llm": {
                 **setup,
                 "preferred_model": get_llm_model(),
-                "order": env.get("LLM_PROVIDERS") or "deepseek",
+                "order": env.get("LLM_PROVIDERS") or "openai",
             },
             "supabase": {
                 "configured": bool(env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")),
@@ -115,6 +115,16 @@ def chat_n8n(request):
     )
     session_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_raw))[:64] or "default"
 
+    thread_focus = payload.get("threadFocus") or payload.get("thread_focus")
+    if thread_focus is not None and not isinstance(thread_focus, dict):
+        thread_focus = None
+    last_user = str(
+        payload.get("lastUser") or payload.get("last_user") or ""
+    ).strip() or None
+    thread_summary = str(
+        payload.get("threadSummary") or payload.get("thread_summary") or ""
+    ).strip() or None
+
     from inventario.services.asistente import n8n_configured, preguntar_asistente
 
     if not n8n_configured():
@@ -128,7 +138,13 @@ def chat_n8n(request):
         )
 
     try:
-        res = preguntar_asistente(message, session_id)
+        res = preguntar_asistente(
+            message,
+            session_id,
+            thread_focus=thread_focus,
+            last_user=last_user,
+            thread_summary=thread_summary,
+        )
     except Exception as exc:  # noqa: BLE001
         return JsonResponse(
             {
@@ -215,11 +231,13 @@ def chat(request):
         model_msgs = []
         effective_history = history or []
 
-    reply, error, used_model, items, mutated, qr_list = run_chat_agent(
+    reply, error, used_model, items, mutated, qr_list, usage = run_chat_agent(
         message, effective_history, memory, preferred_model=preferred_model
     )
 
     if error in ("llm_unavailable", "missing_key"):
+        from inventario.ai.usage import empty_usage, count_tokens
+
         local_reply, local_items = local_chat_answer(message)
         prefix = ""
         if error == "missing_key":
@@ -234,6 +252,12 @@ def chat(request):
                 )
             except Exception:  # noqa: BLE001
                 pass
+        model_name = preferred_model or "gpt-4o-mini"
+        usage = empty_usage(
+            model=model_name,
+            prompt_tokens=count_tokens(message, model_name),
+            completion_tokens=count_tokens(final_reply, model_name),
+        )
         return JsonResponse(
             {
                 "reply": final_reply,
@@ -242,6 +266,7 @@ def chat(request):
                 "items": local_items or items or [],
                 "mutated": False,
                 "qr": [],
+                "usage": usage,
                 "memory_engine": "pydantic-ai" if session_id else None,
             }
         )
@@ -260,6 +285,35 @@ def chat(request):
             "items": items or [],
             "mutated": bool(mutated),
             "qr": qr_list or [],
+            "usage": usage or {},
             "memory_engine": "pydantic-ai" if session_id else None,
         }
     )
+
+
+@csrf_exempt
+@require_POST
+def chat_reiniciar(request):
+    """Borra el historial pydantic-ai de la sesión en Supabase."""
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "El mensaje no es JSON valido."}, status=400)
+
+    session_raw = payload.get("session_id") or payload.get("sessionId")
+    session_id = (
+        str(session_raw).strip()
+        if isinstance(session_raw, str) and session_raw.strip()
+        else ""
+    )
+    if not session_id:
+        return JsonResponse({"error": "Falta session_id."}, status=400)
+
+    try:
+        from inventario.ai.session_memory import clear_session_messages
+
+        ok = clear_session_messages(session_id)
+    except Exception as exc:  # noqa: BLE001
+        return JsonResponse({"ok": False, "error": str(exc)}, status=500)
+
+    return JsonResponse({"ok": bool(ok), "session_id": session_id})

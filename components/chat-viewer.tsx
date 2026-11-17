@@ -9,7 +9,15 @@ import {
   type ReactNode,
 } from "react";
 import { ChevronRight, Layers, QrCode } from "lucide-react";
-import type { ChatApiItem, ChatQrPayload } from "@/lib/chat-api";
+import type {
+  ChatApiItem,
+  ChatComparacionVista,
+  ChatQrPayload,
+} from "@/lib/chat-api";
+import {
+  canonicalizeOrigenLabel,
+  origensMatch,
+} from "@/lib/inventario-origen";
 import type { InventarioRow } from "@/lib/supabase";
 
 export type ChatViewerQr = ChatQrPayload & { dataUrl?: string };
@@ -25,7 +33,8 @@ export type ChatViewerOverview =
   | "recent"
   | "personas"
   | "estado"
-  | "marcas";
+  | "marcas"
+  | "comparacion";
 
 /** Avisa al sync del chat que el panel cambió de tamaño (Mostrar más/menos). */
 function notifyViewerLayout() {
@@ -41,6 +50,8 @@ type ChatViewerProps = {
   overview?: ChatViewerOverview;
   /** Nombre de área (u otro foco) para incidencias concretas. */
   overviewFocus?: string;
+  /** Métricas de comparar_inventarios (overview === "comparacion"). */
+  comparacion?: ChatComparacionVista | null;
   onSelectItem?: (item: ChatApiItem | InventarioRow) => void;
   onSelectAreaOption?: (areaName: string) => void;
   onSelectPersonOption?: (personName: string) => void;
@@ -67,9 +78,14 @@ function isInactiveEstado(value: unknown) {
 
 function matchesFocus(value: string, focusNorm: string) {
   if (!value || !focusNorm) return false;
-  if (value === focusNorm || value.includes(focusNorm)) return true;
+  if (value === focusNorm) return true;
   const focusToks = focusNorm.split(" ").filter(Boolean);
   const toks = value.split(" ").filter(Boolean);
+  // Agujas cortas (ti, rh): solo como palabra completa, no substring de marketing.
+  if (focusNorm.length <= 3 && focusToks.length === 1) {
+    return toks.includes(focusNorm);
+  }
+  if (value.includes(focusNorm)) return true;
   return focusToks.length > 0 && focusToks.every((tok) => toks.includes(tok));
 }
 
@@ -94,7 +110,7 @@ function StaticRecordRow(props: {
         {props.origen ? (
           <span className="chat-viewer-origen">
             <Layers size={12} aria-hidden="true" />
-            {props.origen}
+            {canonicalizeOrigenLabel(props.origen)}
           </span>
         ) : null}
       </span>
@@ -104,7 +120,11 @@ function StaticRecordRow(props: {
 
 function inventoryLabel(items: Array<{ origen?: string | null }>) {
   const origins = [
-    ...new Set(items.map((item) => textOf(item.origen)).filter(Boolean)),
+    ...new Set(
+      items
+        .map((item) => canonicalizeOrigenLabel(textOf(item.origen)))
+        .filter(Boolean),
+    ),
   ];
   if (origins.length === 1) return origins[0];
   if (origins.length > 1) return `${origins.length} inventarios`;
@@ -248,6 +268,7 @@ function ChatViewer({
   qrCards = [],
   overview,
   overviewFocus,
+  comparacion = null,
   onSelectItem,
   onSelectAreaOption,
   onSelectPersonOption,
@@ -255,16 +276,18 @@ function ChatViewer({
   const hasQr = qrCards.some((card) => card.dataUrl || card.text);
   const showOverview = Boolean(overview) && !hasQr;
   const hasResults = !showOverview && (resultItems.length > 0 || hasQr);
-  const showStats = overview === "full" || overview === "stats";
+  const showStats = overview === "stats";
+  const showFull = overview === "full";
   const showAreaTotal = overview === "areaTotal";
   const showAreaMatches = overview === "areaMatches";
   const showPersonTotal = overview === "personTotal";
   const showPersonMatches = overview === "personMatches";
-  const showAreas = overview === "full" || overview === "areas";
-  const showRecent = overview === "full" || overview === "recent";
+  const showAreas = overview === "areas";
+  const showRecent = overview === "recent";
   const showPersonas = overview === "personas";
   const showEstado = overview === "estado";
   const showMarcas = overview === "marcas";
+  const showComparacion = overview === "comparacion";
   const focusArea = textOf(overviewFocus);
   const parsedFocus = useMemo(() => parseMatchesFocus(focusArea), [focusArea]);
   const [qrExpanded, setQrExpanded] = useState(false);
@@ -276,17 +299,18 @@ function ChatViewer({
 
   useLayoutEffect(() => {
     setQrExpanded(false);
-  }, [overview, overviewFocus, resultItems.length]);
+  }, [overview, overviewFocus, resultItems.length, comparacion]);
 
   /** Recientes: mismos 10 que escribe el chatbot. */
   const recentLimit = 10;
   /** Overviews con scroll interno (sin botón Ver más por overflow).
+   *  `full` usa el layout persona (áreas + registros, sin barra).
    *  `recent` NO: usa OverflowCollapseCard + altura fija como Etiquetas. */
   const scrollOnlyOverview =
-    overview === "full" ||
     overview === "stats" ||
     overview === "marcas" ||
-    overview === "estado";
+    overview === "estado" ||
+    overview === "comparacion";
   // “areas”, “personas”, “recent” y etiquetas usan Ver más si no caben.
 
   const overviewData = useMemo(() => {
@@ -333,15 +357,21 @@ function ChatViewer({
 
     const focusNorm = foldText(parsedFocus.label || focusArea);
 
-    // Listado del chat (p. ej. “esos 10 en qué áreas”) → ranking solo de esos.
+    // Listado del chat (preview import / “esos 10 en qué áreas”) → stats desde resultItems.
+    // Ranking global overview==="areas" SIN foco: siempre TODO el inventario (no 1 área previa).
+    const globalAreasRanking =
+      overview === "areas" &&
+      !String(parsedFocus.label || focusArea || "").trim();
     const scopedFromChat =
+      !globalAreasRanking &&
       Array.isArray(resultItems) &&
       resultItems.length > 0 &&
       (overview === "areas" ||
         overview === "personas" ||
         overview === "estado" ||
         overview === "marcas" ||
-        overview === "stats");
+        overview === "stats" ||
+        overview === "full");
 
     // Inventario N / área concreta en panorama-general (no persona/área total).
     const scopeRows = (() => {
@@ -356,33 +386,36 @@ function ChatViewer({
         for (const it of resultItems) {
           const id = it.id != null ? Number(it.id) : NaN;
           const et = String(it.etiqueta ?? "").trim().toLowerCase();
+          const origenWant = String(it.origen ?? "").trim();
           const key =
             Number.isFinite(id) && id > 0
               ? `id:${id}`
               : et
-                ? `et:${et}`
+                ? `et:${et}:${origenWant || "_"}`
                 : "";
           if (!key || seen.has(key)) continue;
           seen.add(key);
+          const byExactId =
+            Number.isFinite(id) && id > 0 ? byId.get(id) : undefined;
+          const byEtiquetaOrigen =
+            et &&
+            inventory.find(
+              (r) =>
+                String(r.etiqueta ?? "").trim().toLowerCase() === et &&
+                (!origenWant ||
+                  String(r.origen ?? "").trim() === origenWant),
+            );
+          // Preview de import (sin id en DB): usar resultItems, no otra fila homónima.
           const hit =
-            (Number.isFinite(id) && id > 0 && byId.get(id)) ||
-            (et
-              ? inventory.find(
-                  (r) =>
-                    String(r.etiqueta ?? "").trim().toLowerCase() === et &&
-                    (!it.origen ||
-                      String(r.origen ?? "").trim() ===
-                        String(it.origen).trim()),
-                )
-              : undefined) ||
-            (et
+            byExactId ||
+            byEtiquetaOrigen ||
+            (!origenWant && et
               ? inventory.find(
                   (r) => String(r.etiqueta ?? "").trim().toLowerCase() === et,
                 )
               : undefined);
           if (hit) rows.push(hit);
           else if (it) {
-            // Fallback mínimo si aún no está hidratado en inventory.
             rows.push(it as InventarioRow);
           }
         }
@@ -397,8 +430,11 @@ function ChatViewer({
       ) {
         return inventory;
       }
-      const byOrigen = inventory.filter(
-        (row) => foldText(row.origen) === focusNorm,
+      const byOrigen = inventory.filter((row) =>
+        focusNorm
+          ? origensMatch(String(row.origen ?? ""), focusArea) ||
+            foldText(row.origen) === focusNorm
+          : false,
       );
       if (byOrigen.length) return byOrigen;
       const byArea = inventory.filter((row) => foldText(row.area) === focusNorm);
@@ -629,15 +665,27 @@ function ChatViewer({
       estadoTotal:
         estadoCounts.activo + estadoCounts.inactivo + estadoCounts.otro || 1,
       recentAll: needRecent
-        ? [...scopeRows]
-            .sort((a, b) => {
-              const ta =
-                Date.parse(String(a.updated_at || a.created_at || "")) || 0;
-              const tb =
-                Date.parse(String(b.updated_at || b.created_at || "")) || 0;
-              return tb - ta;
-            })
-            .slice(0, recentLimit)
+        ? overview === "full"
+          ? scopedFromChat && resultItems.length
+            ? scopeRows.slice(0, Math.min(scopeRows.length, 80))
+            : [...scopeRows]
+                .sort((a, b) => {
+                  const ta =
+                    Date.parse(String(a.updated_at || a.created_at || "")) || 0;
+                  const tb =
+                    Date.parse(String(b.updated_at || b.created_at || "")) || 0;
+                  return tb - ta;
+                })
+                .slice(0, Math.min(scopeRows.length, 80))
+          : [...scopeRows]
+              .sort((a, b) => {
+                const ta =
+                  Date.parse(String(a.updated_at || a.created_at || "")) || 0;
+                const tb =
+                  Date.parse(String(b.updated_at || b.created_at || "")) || 0;
+                return tb - ta;
+              })
+              .slice(0, recentLimit)
         : [],
       scopedTotal: scopeRows.length,
     };
@@ -723,7 +771,11 @@ function ChatViewer({
   const personLabel =
     personasInResults.length === 1 ? personasInResults[0] : "";
   const resultOrigins = [
-    ...new Set(listItems.map((item) => textOf(item.origen)).filter(Boolean)),
+    ...new Set(
+      listItems
+        .map((item) => canonicalizeOrigenLabel(textOf(item.origen)))
+        .filter(Boolean),
+    ),
   ];
   const multiInventario = resultOrigins.length > 1;
   const sameEtiquetaMulti =
@@ -732,7 +784,18 @@ function ChatViewer({
       listItems.map((item) => textOf(item.etiqueta).toLowerCase()).filter(Boolean),
     ).size === 1;
 
-  const displayFocusLabel = parsedFocus.label || focusArea;
+  const displayFocusLabel = canonicalizeOrigenLabel(
+    parsedFocus.label || focusArea,
+  );
+
+  const comparacionTitulo =
+    textOf(comparacion?.titulo) ||
+    (Array.isArray(comparacion?.origenes) && comparacion!.origenes!.length === 2
+      ? `Comparativa: ${comparacion!.origenes![0]} vs ${comparacion!.origenes![1]}`
+      : "Comparativa General");
+  const comparacionInvCount = Array.isArray(comparacion?.inventarios)
+    ? comparacion!.inventarios!.length
+    : 0;
 
   const contextLabel = hasResults
     ? hasQr
@@ -747,7 +810,9 @@ function ChatViewer({
           ? `Etiqueta ${textOf(listItems[0]?.etiqueta) || ""} · ${resultOrigins.length} inventarios`
           : inventoryLabel(listItems)
         : personLabel || displayFocusLabel || "Etiquetas"
-    : overview === "areas"
+    : overview === "comparacion"
+      ? comparacionTitulo
+      : overview === "areas"
       ? resultItems.length > 0
         ? "Áreas del listado"
         : "Áreas"
@@ -762,7 +827,7 @@ function ChatViewer({
               : overview === "recent"
                 ? "Recientes"
                 : overview === "stats"
-                  ? displayFocusLabel || "Totales"
+                  ? displayFocusLabel || "Vista previa"
                   : overview === "personas"
                     ? resultItems.length > 0
                       ? "Personas del listado"
@@ -781,7 +846,9 @@ function ChatViewer({
       : multiInventario
         ? `${listItems.length} ficha${listItems.length === 1 ? "" : "s"} · ${resultOrigins.join(" · ")}`
         : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
-    : overview === "areas"
+    : overview === "comparacion"
+      ? `${formatNumber(comparacionInvCount)} inventarios · métricas`
+      : overview === "areas"
       ? resultItems.length > 0
         ? `${areasSorted.length} áreas · ${resultItems.length} del listado`
         : `${areasSorted.length} áreas · distribución`
@@ -802,7 +869,11 @@ function ChatViewer({
               : overview === "recent"
                 ? `${recentAll.length} últimos registros`
                 : overview === "stats"
-                  ? "Conteo en vivo"
+                  ? resultItems.length > 0
+                    ? `${formatNumber(scopedTotal || resultItems.length)} registros · vista previa`
+                    : "Conteo en vivo"
+                  : overview === "full" && resultItems.length > 0
+                    ? `${formatNumber(scopedTotal || resultItems.length)} registros · vista previa`
                   : overview === "personas"
                     ? `${personasSorted.length} personas con equipo`
                     : overview === "estado"
@@ -845,7 +916,7 @@ function ChatViewer({
                 : "";
             const persona = textOf(item.persona) || "Sin asignar";
             const area = textOf(item.area);
-            const origen = textOf(item.origen);
+            const origen = canonicalizeOrigenLabel(textOf(item.origen));
             return (
               <li key={`${item.id ?? etiqueta}-${origen}-${index}`}>
                 <StaticRecordRow
@@ -883,7 +954,9 @@ function ChatViewer({
           const visiblePersonas = showPersonas ? personasSorted : [];
           const visibleMarcas = showMarcas ? marcasSorted : [];
           const isPersonOrAreaShell =
-            overview === "personTotal" || overview === "areaTotal";
+            overview === "personTotal" ||
+            overview === "areaTotal" ||
+            overview === "full";
           const isMatchesShell =
             overview === "areaMatches" || overview === "personMatches";
           const isScrollShell =
@@ -902,6 +975,271 @@ function ChatViewer({
                     isScrollShell ? " is-records-shell" : ""
                   }${scrollOnlyOverview ? " is-overview-scroll-shell" : ""}`}
                 >
+                  {showComparacion && comparacion ? (
+                    (() => {
+                      const FALLBACK_COLORS = [
+                        "#2dd4bf",
+                        "#38bdf8",
+                        "#a78bfa",
+                        "#fbbf24",
+                      ];
+                      const invs = Array.isArray(comparacion.inventarios)
+                        ? comparacion.inventarios
+                        : [];
+                      const names = invs
+                        .map(
+                          (i, idx) =>
+                            textOf(i.nombre) ||
+                            textOf(i.origen) ||
+                            `Inventario ${idx + 1}`,
+                        )
+                        .filter(Boolean);
+                      const colorByName = new Map<string, string>();
+                      invs.forEach((inv, idx) => {
+                        const name =
+                          textOf(inv.nombre) ||
+                          textOf(inv.origen) ||
+                          names[idx];
+                        colorByName.set(
+                          name,
+                          textOf(inv.color) ||
+                            FALLBACK_COLORS[idx % FALLBACK_COLORS.length],
+                        );
+                      });
+                      const compartidas = Number(
+                        comparacion.resumen_cruces?.etiquetas_compartidas ??
+                          comparacion.cruces?.compartidas ??
+                          0,
+                      );
+                      const exclusivas =
+                        comparacion.resumen_cruces
+                          ?.exclusivas_por_inventario ||
+                        comparacion.cruces?.solo_en ||
+                        {};
+                      const areasRaw = Array.isArray(
+                        comparacion.comparativa_areas,
+                      )
+                        ? comparacion.comparativa_areas
+                        : Array.isArray(comparacion.por_area)
+                          ? comparacion.por_area
+                          : [];
+                      const areasNorm = areasRaw
+                        .map((row) => {
+                          const area = textOf(row.area) || "Sin área";
+                          const raw =
+                            row.valores || row.totales || ({} as Record<string, number>);
+                          const valores: Record<string, number> = {};
+                          for (const n of names) {
+                            valores[n] = Number(raw[n] ?? 0);
+                          }
+                          const suma = names.reduce(
+                            (acc, n) => acc + Number(valores[n] || 0),
+                            0,
+                          );
+                          return { area, valores, suma };
+                        })
+                        .sort(
+                          (a, b) =>
+                            b.suma - a.suma ||
+                            a.area.localeCompare(b.area, "es", {
+                              sensitivity: "base",
+                            }),
+                        );
+                      const maxBar = Math.max(
+                        1,
+                        ...areasNorm.flatMap((a) =>
+                          names.map((n) => Number(a.valores[n] || 0)),
+                        ),
+                      );
+                      const topVol = [...invs].sort(
+                        (a, b) =>
+                          Number(
+                            b.total_articulos ?? b.registros ?? 0,
+                          ) -
+                          Number(a.total_articulos ?? a.registros ?? 0),
+                      )[0];
+                      const topName =
+                        textOf(topVol?.nombre) ||
+                        textOf(topVol?.origen) ||
+                        "—";
+                      const topCount = Number(
+                        topVol?.total_articulos ?? topVol?.registros ?? 0,
+                      );
+
+                      return (
+                        <div className="chat-viewer-person-layout chat-viewer-comparacion">
+                          <section
+                            className="chat-viewer-card is-comparacion-grid"
+                            aria-label="Tarjetas de inventarios"
+                          >
+                            {invs.map((inv, idx) => {
+                              const name =
+                                textOf(inv.nombre) ||
+                                textOf(inv.origen) ||
+                                `Inventario ${idx + 1}`;
+                              const color =
+                                textOf(inv.color) ||
+                                FALLBACK_COLORS[idx % FALLBACK_COLORS.length];
+                              const total = Number(
+                                inv.total_articulos ?? inv.registros ?? 0,
+                              );
+                              const activos = Number(inv.activos ?? 0);
+                              const personas = Number(
+                                inv.total_personas ?? inv.personas ?? 0,
+                              );
+                              return (
+                                <div
+                                  key={`${name}-${idx}`}
+                                  className="chat-viewer-comparacion-card"
+                                  style={{
+                                    borderColor: `${color}55`,
+                                    boxShadow: `inset 3px 0 0 ${color}`,
+                                  }}
+                                >
+                                  <div className="chat-viewer-comparacion-card-head">
+                                    <span
+                                      className="chat-viewer-comparacion-dot"
+                                      style={{ background: color }}
+                                      aria-hidden
+                                    />
+                                    <strong
+                                      className="chat-viewer-comparacion-name"
+                                      title={name}
+                                    >
+                                      {name}
+                                    </strong>
+                                  </div>
+                                  <div className="chat-viewer-comparacion-metrics">
+                                    <div className="chat-viewer-stat">
+                                      <span className="chat-viewer-stat-label">
+                                        Artículos
+                                      </span>
+                                      <strong>{formatNumber(total)}</strong>
+                                    </div>
+                                    <div className="chat-viewer-stat">
+                                      <span className="chat-viewer-stat-label">
+                                        Activos
+                                      </span>
+                                      <strong>{formatNumber(activos)}</strong>
+                                    </div>
+                                    <div className="chat-viewer-stat">
+                                      <span className="chat-viewer-stat-label">
+                                        Personas
+                                      </span>
+                                      <strong>{formatNumber(personas)}</strong>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </section>
+
+                          {areasNorm.length ? (
+                            <section
+                              className="chat-viewer-card chat-viewer-comparacion-chart-card"
+                              aria-label="Gráfica comparativa por área"
+                            >
+                              <h3 className="chat-viewer-section-title">
+                                Comparativa por área
+                              </h3>
+                              <ul
+                                className="chat-viewer-comparacion-legend"
+                                aria-label="Leyenda"
+                              >
+                                {names.map((n) => (
+                                  <li key={`leg-${n}`}>
+                                    <span
+                                      className="chat-viewer-comparacion-dot"
+                                      style={{
+                                        background:
+                                          colorByName.get(n) ||
+                                          FALLBACK_COLORS[0],
+                                      }}
+                                    />
+                                    {n}
+                                  </li>
+                                ))}
+                              </ul>
+                              <div className="chat-viewer-comparacion-chart">
+                                {areasNorm.map((row) => (
+                                  <div
+                                    key={row.area}
+                                    className="chat-viewer-comparacion-chart-row"
+                                  >
+                                    <div
+                                      className="chat-viewer-comparacion-chart-label"
+                                      title={row.area}
+                                    >
+                                      {row.area}
+                                    </div>
+                                    <div className="chat-viewer-comparacion-chart-group">
+                                      {names.map((n) => {
+                                        const val = Number(row.valores[n] || 0);
+                                        const pct = Math.max(
+                                          val > 0 ? 6 : 0,
+                                          Math.round((val / maxBar) * 100),
+                                        );
+                                        const color =
+                                          colorByName.get(n) ||
+                                          FALLBACK_COLORS[0];
+                                        return (
+                                          <div
+                                            key={`${row.area}-${n}`}
+                                            className="chat-viewer-comparacion-bar-wrap"
+                                          >
+                                            <div
+                                              className="chat-viewer-comparacion-bar"
+                                              style={{
+                                                width: `${pct}%`,
+                                                background: color,
+                                              }}
+                                              aria-label={`${n}: ${val}`}
+                                            >
+                                              <span className="chat-viewer-comparacion-tooltip">
+                                                {n}: {formatNumber(val)}
+                                              </span>
+                                            </div>
+                                            <span className="chat-viewer-comparacion-bar-val">
+                                              {formatNumber(val)}
+                                            </span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </section>
+                          ) : null}
+
+                          <section
+                            className="chat-viewer-card chat-viewer-comparacion-didactic"
+                            aria-label="Resumen didáctico"
+                          >
+                            <p>
+                              Coinciden{" "}
+                              <strong>{formatNumber(compartidas)}</strong>{" "}
+                              etiqueta
+                              {compartidas === 1 ? "" : "s"} entre los
+                              inventarios
+                              {names.length
+                                ? ` (${names
+                                    .map(
+                                      (n) =>
+                                        `${formatNumber(Number(exclusivas[n] || 0))} solo en ${n}`,
+                                    )
+                                    .join("; ")})`
+                                : ""}
+                              . Mayor volumen:{" "}
+                              <strong>{topName}</strong> (
+                              {formatNumber(topCount)} artículos).
+                            </p>
+                          </section>
+                        </div>
+                      );
+                    })()
+                  ) : null}
+
                   {showAreaMatches ? (
                     <>
                       <section
@@ -1160,6 +1498,136 @@ function ChatViewer({
                               </ul>
                             </div>
                           </section>
+                        </div>
+                      );
+                    })()
+                  ) : null}
+
+                  {showFull ? (
+                    (() => {
+                      const fullList: ChatApiItem[] =
+                        recentAll.length > 0
+                          ? (recentAll as ChatApiItem[])
+                          : listItems;
+                      const fullMaxArea = maxArea || 1;
+                      return (
+                        <div className="chat-viewer-person-layout">
+                          <section
+                            className="chat-viewer-card chat-viewer-stats is-person-total is-compact"
+                            aria-label={
+                              displayFocusLabel
+                                ? `Resumen de ${displayFocusLabel}`
+                                : "Resumen del inventario"
+                            }
+                          >
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Registros
+                              </span>
+                              <strong>{formatNumber(scopedTotal)}</strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Áreas
+                              </span>
+                              <strong>{formatNumber(areasSorted.length)}</strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Personas
+                              </span>
+                              <strong>{formatNumber(personaCount)}</strong>
+                            </div>
+                            <div className="chat-viewer-stat">
+                              <span className="chat-viewer-stat-label">
+                                Activos
+                              </span>
+                              <strong>{formatNumber(activos)}</strong>
+                            </div>
+                          </section>
+
+                          <div className="chat-viewer-person-split">
+                            <section
+                              className="chat-viewer-card chat-viewer-person-areas"
+                              aria-label="Áreas"
+                            >
+                              <h3 className="chat-viewer-section-title">
+                                Áreas
+                              </h3>
+                              <ul className="chat-viewer-bars">
+                                {areasSorted.map(([area, count]) => (
+                                  <li
+                                    key={area}
+                                    className="chat-viewer-bar-row"
+                                  >
+                                    <div className="chat-viewer-bar-meta">
+                                      <span className="chat-viewer-rank-line">
+                                        <span>{area}</span>
+                                      </span>
+                                      <span>{formatNumber(count)}</span>
+                                    </div>
+                                    <div className="chat-viewer-bar-track">
+                                      <span
+                                        className="chat-viewer-bar-fill"
+                                        style={{
+                                          width: `${Math.max(
+                                            8,
+                                            (count / fullMaxArea) * 100,
+                                          )}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </li>
+                                ))}
+                              </ul>
+                            </section>
+
+                            <section
+                              className="chat-viewer-card chat-viewer-records-card"
+                              aria-label="Registros"
+                            >
+                              <h3 className="chat-viewer-section-title">
+                                Registros (
+                                {formatNumber(
+                                  scopedTotal > 0 ? scopedTotal : fullList.length,
+                                )}
+                                )
+                              </h3>
+                              <div className="chat-viewer-expandable is-expanded">
+                                <ul className="chat-viewer-list">
+                                  {fullList.map((item, index) => {
+                                    const etiqueta =
+                                      textOf(item.etiqueta) ||
+                                      `Item ${index + 1}`;
+                                    const articulo =
+                                      textOf(item.articulo) || "Artículo";
+                                    const marca = textOf(item.marca);
+                                    const marcaLabel =
+                                      marca &&
+                                      !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                                        ? ` · ${marca}`
+                                        : "";
+                                    const persona =
+                                      textOf(item.persona) || "Sin asignar";
+                                    const area = textOf(item.area);
+                                    return (
+                                      <li
+                                        key={`${item.id ?? etiqueta}-${index}`}
+                                      >
+                                        <StaticRecordRow
+                                          etiqueta={etiqueta}
+                                          title={`${articulo}${marcaLabel}`}
+                                          subtitle={[persona, area]
+                                            .filter(Boolean)
+                                            .join(" · ")}
+                                        />
+                                      </li>
+                                    );
+                                  })}
+                                </ul>
+                              </div>
+                            </section>
+                          </div>
                         </div>
                       );
                     })()
@@ -1530,9 +1998,17 @@ function ChatViewer({
                         recentOnly ? " chat-viewer-recent-hero" : ""
                       }`}
                       title={
-                        recentOnly ? "Últimos movimientos" : "Recientes"
+                        recentOnly
+                          ? "Últimos movimientos"
+                          : resultItems.length > 0 && overview === "full"
+                            ? `Registros (${formatNumber(visibleRecent.length)}${
+                                scopedTotal > visibleRecent.length
+                                  ? ` de ${formatNumber(scopedTotal)}`
+                                  : ""
+                              })`
+                            : "Recientes"
                       }
-                      ariaLabel="Recientes"
+                      ariaLabel="Registros"
                       expanded={qrExpanded}
                       onToggle={() => setQrExpanded((open) => !open)}
                       measureKey={`recent:${visibleRecent.length}:${overviewFocus || ""}`}
@@ -1598,7 +2074,7 @@ function ChatViewer({
                     : "";
                 const persona = textOf(item.persona) || "Sin asignar";
                 const area = textOf(item.area);
-                const origen = textOf(item.origen);
+                const origen = canonicalizeOrigenLabel(textOf(item.origen));
 
                 return (
                   <li

@@ -50,6 +50,10 @@ def _load_env() -> dict[str, str]:
         "DEEPSEEK_BASE_URL",
         "N8N_INVENTARIO_URL",
         "N8N_INVENTARIO_KEY",
+        "OPENAI_API_KEY",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_BASE_URL",
+        "EMBEDDING_MODEL",
     )
     values: dict[str, str] = {}
     for key in keys:
@@ -221,6 +225,7 @@ def list_por_campo(
     if error:
         return [], error
     tokens = [t for t in valor.split() if len(t) > 1] or [valor]
+    cap = max(1, min(limit, 50))
     matched: list[dict] = []
     for row in rows:
         blob = str(row.get(campo) or "").lower()
@@ -228,9 +233,21 @@ def list_por_campo(
             continue
         if all(t in blob for t in tokens):
             matched.append(row)
-            if len(matched) >= max(1, min(limit, 50)):
+            if len(matched) >= cap:
                 break
-    return matched, None
+    if matched:
+        return matched, None
+    # Fallback difuso (rapidfuzz) contra el valor real del campo — no reescribe el chat.
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        blob = str(row.get(campo) or "").lower()
+        if not blob:
+            continue
+        ratio = _fuzzy_ratio(valor, blob)
+        if ratio >= 78:
+            scored.append((ratio, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:cap]], None
 
 
 def read_inventario(force: bool = False) -> tuple[list[dict], str | None, str | None]:
@@ -353,43 +370,73 @@ def listar_recientes(
     return [], last_error
 
 
+def _fuzzy_ratio(a: str, b: str) -> float:
+    """rapidfuzz solo dentro de la consulta (no reescribe el prompt del chat)."""
+    if not a or not b:
+        return 0.0
+    try:
+        from rapidfuzz import fuzz
+
+        return float(fuzz.partial_ratio(a, b))
+    except Exception:  # noqa: BLE001
+        return 100.0 if a in b or b in a else 0.0
+
+
 def search_inventario(query: str, limit: int = 20) -> tuple[list[dict], str | None]:
     rows, error, _ = read_inventario()
     if error:
         return [], error
-    tokens = [t for t in query.lower().split() if len(t) > 1]
+    q = (query or "").strip().lower()
+    tokens = [t for t in q.split() if len(t) > 1]
     if not tokens:
         return rows[: max(1, min(limit, 50))], None
 
-    scored: list[tuple[int, dict]] = []
+    scored: list[tuple[float, dict]] = []
     for row in rows:
+        persona = str(row.get("persona") or "").lower()
+        area = str(row.get("area") or "").lower()
+        articulo = str(row.get("articulo") or "").lower()
+        etiqueta = str(row.get("etiqueta") or "").lower()
+        marca = str(row.get("marca") or "").lower()
         blob_parts = [
-            row.get("etiqueta"),
-            row.get("articulo"),
-            row.get("marca"),
-            row.get("modelo"),
-            row.get("serie"),
-            row.get("area"),
-            row.get("persona"),
-            row.get("origen"),
-            row.get("estado"),
-            row.get("observaciones"),
+            etiqueta,
+            articulo,
+            marca,
+            str(row.get("modelo") or "").lower(),
+            str(row.get("serie") or "").lower(),
+            area,
+            persona,
+            str(row.get("origen") or "").lower(),
+            str(row.get("estado") or "").lower(),
+            str(row.get("observaciones") or "").lower(),
         ]
-        blob = " ".join(str(p or "").lower() for p in blob_parts)
-        score = 0
+        blob = " ".join(blob_parts)
+        score = 0.0
         for t in tokens:
-            if t == str(row.get("etiqueta") or "").lower():
+            if t == etiqueta:
                 score += 15
-            elif t in str(row.get("etiqueta") or "").lower():
+            elif t in etiqueta:
                 score += 8
-            if t in str(row.get("persona") or "").lower():
+            if t in persona:
                 score += 8
-            if t in str(row.get("articulo") or "").lower():
+            if t in articulo:
                 score += 6
-            if t in str(row.get("area") or "").lower():
+            if t in area:
                 score += 5
             if t in blob:
                 score += 2
+        # Coincidencia difusa contra campos reales (persona/área/artículo/marca).
+        for field_val, weight in (
+            (persona, 10.0),
+            (area, 8.0),
+            (articulo, 7.0),
+            (marca, 6.0),
+        ):
+            if not field_val:
+                continue
+            ratio = _fuzzy_ratio(q, field_val)
+            if ratio >= 78:
+                score += weight * (ratio / 100.0)
         if score > 0:
             scored.append((score, row))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -464,6 +511,91 @@ def update_inventario_row(row_id: int, fields: dict) -> tuple[dict | None, str |
             return payload, None
         return clean, None
     return None, last_error
+
+
+def update_inventario_embedding(
+    row_id: int, vector: list[float]
+) -> tuple[bool, str | None]:
+    """Escribe el vector en inventario.embedding (pgvector)."""
+    from inventario.ai.embeddings import vector_literal
+
+    env = get_env()
+    base, attempts = _supabase_base_and_keys(env)
+    if not base or not attempts:
+        return False, "Supabase no configurado."
+    body = {"embedding": vector_literal(vector)}
+    last_error = "No se pudo guardar embedding"
+    for name, key, send_bearer in attempts:
+        url, headers, _ = _with_key(
+            base, f"inventario?id=eq.{int(row_id)}", name, key, send_bearer
+        )
+        headers["Prefer"] = "return=minimal"
+        _payload, error, _resp = _request_json(
+            "PATCH", url, headers=headers, body=body
+        )
+        if error:
+            last_error = error
+            continue
+        return True, None
+    return False, last_error
+
+
+def search_semantico(
+    query: str,
+    limit: int = 15,
+    threshold: float = 0.25,
+) -> tuple[list[dict], str | None]:
+    """Búsqueda por significado vía RPC match_inventario (pgvector)."""
+    q = (query or "").strip()
+    if not q:
+        return [], "Falta el texto a buscar"
+    try:
+        from inventario.ai.embeddings import (
+            embeddings_configured,
+            embed_query,
+            vector_literal,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [], f"embeddings no disponibles: {exc}"
+
+    if not embeddings_configured():
+        rows, err = search_inventario(q, limit=limit)
+        if err:
+            return [], err
+        return rows, None
+
+    try:
+        vec = embed_query(q)
+    except Exception as exc:  # noqa: BLE001
+        return [], f"error al embeddear query: {exc}"
+
+    env = get_env()
+    base, attempts = _supabase_base_and_keys(env)
+    if not base or not attempts:
+        return [], "Supabase no configurado."
+
+    body = {
+        "query_embedding": vector_literal(vec),
+        "match_count": max(1, min(int(limit or 15), 50)),
+        "match_threshold": float(threshold),
+    }
+    last_error = "RPC match_inventario falló"
+    for name, key, send_bearer in attempts:
+        url, headers, _ = _with_key(base, "rpc/match_inventario", name, key, send_bearer)
+        payload, error, _resp = _request_json(
+            "POST", url, headers=headers, body=body
+        )
+        if error:
+            last_error = error
+            continue
+        if isinstance(payload, list):
+            return payload, None
+        return [], "Respuesta inesperada de match_inventario"
+    # Fallback léxico+fuzzy si la RPC aún no existe.
+    rows, err = search_inventario(q, limit=limit)
+    if err:
+        return [], f"{last_error}; fallback: {err}"
+    return rows, None
 
 
 def create_inventario_row(fields: dict) -> tuple[dict | None, str | None]:

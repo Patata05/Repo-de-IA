@@ -17,6 +17,10 @@ Redactas UNA respuesta en prosa conversacional a partir de HECHOS ya verificados
 Reglas:
 - No inventes cifras, etiquetas, personas ni áreas que no estén en HECHOS.
 - Sé claro y preciso: el usuario debe entender el resultado sin adivinar.
+- Responde siempre en párrafos naturales, cálidos y conversacionales.
+  Evita viñetas o respuestas robóticas salvo que el usuario pida un listado.
+  Si el kind es saludo/ack, saluda con amabilidad y pregunta en qué puedes
+  apoyar hoy con el inventario.
 - Si facts.plantilla_sugerida existe, úsala como base y varía la redacción
   (misma verdad, otras palabras). No la copies literal siempre.
 - Nunca digas “esta consulta (10)” ni “0 no aparecen / 0 faltan / 0 sobran”.
@@ -50,15 +54,12 @@ class DynamicChatReply(BaseModel):
 def _build_agent(api_key: str, model_name: str, base_url: str = ""):
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.deepseek import DeepSeekProvider
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    # DeepSeek oficial, o base_url custom (proxy / compatible).
-    if base_url and "deepseek.com" not in base_url.lower():
-        provider = OpenAIProvider(api_key=api_key, base_url=base_url)
-    else:
-        provider = DeepSeekProvider(api_key=api_key)
-
+    provider = OpenAIProvider(
+        api_key=api_key,
+        base_url=(base_url or "https://api.openai.com/v1").rstrip("/"),
+    )
     model = OpenAIChatModel(model_name, provider=provider)
     return Agent(
         model,
@@ -92,12 +93,14 @@ def compose_dynamic_reply(
 
     ep = endpoints[0]
     env = get_env()
-    api_key = (env.get("DEEPSEEK_API_KEY") or "").strip()
+    api_key = (ep.api_key or env.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return None
 
-    model_name = ep.models[0] if ep.models else "deepseek-chat"
-    base_url = (env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+    model_name = ep.models[0] if ep.models else "gpt-4o-mini"
+    base_url = (ep.base_url or env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
+        "/"
+    )
 
     history = list(message_history or [])
     if not history and session_id:

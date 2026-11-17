@@ -29,6 +29,7 @@ import type { InventarioRow, NewInventarioItem } from "@/lib/supabase";
 import { updateInventarioAction, deleteInventarioAction } from "@/app/actions";
 import ModalPortal from "@/components/modal-portal";
 import {
+  canonicalizeOrigenLabel,
   displayOrigenLabel,
   nextInventarioName,
   resolveFuenteOrigen,
@@ -613,7 +614,9 @@ export default function ProductDetailModal({
                 <span>{product.area || "General"}</span>
               </span>
               <span className="detail-pill pill-origen" title="Inventario / conteo">
-                <span>{product.origen || "S/O"}</span>
+                <span>
+                  {canonicalizeOrigenLabel(product.origen || "S/O")}
+                </span>
               </span>
               <span className="detail-pill pill-fuente" title="Origen de los datos">
                 <span>Origen: {origenDisplay || "nuevo registro"}</span>
@@ -948,10 +951,12 @@ export default function ProductDetailModal({
                   {/* Inventario del conteo / bucket */}
                   <div className="detail-card">
                     <span className="detail-label">Inventario</span>
-                    <strong className="detail-value">{product.origen || "S/O"}</strong>
+                    <strong className="detail-value">
+                      {canonicalizeOrigenLabel(product.origen || "S/O")}
+                    </strong>
                   </div>
 
-                  {/* Origen de los datos (csv/xlsx/Inventario N/nuevo registro) */}
+                  {/* Origen de los datos (excel N/Inventario N/nuevo registro) */}
                   <div className="detail-card">
                     <span className="detail-label">Origen</span>
                     <strong className="detail-value">

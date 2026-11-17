@@ -748,6 +748,54 @@ export async function deleteInventarioMany(
   }
 }
 
+/** Vacía uno o varios orígenes con `.in("origen", origenes)`. */
+export async function deleteInventarioByOrigens(
+  origenes: string[],
+): Promise<{ success: boolean; deletedIds: number[]; error: string | null }> {
+  if (!supabase) {
+    return {
+      success: false,
+      deletedIds: [],
+      error: "El cliente de Supabase no está configurado.",
+    };
+  }
+
+  const unique = [
+    ...new Set(
+      origenes.map((o) => String(o || "").trim()).filter(Boolean),
+    ),
+  ];
+  if (!unique.length) {
+    return {
+      success: false,
+      deletedIds: [],
+      error: "No hay orígenes válidos para eliminar.",
+    };
+  }
+
+  try {
+    const { data, error } = await (await inventarioTable())
+      .delete()
+      .in("origen", unique)
+      .select("id");
+
+    if (error) {
+      console.error("Error al eliminar por origen en Supabase:", error);
+      return { success: false, deletedIds: [], error: error.message };
+    }
+
+    const deletedIds = (data ?? [])
+      .map((row) => Number(row.id))
+      .filter(Number.isFinite);
+    return { success: true, deletedIds, error: null };
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : "Error inesperado al eliminar.";
+    console.error("Error en deleteInventarioByOrigens:", err);
+    return { success: false, deletedIds: [], error: message };
+  }
+}
+
 export async function restoreInventarioMany(
   rows: InventarioRow[]
 ): Promise<{ success: boolean; data: InventarioRow[]; error: string | null }> {

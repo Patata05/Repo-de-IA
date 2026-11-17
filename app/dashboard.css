@@ -2180,8 +2180,10 @@ tbody tr:last-child td {
   align-items: stretch;
   gap: 0;
   padding: 0 28px 0 20px;
-  overflow-x: hidden;
-  overflow-y: auto;
+  height: calc(100vh - 64px);
+  max-height: calc(100vh - 64px);
+  min-height: 0;
+  overflow: hidden;
   overscroll-behavior: contain;
   scroll-padding-top: 16px;
   scrollbar-width: none;
@@ -2207,10 +2209,9 @@ tbody tr:last-child td {
   box-sizing: border-box;
 }
 
-/* Scroll del chat con visor: invisible (sigue con rueda/gesto) */
+/* Conversación + visor: hermanas; cada una scrollea por su cuenta */
 .chat-stage.has-viewer.is-conversation {
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
   padding-left: 20px;
   padding-right: 12px;
@@ -2226,9 +2227,17 @@ tbody tr:last-child td {
 
 .chat-stage.has-viewer.is-conversation .chat-viewer {
   margin-right: 14px;
-  /* Hasta arriba del composer (línea de la barra de pregunta) */
-  min-height: calc(100dvh - 132px);
-  align-self: flex-start;
+  flex: 0 0 var(--chat-viewer-col);
+  width: var(--chat-viewer-col);
+  min-width: 280px;
+  max-width: 440px;
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  align-self: stretch;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 
@@ -2240,19 +2249,27 @@ tbody tr:last-child td {
 }
 
 .chat-stage.has-viewer.is-conversation .chat-shell {
-  overflow: visible;
-  min-height: 100%;
+  overflow: hidden;
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
 }
 
 .chat-stage.has-viewer.is-conversation .chat-main {
-  overflow: visible;
-  flex: 1 0 auto;
+  overflow: hidden;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .chat-stage.has-viewer.is-conversation .chat-log {
-  overflow: visible;
-  flex: 0 0 auto;
-  min-height: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* pt = mismo inset superior que .chat-viewer.is-filled (tarjeta derecha) */
+  padding-top: 4px;
+  padding-bottom: 70vh;
+  scroll-padding-top: 4px;
   scrollbar-width: none;
 }
 
@@ -2261,13 +2278,14 @@ tbody tr:last-child td {
   height: 0;
 }
 
-/* Barra de pregunta: sticky; el dock no tapa con caja, la cápsula sí es opaca */
+/* Composer fijo bajo el log (shell no scrollea; el log sí) */
 .chat-stage.has-viewer.is-conversation .chat-composer-dock,
 .chat-stage.is-conversation .chat-composer-dock {
-  position: sticky;
-  bottom: 0;
+  position: relative;
+  bottom: auto;
   z-index: 8;
-  margin-top: auto;
+  flex: 0 0 auto;
+  margin-top: 0;
   padding-top: 10px;
   padding-bottom: 6px;
   background: transparent;
@@ -2303,15 +2321,17 @@ tbody tr:last-child td {
   overflow: hidden;
 }
 
-/* Columna derecha: totales persona/área llenan alto; listas cortas se ajustan. */
+/* Columna derecha: altura del stage; scroll propio (no sticky al chat) */
 .chat-viewer.is-docked {
-  position: sticky;
-  top: 12px;
-  align-self: flex-start;
-  height: auto;
-  max-height: calc(100dvh - 132px);
+  position: relative;
+  top: auto;
+  align-self: stretch;
+  height: 100%;
+  max-height: 100%;
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .chat-viewer.is-docked:has(.is-overview-personTotal),
@@ -2324,9 +2344,186 @@ tbody tr:last-child td {
 .chat-viewer.is-docked:has(.is-overview-recent),
 .chat-viewer.is-docked:has(.is-overview-personas),
 .chat-viewer.is-docked:has(.is-overview-marcas),
-.chat-viewer.is-docked:has(.is-overview-estado) {
-  height: calc(100dvh - 132px);
-  min-height: calc(100dvh - 132px);
+.chat-viewer.is-docked:has(.is-overview-estado),
+.chat-viewer.is-docked:has(.is-overview-comparacion) {
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+}
+
+.chat-viewer-comparacion {
+  gap: 12px;
+}
+
+.is-comparacion-grid {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 10px;
+  align-items: stretch;
+  padding: 12px !important;
+}
+
+.chat-viewer-comparacion-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  background: color-mix(in srgb, #0f172a 92%, transparent);
+}
+
+.chat-viewer-comparacion-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-viewer-comparacion-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.chat-viewer-comparacion-name {
+  font-size: 0.92rem;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-viewer-comparacion-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.chat-viewer-comparacion-metrics .chat-viewer-stat-label {
+  color: #94a3b8;
+}
+
+.chat-viewer-comparacion-metrics .chat-viewer-stat strong {
+  color: #f8fafc;
+  font-size: 1.05rem;
+}
+
+.chat-viewer-comparacion-chart-card {
+  padding: 12px !important;
+}
+
+.chat-viewer-comparacion-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+  color: #cbd5e1;
+  font-size: 0.78rem;
+}
+
+.chat-viewer-comparacion-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-viewer-comparacion-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: min(42vh, 420px);
+  overflow: auto;
+  padding-right: 4px;
+  border-top: 1px solid #1e293b;
+  padding-top: 10px;
+}
+
+.chat-viewer-comparacion-chart-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 34%) 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+.chat-viewer-comparacion-chart-label {
+  color: #e2e8f0;
+  font-size: 0.78rem;
+  line-height: 1.25;
+  padding-top: 2px;
+  word-break: break-word;
+}
+
+.chat-viewer-comparacion-chart-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.chat-viewer-comparacion-bar-wrap {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+  min-height: 16px;
+}
+
+.chat-viewer-comparacion-bar {
+  position: relative;
+  height: 12px;
+  min-width: 0;
+  border-radius: 999px;
+  background: #334155;
+  box-shadow: inset 0 0 0 1px #1e293b;
+}
+
+.chat-viewer-comparacion-bar-val {
+  color: #94a3b8;
+  font-size: 0.72rem;
+  min-width: 1.6rem;
+  text-align: right;
+}
+
+.chat-viewer-comparacion-tooltip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #e2e8f0;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 3;
+}
+
+.chat-viewer-comparacion-bar:hover .chat-viewer-comparacion-tooltip {
+  opacity: 1;
+}
+
+.chat-viewer-comparacion-didactic {
+  padding: 12px 14px !important;
+}
+
+.chat-viewer-comparacion-didactic p {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.chat-viewer-comparacion-didactic strong {
+  color: #f8fafc;
 }
 
 .chat-viewer-dock-item {
@@ -3330,12 +3527,22 @@ html:not(.theme-dark) .chat-viewer-list-item:hover .chat-viewer-item-arrow {
   width: 100%;
   max-width: none;
   flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .view-panel.is-chat .chat-stage {
   flex: 1;
   min-height: 0;
-  max-height: none;
+  max-height: calc(100vh - 64px);
+}
+
+.view-panel.is-chat .chat-stage.is-conversation {
+  height: calc(100vh - 64px);
+  max-height: calc(100vh - 64px);
+  overflow: hidden;
 }
 
 .chat-shell {
@@ -3864,6 +4071,55 @@ html:not(.theme-dark) .chat-token-popover-grid span {
   font-size: 11.5px;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
+}
+
+.chat-token-popover-grid-clean {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.chat-token-details {
+  margin-top: 10px;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  padding-top: 8px;
+}
+
+html:not(.theme-dark) .chat-token-details {
+  border-top-color: rgba(15, 23, 42, 0.08);
+}
+
+.chat-token-details > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: rgba(186, 198, 214, 0.78);
+  user-select: none;
+}
+
+.chat-token-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-token-details > summary::before {
+  content: "▸ ";
+  color: #55d7c4;
+}
+
+.chat-token-details[open] > summary::before {
+  content: "▾ ";
+}
+
+html:not(.theme-dark) .chat-token-details > summary {
+  color: rgba(30, 41, 59, 0.72);
+}
+
+.chat-token-details .chat-token-popover-grid {
+  margin-top: 8px;
+}
+
+.chat-token-details .chat-token-models-section {
+  margin-top: 10px;
 }
 
 .chat-token-models-section {
@@ -4553,17 +4809,19 @@ html:not(.theme-dark) .chat-quick-action-icon {
 
 .chat-log {
   display: flex;
-  flex: 1;
+  flex: 1 1 auto;
   flex-direction: column;
   align-items: stretch;
   gap: 22px;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 8px 10px 12px 4px;
-  scroll-padding-top: 28px;
+  /* 4px = padding-top de .chat-viewer.is-filled (borde superior de la tarjeta) */
+  padding: 4px 10px 70vh 4px;
+  scroll-padding-top: 4px;
+  scroll-padding-bottom: 24px;
   overscroll-behavior: contain;
-  overflow-anchor: none; /* no pelear con el pin */
+  overflow-anchor: none;
   scrollbar-width: none;
 }
 
@@ -4576,9 +4834,18 @@ html:not(.theme-dark) .chat-quick-action-icon {
 .chat-log-spacer {
   flex: 0 0 auto;
   width: 100%;
-  min-height: 24px;
-  height: 24px;
+  min-height: 0;
+  height: 0;
   pointer-events: none;
+}
+
+/*
+ * Ancla del último mensaje de usuario al borde superior de la tarjeta del visor.
+ * 4px = padding-top de .chat-viewer.is-filled (inicio de la card).
+ * (scroll-mt-4 de Tailwind sería 1rem y bajaba el mensaje; aquí va el valor exacto.)
+ */
+.chat-user-anchor {
+  scroll-margin-top: 4px;
 }
 
 .chat-log [data-chat-latest="true"] {
@@ -4863,7 +5130,6 @@ html:not(.theme-dark) .chat-response-sync-pill {
   margin-top: auto;
 }
 
-.chat-viewer.is-docked .is-overview-full .chat-viewer-expandable.is-overview-scroll-shell,
 .chat-viewer.is-docked .is-overview-personas .chat-viewer-expandable.is-overview-scroll-shell,
 .chat-viewer.is-docked .is-overview-marcas .chat-viewer-expandable.is-overview-scroll-shell,
 .chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-expandable.is-records-shell,
@@ -4876,11 +5142,16 @@ html:not(.theme-dark) .chat-response-sync-pill {
   overflow: hidden;
 }
 
-.chat-viewer.is-docked .is-overview-full .chat-viewer-stats {
-  flex: 0 0 auto !important;
+/* full = mismo shell que personTotal (person-layout), no cards flex 1 1 0 */
+.chat-viewer.is-docked .is-overview-full .chat-viewer-expandable.is-records-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
 }
 
-.chat-viewer.is-docked .is-overview-full .chat-viewer-card:not(.chat-viewer-stats),
 .chat-viewer.is-docked .is-overview-marcas .chat-viewer-card,
 .chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-card:not(.chat-viewer-stats),
 .chat-viewer.is-docked .is-overview-personMatches .chat-viewer-card:not(.chat-viewer-stats) {
@@ -4924,7 +5195,8 @@ html:not(.theme-dark) .chat-response-sync-pill {
   overflow: hidden;
 }
 
-.chat-viewer.is-docked .is-etiquetas .chat-viewer-scroll.is-collapsed {
+.chat-viewer.is-docked .is-etiquetas .chat-viewer-scroll.is-collapsed,
+.chat-viewer.is-docked .is-qr .chat-viewer-scroll.is-collapsed {
   flex: 0 1 auto;
   min-height: 0;
   overflow: visible;
@@ -4933,7 +5205,8 @@ html:not(.theme-dark) .chat-response-sync-pill {
 .chat-viewer.is-docked .is-overview-areas .chat-viewer-card.chat-viewer-areas-hero.is-collapsed,
 .chat-viewer.is-docked .is-overview-personas .chat-viewer-card.chat-viewer-people-hero.is-collapsed,
 .chat-viewer.is-docked .chat-viewer-card.chat-viewer-records-card.is-collapsed,
-.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-collapsed {
+.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-collapsed,
+.chat-viewer.is-docked .is-qr .chat-viewer-card.is-collapsed {
   flex: 0 0 auto;
   min-height: var(--chat-viewer-collapsed-h);
   height: var(--chat-viewer-collapsed-h);
@@ -4951,7 +5224,8 @@ html:not(.theme-dark) .chat-response-sync-pill {
 .chat-viewer.is-docked .is-overview-areas .chat-viewer-card.chat-viewer-areas-hero.is-expanded,
 .chat-viewer.is-docked .is-overview-personas .chat-viewer-card.chat-viewer-people-hero.is-expanded,
 .chat-viewer.is-docked .chat-viewer-card.chat-viewer-records-card.is-expanded,
-.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-expanded {
+.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-expanded,
+.chat-viewer.is-docked .is-qr .chat-viewer-card.is-expanded {
   flex: 1 1 auto;
   height: 100%;
   max-height: none;
@@ -4961,6 +5235,7 @@ html:not(.theme-dark) .chat-response-sync-pill {
 .chat-viewer.is-docked .is-overview-areas .chat-viewer-show-more,
 .chat-viewer.is-docked .is-overview-personas .chat-viewer-show-more,
 .chat-viewer.is-docked .is-etiquetas .chat-viewer-show-more,
+.chat-viewer.is-docked .is-qr .chat-viewer-show-more,
 .chat-viewer.is-docked .chat-viewer-records-card .chat-viewer-show-more {
   display: flex !important;
   flex: none;
@@ -4987,8 +5262,6 @@ html:not(.theme-dark) .chat-response-sync-pill {
   overflow: auto;
 }
 
-.chat-viewer.is-docked .is-overview-full .chat-viewer-bars,
-.chat-viewer.is-docked .is-overview-full .chat-viewer-list,
 .chat-viewer.is-docked .is-overview-marcas .chat-viewer-chips,
 .chat-viewer.is-docked .is-overview-areaMatches .chat-viewer-list,
 .chat-viewer.is-docked .is-overview-personMatches .chat-viewer-list {
@@ -4999,16 +5272,53 @@ html:not(.theme-dark) .chat-response-sync-pill {
   scrollbar-width: thin;
 }
 
+/* Vista general (archivo / Inventario N): mismas reglas que personTotal */
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-stats.is-compact {
+  flex: 0 0 auto !important;
+  height: auto !important;
+  max-height: none !important;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-areas,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-records-card {
+  min-height: 0 !important;
+  max-height: none !important;
+  height: auto !important;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-areas,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-areas .chat-viewer-bars,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-records-card .chat-viewer-expandable {
+  scrollbar-width: none !important;
+}
+
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-areas::-webkit-scrollbar,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-person-areas .chat-viewer-bars::-webkit-scrollbar,
+.chat-viewer.is-docked .is-overview-full .chat-viewer-records-card .chat-viewer-expandable::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
+}
+
 /* Recientes colapsado: la lista no scrollea sola (si no, no hay Ver más) */
 .chat-viewer.is-docked .is-overview-recent .chat-viewer-card.is-collapsed .chat-viewer-list,
-.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-collapsed .chat-viewer-list {
+.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-collapsed .chat-viewer-list,
+.chat-viewer.is-docked .is-qr .chat-viewer-card.is-collapsed .chat-viewer-list {
   flex: 0 1 auto;
   min-height: 0;
   overflow: visible;
 }
 
 .chat-viewer.is-docked .is-overview-recent .chat-viewer-card.is-expanded .chat-viewer-list,
-.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-expanded .chat-viewer-list {
+.chat-viewer.is-docked .is-etiquetas .chat-viewer-card.is-expanded .chat-viewer-list,
+.chat-viewer.is-docked .is-qr .chat-viewer-card.is-expanded .chat-viewer-list {
   flex: 1 1 auto;
   min-height: 0;
   overflow: visible;
@@ -5067,6 +5377,21 @@ html:not(.theme-dark) .chat-response-sync-pill {
   min-height: 0 !important;
   max-height: none !important;
   height: auto !important;
+}
+
+/* Plantilla persona: ocultar scroll en áreas + etiquetas (solo personTotal). */
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-person-areas,
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-person-areas .chat-viewer-bars,
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-records-card .chat-viewer-expandable {
+  scrollbar-width: none !important;
+}
+
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-person-areas::-webkit-scrollbar,
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-person-areas .chat-viewer-bars::-webkit-scrollbar,
+.chat-viewer.is-docked .is-overview-personTotal .chat-viewer-records-card .chat-viewer-expandable::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
 }
 
 .chat-viewer.is-docked .is-overview-areaTotal .chat-viewer-records-card {
@@ -5498,26 +5823,25 @@ html:not(.theme-dark) .chat-rich-list {
 }
 
 .chat-rich-list-item {
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
-  column-gap: 10px;
-  align-items: start;
+  display: block;
   font-size: 15px;
   line-height: 1.55;
   color: var(--text);
 }
 
+/* Sin viñetas verdes: el contenido ocupa todo el ancho */
 .chat-rich-bullet {
-  width: 6px;
-  height: 6px;
-  margin: 8px auto 0;
-  flex: none;
-  border-radius: 50%;
-  background: #55d7c4;
+  display: none !important;
 }
 
-html:not(.theme-dark) .chat-rich-bullet {
-  background: #1b7f5c;
+.chat-rich-list.is-plain .chat-rich-list-item,
+.chat-rich-list:not(.is-ordered) .chat-rich-list-item {
+  display: block;
+}
+
+.chat-rich-list:not(.is-ordered) .chat-rich-list-action {
+  display: block;
+  grid-template-columns: none;
 }
 
 /* Mismo diseño (cuadrado azul); columna fija para alinear todos los números */
@@ -5570,6 +5894,15 @@ html:not(.theme-dark) .chat-rich-order-badge {
   transition: background 0.15s ease;
 }
 
+.chat-rich-list-action.is-paragraph {
+  display: inline;
+  grid-template-columns: none;
+  width: auto;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
 .chat-rich-list.is-ordered .chat-rich-list-item {
   grid-template-columns: 22px minmax(0, 1fr);
 }
@@ -5593,6 +5926,21 @@ html:not(.theme-dark) .chat-rich-list-action:hover {
   flex-wrap: wrap;
   gap: 8px;
   margin: 10px 0 2px;
+}
+
+.chat-follow-ups--enter {
+  animation: chat-follow-ups-in 0.35s ease-out both;
+}
+
+@keyframes chat-follow-ups-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .chat-follow-up {
@@ -5839,6 +6187,74 @@ html:not(.theme-dark) .chat-import-card {
   max-width: min(280px, 100%);
 }
 
+/* Draft en composer: misma tarjeta + botón quitar */
+.chat-composer-draft-wrap {
+  position: relative;
+  display: flex;
+  align-self: flex-start;
+  max-width: min(280px, 100%);
+  width: 100%;
+  margin: 0 0 2px;
+  animation: chat-attach-in 180ms ease-out;
+}
+
+.chat-export-files.is-composer-draft {
+  margin: 0;
+  margin-left: 0;
+  max-width: 100%;
+  width: 100%;
+}
+
+.chat-export-files.is-composer-draft .chat-export-card {
+  padding-right: 36px;
+  cursor: default;
+}
+
+.chat-export-files.is-composer-draft .chat-export-card:hover {
+  transform: none;
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+html:not(.theme-dark) .chat-export-files.is-composer-draft .chat-export-card:hover {
+  background: rgba(15, 23, 42, 0.04);
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+.chat-export-card-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(242, 245, 250, 0.9);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.chat-export-card-remove:hover {
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+}
+
+html:not(.theme-dark) .chat-export-card-remove {
+  background: rgba(15, 23, 42, 0.12);
+  color: rgba(20, 32, 51, 0.7);
+}
+
+html:not(.theme-dark) .chat-export-card-remove:hover {
+  background: rgba(15, 23, 42, 0.2);
+  color: #142033;
+}
+
 .chat-user-card .chat-export-files.is-user-upload + .chat-bubble {
   margin-top: 8px;
 }
@@ -5978,7 +6394,7 @@ html:not(.theme-dark) .chat-inline-code {
   }
 
   .chat-log {
-    padding: 18px 2px 24px;
+    padding: 4px 2px 70vh;
   }
 }
 
@@ -6499,9 +6915,10 @@ html:not(.theme-dark) .chat-inline-code {
   }
 
   .view-panel.is-chat .chat-log {
-    flex: 1;
+    flex: 1 1 auto;
     min-height: 0;
-    padding: 12px 2px;
+    overflow-y: auto;
+    padding: 4px 2px 70vh;
   }
 
   .chat-info-toggle {

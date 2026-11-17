@@ -33,9 +33,14 @@ export type ChatTokenUsage = {
   completion_tokens: number;
   total_tokens: number;
   token_budget: number;
+  limite_contexto?: number;
   provider: string;
+  proveedor?: string;
   model: string;
+  modelo?: string;
   key_fingerprint: string;
+  costo_usd?: number;
+  acumulado_sesion?: number;
   rounds?: number;
 };
 
@@ -69,6 +74,72 @@ export type ChatHealthLlmInfo = {
   }>;
 };
 
+export type ChatAccionSugerida = {
+  etiqueta: string;
+  prompt_accion: string;
+};
+
+/** Métricas del visor de comparación de inventarios. */
+export type ChatComparacionVista = {
+  titulo?: string;
+  general?: boolean;
+  origenes?: string[];
+  inventarios?: Array<{
+    nombre?: string;
+    total_articulos?: number;
+    activos?: number;
+    inactivos?: number;
+    total_personas?: number;
+    etiquetas_unicas?: number;
+    color?: string;
+    /** Alias retrocompatibles */
+    origen?: string;
+    registros?: number;
+    personas?: number;
+    etiquetas?: number;
+  }>;
+  comparativa_areas?: Array<{
+    area?: string;
+    valores?: Record<string, number>;
+    totales?: Record<string, number>;
+    suma?: number;
+  }>;
+  resumen_cruces?: {
+    etiquetas_compartidas?: number;
+    exclusivas_por_inventario?: Record<string, number>;
+  };
+  cruces?: {
+    compartidas?: number;
+    solo_en?: Record<string, number>;
+  };
+  por_area?: Array<{
+    area?: string;
+    valores?: Record<string, number>;
+    totales?: Record<string, number>;
+    suma?: number;
+  }>;
+};
+
+/** Panel derecho activo que ve el usuario (para «de aquí»). */
+export type ChatContextoVista = {
+  tipo:
+    | "persona"
+    | "area"
+    | "origen"
+    | "areas"
+    | "areas_general"
+    | "comparacion";
+  valor: string;
+  ranking?: Array<{
+    area?: string;
+    articulos?: number;
+    personas?: number;
+  }>;
+  comparacion?: ChatComparacionVista;
+  /** true = mostrar solo los items del turno (ej. “dame 8”), sin expandir. */
+  lista_limitada?: boolean;
+};
+
 export type ChatApiResponse = {
   reply?: string;
   error?: string | null;
@@ -77,6 +148,18 @@ export type ChatApiResponse = {
   mutated?: boolean;
   qr?: ChatQrPayload[];
   usage?: ChatTokenUsage | null;
+  /** Chips contextuales {etiqueta, prompt_accion} generados en el backend. */
+  acciones_sugeridas?: ChatAccionSugerida[];
+  /**
+   * Sync del panel derecho por turno.
+   * null → no tocar el panel (charla).
+   * objeto → renderizar esa vista de inmediato.
+   */
+  contexto_vista?: ChatContextoVista | null;
+  /** Alias retrocompatible de contexto_vista. */
+  viewer?: ChatContextoVista | null;
+  /** true solo tras confirmar_exportacion_excel → FE genera la tarjeta .xlsx. */
+  exportar_excel?: boolean;
 };
 
 /** Vacío = mismo origen (Next proxy → Backend-ia). */
@@ -119,6 +202,8 @@ export async function askInventoryChat(
     model?: string | null;
     /** Id del chat → memoria PydanticAI (messages_json en Supabase). */
     sessionId?: string | null;
+    /** Filtro del panel derecho abierto (persona/área/origen). */
+    contextoVista?: ChatContextoVista | null;
   },
 ): Promise<ChatApiResponse> {
   const base = getChatApiBaseUrl();
@@ -135,6 +220,7 @@ export async function askInventoryChat(
         memory: options?.memory || undefined,
         model: options?.model || undefined,
         session_id: options?.sessionId || undefined,
+        contexto_vista: options?.contextoVista || undefined,
       }),
       signal: options?.signal,
     });
@@ -184,6 +270,71 @@ export async function askInventoryChat(
     };
   }
 
+  const acciones_sugeridas = Array.isArray(data.acciones_sugeridas)
+    ? data.acciones_sugeridas
+        .map((a) => ({
+          etiqueta: String(a?.etiqueta || "").trim(),
+          prompt_accion: String(a?.prompt_accion || "").trim(),
+        }))
+        .filter((a) => a.etiqueta && a.prompt_accion)
+        .slice(0, 3)
+    : [];
+
+  const parseContexto = (
+    raw: ChatApiResponse["contexto_vista"] | ChatApiResponse["viewer"] | unknown,
+  ): ChatContextoVista | null | undefined => {
+    // undefined = campo ausente; null = charla explícita (no tocar panel).
+    if (raw === null) return null;
+    if (!raw || typeof raw !== "object") return undefined;
+    const rec = raw as Record<string, unknown>;
+    const tipo = String(rec.tipo || "").trim().toLowerCase();
+    const valor = String(rec.valor || "").trim();
+    if (
+      !(
+        tipo === "persona" ||
+        tipo === "area" ||
+        tipo === "origen" ||
+        tipo === "areas" ||
+        tipo === "areas_general" ||
+        tipo === "comparacion"
+      )
+    ) {
+      return undefined;
+    }
+    if (
+      (tipo === "persona" || tipo === "area" || tipo === "origen") &&
+      !valor
+    ) {
+      return undefined;
+    }
+    const ranking = Array.isArray(rec.ranking)
+      ? (rec.ranking as ChatContextoVista["ranking"])
+      : undefined;
+    const comparacion =
+      tipo === "comparacion" &&
+      rec.comparacion &&
+      typeof rec.comparacion === "object"
+        ? (rec.comparacion as ChatContextoVista["comparacion"])
+        : undefined;
+    return {
+      tipo: tipo as ChatContextoVista["tipo"],
+      valor: valor || "general",
+      ranking,
+      comparacion,
+      lista_limitada: Boolean(rec.lista_limitada),
+    };
+  };
+
+  // Preferir contexto_vista; viewer es alias.
+  const hasContextoKey = Object.prototype.hasOwnProperty.call(
+    data,
+    "contexto_vista",
+  );
+  const contexto_vista = hasContextoKey
+    ? parseContexto(data.contexto_vista) ?? null
+    : parseContexto(data.viewer) ?? null;
+  const viewer = contexto_vista;
+
   return {
     reply: data.reply || "Sin respuesta del asistente.",
     error: data.error ?? null,
@@ -192,5 +343,41 @@ export async function askInventoryChat(
     mutated: Boolean(data.mutated),
     qr: Array.isArray(data.qr) ? data.qr.filter((q) => q?.text) : [],
     usage: data.usage ?? null,
+    acciones_sugeridas,
+    contexto_vista,
+    viewer,
+    exportar_excel: Boolean(
+      (data as { exportar_excel?: boolean }).exportar_excel,
+    ),
   };
+}
+
+/** Borra memoria de sesión en Backend-ia (chat_agent_memory). */
+export async function resetChatSession(
+  sessionId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return { ok: false, error: "missing_session" };
+  const base = getChatApiBaseUrl();
+  const url = base ? `${base}/api/chat/reiniciar/` : "/api/chat/reiniciar";
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid }),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+    };
+    if (!response.ok) {
+      return { ok: false, error: data.error || `http_${response.status}` };
+    }
+    return { ok: Boolean(data.ok ?? true), error: data.error };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "fetch_failed",
+    };
+  }
 }

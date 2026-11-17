@@ -7,6 +7,7 @@ import {
   updateInventarioMany,
   deleteInventario,
   deleteInventarioMany,
+  deleteInventarioByOrigens,
   restoreInventarioMany,
   NewInventarioItem,
   InventarioRow,
@@ -172,6 +173,22 @@ export async function deleteInventarioManyAction(
     return {
       success: false,
       error: result.error || "No se pudieron eliminar los artículos.",
+    };
+  }
+
+  revalidatePath("/");
+  return { success: true, deletedIds: result.deletedIds };
+}
+
+export async function deleteInventarioByOrigensAction(
+  origenes: string[],
+): Promise<{ success: boolean; deletedIds?: number[]; error?: string }> {
+  const result = await deleteInventarioByOrigens(origenes);
+
+  if (!result.success) {
+    return {
+      success: false,
+      error: result.error || "No se pudieron eliminar los orígenes.",
     };
   }
 
