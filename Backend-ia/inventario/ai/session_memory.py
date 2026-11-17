@@ -17,8 +17,8 @@ from inventario.supabase_client import _request_json, _supabase_base_and_keys, g
 logger = logging.getLogger(__name__)
 
 TABLE = "chat_agent_memory"
-# Últimos N mensajes Model* (request+response). Recortar evita saturar tokens.
-MAX_MODEL_MESSAGES = 20
+# Ventana deslizante: ~4 turnos (user+assistant). Menos tokens → respuesta más rápida.
+MAX_MODEL_MESSAGES = 8
 
 
 def _adapter():
@@ -49,18 +49,68 @@ def messages_from_json(raw: str | bytes | list | dict | None) -> list[Any]:
         return []
 
 
+def _part_kind(part: Any) -> str:
+    return str(getattr(part, "part_kind", "") or "")
+
+
+def _is_user_prompt_request(msg: Any) -> bool:
+    """True si el ModelRequest abre un turno de usuario (no solo tool-return)."""
+    from pydantic_ai.messages import ModelRequest
+
+    if not isinstance(msg, ModelRequest):
+        return False
+    for part in msg.parts:
+        kind = _part_kind(part)
+        name = part.__class__.__name__
+        if kind in ("user-prompt", "user_prompt") or name == "UserPromptPart":
+            return True
+    return False
+
+
+def _response_is_tool_call_only(msg: Any) -> bool:
+    from pydantic_ai.messages import ModelResponse
+
+    if not isinstance(msg, ModelResponse):
+        return False
+    has_call = False
+    has_text = False
+    for part in msg.parts:
+        kind = _part_kind(part)
+        name = part.__class__.__name__
+        if kind in ("tool-call", "tool_call") or "ToolCall" in name:
+            has_call = True
+        if kind == "text" or name == "TextPart":
+            has_text = True
+    return has_call and not has_text
+
+
 def trim_model_messages(
     messages: list[Any],
     max_n: int = MAX_MODEL_MESSAGES,
 ) -> list[Any]:
-    """Recorta el historial; el primer elemento debe ser ModelRequest."""
+    """
+    Ventana deslizante: últimos N Model*.
+    Empieza en UserPrompt y no deja tool_call sin su tool_return.
+    """
     if not messages:
         return []
-    trimmed = list(messages[-max(1, max_n) :])
-    # El recorte no puede empezar a mitad de un turno (response sin request).
     from pydantic_ai.messages import ModelRequest
 
-    while trimmed and not isinstance(trimmed[0], ModelRequest):
+    trimmed = list(messages[-max(1, int(max_n)) :])
+
+    while trimmed and not _is_user_prompt_request(trimmed[0]):
+        trimmed = trimmed[1:]
+
+    while trimmed and _response_is_tool_call_only(trimmed[-1]):
+        trimmed = trimmed[:-1]
+        while (
+            trimmed
+            and isinstance(trimmed[-1], ModelRequest)
+            and not _is_user_prompt_request(trimmed[-1])
+        ):
+            trimmed = trimmed[:-1]
+
+    while trimmed and not _is_user_prompt_request(trimmed[0]):
         trimmed = trimmed[1:]
     return trimmed
 

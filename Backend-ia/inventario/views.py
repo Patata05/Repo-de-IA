@@ -7,7 +7,7 @@ from django.views.decorators.http import require_GET, require_POST
 
 from inventario.ai.agent import run_chat_agent
 from inventario.ai.client import describe_llm_setup, get_llm_model
-from inventario.ai.local_fallback import local_chat_answer
+from inventario.ai.suggested_actions import build_acciones_sugeridas
 from inventario.supabase_client import get_env, read_inventario
 
 
@@ -204,6 +204,12 @@ def chat(request):
         else None
     )
 
+    contexto_vista = payload.get("contexto_vista") or payload.get("contextoVista")
+    if contexto_vista is not None and not isinstance(contexto_vista, dict):
+        return JsonResponse(
+            {"error": "contexto_vista debe ser un objeto."}, status=400
+        )
+
     env = get_env()
     if not (env.get("NEXT_PUBLIC_SUPABASE_URL") or env.get("SUPABASE_URL")):
         return JsonResponse(
@@ -215,80 +221,328 @@ def chat(request):
             }
         )
 
+    # Saludo/charla o QR directo: respuesta ligera (sin historial gigante ni agente).
+    from inventario.ai.tool_agent import (
+        is_fast_chitchat_message,
+        is_fast_qr_message,
+        run_fast_chitchat_reply,
+        run_fast_qr_reply,
+    )
+
+    if is_fast_chitchat_message(message, session_id=session_id):
+        reply, error, used_model, items, mutated, qr_list, usage, viewer = (
+            run_fast_chitchat_reply(
+                message,
+                preferred_model=preferred_model,
+                history=history if isinstance(history, list) else None,
+                session_id=session_id,
+            )
+        )
+        if session_id and reply:
+            try:
+                from inventario.ai.tool_agent import persist_short_turn
+
+                persist_short_turn(session_id, message, reply)
+            except Exception:  # noqa: BLE001
+                pass
+        acciones = build_acciones_sugeridas(reply or "", [], message, None)
+        return JsonResponse(
+            {
+                "reply": reply,
+                "error": error,
+                "used": used_model,
+                "items": [],
+                "mutated": False,
+                "qr": [],
+                "usage": usage or {},
+                "memory_engine": "openai-fast" if session_id else None,
+                "acciones_sugeridas": acciones,
+                "exportar_excel": False,
+                "contexto_vista": None,
+                "viewer": None,
+            }
+        )
+
+    if is_fast_qr_message(message, session_id=session_id):
+        reply, error, used_model, items, mutated, qr_list, usage, viewer = (
+            run_fast_qr_reply(
+                message,
+                preferred_model=preferred_model,
+                session_id=session_id,
+            )
+        )
+        if session_id and reply:
+            try:
+                from inventario.ai.tool_agent import persist_short_turn
+
+                persist_short_turn(session_id, message, reply)
+            except Exception:  # noqa: BLE001
+                pass
+        acciones = build_acciones_sugeridas(
+            reply or "", items or [], message, viewer
+        )
+        return JsonResponse(
+            {
+                "reply": reply,
+                "error": error,
+                "used": used_model,
+                "items": items or [],
+                "mutated": False,
+                "qr": list(qr_list or []),
+                "usage": usage or {},
+                "memory_engine": "openai-fast-qr" if session_id else None,
+                "acciones_sugeridas": acciones,
+                "exportar_excel": False,
+                "contexto_vista": viewer,
+                "viewer": viewer,
+            }
+        )
+
     # PydanticAI message_history (Supabase messages_json) + recorte de tokens.
     effective_history = history or []
     model_msgs = []
     try:
         from inventario.ai.session_memory import (
-            append_and_save_turn,
             history_for_openai_agent,
             resolve_message_history,
         )
+        from inventario.ai.tool_agent import (
+            MAX_HISTORY_MESSAGES,
+            compact_message_history_for_llm,
+        )
 
-        model_msgs = resolve_message_history(session_id, effective_history)
-        effective_history = history_for_openai_agent(session_id, effective_history)
+        model_msgs = compact_message_history_for_llm(
+            resolve_message_history(session_id, effective_history),
+            max_n=MAX_HISTORY_MESSAGES,
+        )
+        effective_history = history_for_openai_agent(session_id, effective_history)[
+            -MAX_HISTORY_MESSAGES:
+        ]
     except Exception:  # noqa: BLE001
         model_msgs = []
-        effective_history = history or []
+        effective_history = (history or [])[-4:]
 
-    reply, error, used_model, items, mutated, qr_list, usage = run_chat_agent(
-        message, effective_history, memory, preferred_model=preferred_model
+    reply, error, used_model, items, mutated, qr_list, usage, viewer = run_chat_agent(
+        message,
+        effective_history,
+        memory,
+        preferred_model=preferred_model,
+        session_id=session_id,
+        contexto_vista=contexto_vista if isinstance(contexto_vista, dict) else None,
+        message_history=model_msgs,
     )
 
-    if error in ("llm_unavailable", "missing_key"):
-        from inventario.ai.usage import empty_usage, count_tokens
-
-        local_reply, local_items = local_chat_answer(message)
-        prefix = ""
-        if error == "missing_key":
-            prefix = "(Sin proveedores IA — modo local)\n\n"
-        elif error == "llm_unavailable":
-            prefix = "(Los proveedores IA no respondieron — modo local)\n\n"
-        final_reply = prefix + local_reply
-        if session_id and final_reply:
-            try:
-                append_and_save_turn(
-                    session_id, message, final_reply, prior=model_msgs
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        model_name = preferred_model or "gpt-4o-mini"
-        usage = empty_usage(
-            model=model_name,
-            prompt_tokens=count_tokens(message, model_name),
-            completion_tokens=count_tokens(final_reply, model_name),
-        )
-        return JsonResponse(
-            {
-                "reply": final_reply,
-                "error": None,
-                "used": "local_fallback",
-                "items": local_items or items or [],
-                "mutated": False,
-                "qr": [],
-                "usage": usage,
-                "memory_engine": "pydantic-ai" if session_id else None,
-            }
-        )
-
+    # Guardar solo prosa corta del turno (sin dumps de tools).
     if session_id and reply:
         try:
-            append_and_save_turn(session_id, message, reply, prior=model_msgs)
+            from inventario.ai.tool_agent import persist_short_turn
+
+            persist_short_turn(session_id, message, reply)
         except Exception:  # noqa: BLE001
             pass
 
-    return JsonResponse(
-        {
-            "reply": reply,
-            "error": error,
-            "used": used_model,
-            "items": items or [],
-            "mutated": bool(mutated),
-            "qr": qr_list or [],
-            "usage": usage or {},
-            "memory_engine": "pydantic-ai" if session_id else None,
-        }
+    items_out = items or []
+    # contexto_vista: null = charla/sin datos (visor oculto); objeto = mostrar/sincronizar.
+    contexto_out = None
+    if isinstance(viewer, dict) and viewer.get("tipo"):
+        tipo_v = str(viewer["tipo"]).strip().lower()
+        valor_v = str(viewer.get("valor") or "").strip()
+        if tipo_v == "comparacion":
+            comp = viewer.get("comparacion")
+            contexto_out = {
+                "tipo": "comparacion",
+                "valor": valor_v or "general",
+                "comparacion": comp if isinstance(comp, dict) else {},
+                "lista_limitada": False,
+            }
+        elif tipo_v in {"areas", "areas_general"}:
+            ranking = viewer.get("ranking")
+            contexto_out = {
+                "tipo": "areas_general",
+                "valor": "general",
+                "ranking": ranking if isinstance(ranking, list) else [],
+                "lista_limitada": False,
+            }
+        elif tipo_v in {"persona", "area", "origen"} and valor_v:
+            contexto_out = {
+                "tipo": tipo_v,
+                "valor": valor_v,
+                "lista_limitada": bool(viewer.get("lista_limitada")),
+            }
+
+    # Crear/juntar/mover inventarios ≠ exportar Excel.
+    msg_fold = re.sub(
+        r"\s+",
+        " ",
+        re.sub(
+            r"[áàäâ]",
+            "a",
+            re.sub(
+                r"[éèëê]",
+                "e",
+                re.sub(
+                    r"[íìïî]",
+                    "i",
+                    re.sub(
+                        r"[óòöô]",
+                        "o",
+                        re.sub(
+                            r"[úùüû]",
+                            "u",
+                            (message or "").lower(),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     )
+    # Confirmación de consolidación/traslado: forzar visor al origen destino
+    # (evita arrastrar persona/área previa, p. ej. «excel 3»).
+    is_confirm_consolidacion = bool(
+        mutated
+        and items_out
+        and re.search(
+            r"^(si|ok|okay|dale|procede|confirmo|confirmalo|adelante|hazlo|"
+            r"de acuerdo|va|claro|perfecto)(\b|[,.!]|$)",
+            msg_fold.strip(),
+        )
+    )
+    if is_confirm_consolidacion:
+        origenes_dest: dict[str, int] = {}
+        for row in items_out:
+            if not isinstance(row, dict):
+                continue
+            o = str(row.get("origen") or "").strip()
+            if o:
+                origenes_dest[o] = origenes_dest.get(o, 0) + 1
+        if origenes_dest:
+            top_origen, top_n = max(origenes_dest.items(), key=lambda kv: kv[1])
+            if top_n >= max(1, (len(items_out) + 1) // 2):
+                tipo_actual = (
+                    str(contexto_out.get("tipo") or "").strip().lower()
+                    if isinstance(contexto_out, dict)
+                    else ""
+                )
+                if tipo_actual != "origen":
+                    contexto_out = {
+                        "tipo": "origen",
+                        "valor": top_origen,
+                        "lista_limitada": False,
+                    }
+    # Panorama/resumen ≠ exportar (aunque digan xlsx/excel N).
+    is_panorama_ask = bool(
+        re.search(r"\b(panorama|panorma|resumen|dashboard|totales?)\b", msg_fold)
+        and not re.search(r"\b(exportar?|descargar?|bajar|descarga)\b", msg_fold)
+    )
+    wants_explicit_export = bool(
+        re.search(
+            r"\b(exportar?|descargar?|bajar|descarga|archivo\s+xlsx|"
+            r"dame\s+(un\s+)?archivo\s+(excel|xlsx|csv)|"
+            r"genera(r)?\s+(un\s+)?(archivo\s+)?(excel|xlsx))\b",
+            msg_fold,
+        )
+    ) and not is_panorama_ask
+    # Autorizado por tool confirmar_exportacion_excel.
+    export_authorized = bool(
+        isinstance(viewer, dict) and viewer.get("exportar_excel") is True
+    )
+    consolidacion_intent = bool(
+        re.search(
+            r"\b(crea(r)?|arma(r)?|junta(r)?|une|unir|consolida(r)?|"
+            r"traslad\w*|pas(a|ar)|mueve|mover|copia(r)?)\b",
+            msg_fold,
+        )
+        and re.search(
+            r"\b(inventario|excel|origen|registros?|etiquetas?)\b",
+            msg_fold,
+        )
+    )
+    eliminacion_intent = bool(
+        re.search(r"\b(elimina\w*|borra\w*|quitar|suprim\w*)\b", msg_fold)
+        and re.search(r"\b(inventario|excel|origen)\b", msg_fold)
+    )
+    reply_asks_confirm = bool(
+        re.search(
+            r"\b(confirm|omit|validos|mover|crearan|inventario\s+\d+|"
+            r"eliminar|borrara|renumer)\b",
+            re.sub(r"\s+", " ", (reply or "").lower()),
+        )
+    )
+    # Sin pedido explícito de export → no devolver ítems que disparen descarga.
+    if consolidacion_intent and not wants_explicit_export and not export_authorized:
+        items_out = []
+    # Panorama: no marcar export.
+    if is_panorama_ask:
+        export_authorized = False
+
+    # QR: lista completa al visor (sin recortar 5/50). El chat ya resume.
+    qr_out = list(qr_list or [])
+
+    acciones = build_acciones_sugeridas(
+        reply or "", items_out, message, contexto_out
+    )
+    if (
+        (
+            consolidacion_intent
+            or eliminacion_intent
+            or reply_asks_confirm
+            or wants_explicit_export
+        )
+        and not export_authorized
+    ):
+        acciones = [
+            a
+            for a in acciones
+            if not re.search(
+                r"\b(export|descarg|excel|xlsx|csv)\b",
+                f"{a.get('etiqueta', '')} {a.get('prompt_accion', '')}".lower(),
+            )
+        ]
+        if not acciones and (
+            consolidacion_intent or eliminacion_intent or wants_explicit_export
+        ):
+            acciones = [
+                {
+                    "etiqueta": "Confirmar",
+                    "prompt_accion": "sí, confírmalo",
+                },
+                {
+                    "etiqueta": "Cancelar",
+                    "prompt_accion": "cancela",
+                },
+            ]
+
+    payload: dict = {
+        "reply": reply,
+        "error": error,
+        "used": used_model,
+        "items": items_out,
+        "mutated": bool(mutated),
+        "qr": qr_out,
+        "usage": usage or {},
+        "memory_engine": "pydantic-ai" if session_id else None,
+        "acciones_sugeridas": acciones,
+        # Solo true tras confirmar_exportacion_excel (o pedido ya confirmado).
+        "exportar_excel": bool(export_authorized),
+        "contexto_vista": contexto_out,
+        # Alias retrocompatible.
+        "viewer": (
+            {
+                "tipo": "areas"
+                if contexto_out and contexto_out["tipo"] == "areas_general"
+                else contexto_out["tipo"],
+                "valor": contexto_out.get("valor") or "general",
+                **(
+                    {"comparacion": contexto_out.get("comparacion")}
+                    if contexto_out and contexto_out.get("tipo") == "comparacion"
+                    else {}
+                ),
+            }
+            if contexto_out
+            else None
+        ),
+    }
+    return JsonResponse(payload)
 
 
 @csrf_exempt

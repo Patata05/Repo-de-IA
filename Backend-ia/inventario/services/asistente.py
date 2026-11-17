@@ -34,7 +34,14 @@ def _origen_catalog() -> list[dict[str, Any]]:
     return out
 
 
-def preguntar_asistente(mensaje: str, session_id: str) -> dict[str, Any]:
+def preguntar_asistente(
+    mensaje: str,
+    session_id: str,
+    *,
+    thread_focus: dict[str, Any] | None = None,
+    last_user: str | None = None,
+    thread_summary: str | None = None,
+) -> dict[str, Any]:
     """
     POST al webhook n8n. Espera JSON { "reply": "..." } y extrae [[ACCION:{...}]].
     No muta inventario aquí: solo parsea acciones para el front.
@@ -53,21 +60,29 @@ def preguntar_asistente(mensaje: str, session_id: str) -> dict[str, Any]:
         headers["X-API-Key"] = key
 
     catalog = _origen_catalog()
+    focus = thread_focus if isinstance(thread_focus, dict) else {}
     facts = (
         "Hechos verificados desde Supabase (columna origen exacta). "
         "NUNCA digas que un inventario está vacío si aparece aquí con registros > 0. "
         "Filtra siempre con igualdad exacta del nombre (ej. origen = 'Inventario 1'). "
+        "Para listados en el panel derecho del chat, emite "
+        '[[ACCION:{"tipo":"mostrar_panel","overview":"personTotal|areaTotal|recent|...",'
+        '"persona":"...","area":"...","origen":"...","focus":"...","limit":50}]]. '
         f"Catálogo: {json.dumps(catalog, ensure_ascii=False)}"
     )
+    if focus:
+        facts += f" Foco del hilo: {json.dumps(focus, ensure_ascii=False)}."
 
     body = json.dumps(
         {
             "message": mensaje,
             "sessionId": session_id,
-            # Campos extra: el workflow puede mapearlos al system/prompt del Agent.
             "origenCatalog": catalog,
             "systemFacts": facts,
             "totalRegistros": sum(int(c["registros"]) for c in catalog),
+            "threadFocus": focus or None,
+            "lastUser": (last_user or "").strip() or None,
+            "threadSummary": (thread_summary or "").strip() or None,
         },
         ensure_ascii=False,
     ).encode("utf-8")
