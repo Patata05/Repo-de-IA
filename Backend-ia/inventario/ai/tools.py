@@ -485,6 +485,19 @@ def run_tool(
                     for it in items
                     if db._fold_text(str(it.get("area") or "")) == fold_a
                 ]
+            # Área canónica (TI → Sistemas y TI): devolver TODO el listado del área.
+            if area_resolved and cap < CHAT_LIST_CAP:
+                rows_full, err_full = db.list_por_campo(
+                    "area", area_resolved, limit=CHAT_LIST_CAP
+                )
+                if not err_full and rows_full:
+                    fold_a = db._fold_text(area_resolved)
+                    items = [
+                        it
+                        for it in _items_unique_etiqueta(rows_full)[:CHAT_LIST_CAP]
+                        if db._fold_text(str(it.get("area") or "")) == fold_a
+                    ]
+                    cap = CHAT_LIST_CAP
             out: dict[str, Any] = {
                 "ok": True,
                 "count": len(items),
@@ -492,7 +505,8 @@ def run_tool(
                 "faltaron": max(0, int(limit or 0) - len(items)),
                 "items": items,
                 # N explícito (ej. 8) < tope chat → lista acotada (no expandir).
-                "lista_limitada": cap < CHAT_LIST_CAP,
+                # Área resuelta → nunca vista previa recortada.
+                "lista_limitada": (not area_resolved) and cap < CHAT_LIST_CAP,
             }
             if area_resolved:
                 out["filtro"] = {"tipo": "area", "valor": area_resolved}
@@ -1048,10 +1062,10 @@ def run_tool(
         return {"ok": False, "error": str(exc)}
 
 
-def dump_tool_result(result: dict[str, Any]) -> str:
-    """Payload compacto para el LLM (menos tokens = respuesta más rápida)."""
+def slim_tool_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Dict esencial para el LLM (sin tabla completa ni campos muertos)."""
     if not isinstance(result, dict):
-        return json.dumps({"ok": False, "error": "resultado inválido"}, ensure_ascii=False)
+        return {"ok": False, "error": "resultado inválido"}
 
     slim: dict[str, Any] = {
         k: result[k]
@@ -1083,35 +1097,57 @@ def dump_tool_result(result: dict[str, Any]) -> str:
             "total_areas",
             "total_articulos",
             "ranking",
+            "mensaje_agente",
+            "titulo",
+            "registros",
+            "activos",
         )
         if k in result
     }
+    # Totales escalares de panorama (no listas).
+    for k in ("personas", "areas"):
+        v = result.get(k)
+        if isinstance(v, (int, float)):
+            slim[k] = v
     if isinstance(result.get("item"), dict):
         slim["item"] = _compact_row(result["item"])
     items = result.get("items")
     if isinstance(items, list):
+        # Muestra corta: el visor derecho ya tiene el lote completo en deps.
         slim["items"] = [
-            _compact_row(row) if isinstance(row, dict) else row for row in items[:8]
+            _compact_row(row) if isinstance(row, dict) else row for row in items[:6]
         ]
-        if len(items) > 8:
-            slim["items_truncated"] = len(items) - 8
+        if len(items) > 6:
+            slim["items_truncated"] = len(items) - 6
+            slim["count"] = (
+                int(result["count"])
+                if isinstance(result.get("count"), int)
+                else len(items)
+            )
     for list_key in ("personas", "equipos"):
         vals = result.get(list_key)
         if isinstance(vals, list):
-            slim[list_key] = vals[:25]
-            if len(vals) > 25:
-                slim[f"{list_key}_truncated"] = len(vals) - 25
+            slim[list_key] = vals[:20]
+            if len(vals) > 20:
+                slim[f"{list_key}_truncated"] = len(vals) - 20
     areas = result.get("areas")
     if isinstance(areas, dict):
-        slim["areas"] = dict(list(areas.items())[:15])
+        slim["areas"] = dict(list(areas.items())[:12])
     qrs = result.get("qrs")
     if isinstance(qrs, list):
-        slim["qrs"] = qrs[:7]
+        slim["qrs"] = qrs[:5]
         slim["count"] = slim.get("count", len(qrs))
-    # Resumen / totales: pasar campos numéricos útiles
     for k, v in result.items():
         if k in slim or k in ("item", "items", "qrs", "personas", "equipos", "areas"):
             continue
         if isinstance(v, (int, float, str, bool)) or v is None:
             slim[k] = v
-    return json.dumps(slim, ensure_ascii=False, default=str)
+    return slim
+
+
+def dump_tool_result(result: dict[str, Any]) -> str:
+    """Payload compacto para el LLM (JSON sin indentación)."""
+    slim = slim_tool_result(result if isinstance(result, dict) else {})
+    return json.dumps(
+        slim, ensure_ascii=False, default=str, separators=(",", ":")
+    )

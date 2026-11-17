@@ -16,9 +16,29 @@ import type {
 } from "@/lib/chat-api";
 import {
   canonicalizeOrigenLabel,
+  inventarioNumber,
   origensMatch,
 } from "@/lib/inventario-origen";
 import type { InventarioRow } from "@/lib/supabase";
+
+/** “Inventario 1”, “Inventario 1 - 2”, “Inventario 1 - 2 - 3”. */
+function formatInventarioOrigenChain(origens: string[]): string {
+  const nums = [
+    ...new Set(
+      origens
+        .map((o) => inventarioNumber(canonicalizeOrigenLabel(o)))
+        .filter((n): n is number => n != null && n > 0),
+    ),
+  ].sort((a, b) => a - b);
+  if (nums.length === 1) return `Inventario ${nums[0]}`;
+  if (nums.length > 1) return `Inventario ${nums.join(" - ")}`;
+  const labels = [
+    ...new Set(
+      origens.map((o) => canonicalizeOrigenLabel(o)).filter(Boolean),
+    ),
+  ];
+  return labels.join(" · ");
+}
 
 export type ChatViewerQr = ChatQrPayload & { dataUrl?: string };
 
@@ -730,41 +750,142 @@ function ChatViewer({
     scopedTotal,
   } = overviewData;
 
-  const listItems: ChatApiItem[] = hasQr
-    ? qrCards.map((card) => {
-        const match =
-          (card.id != null
-            ? resultItems.find((item) => Number(item.id) === Number(card.id))
-            : undefined) ||
-          resultItems.find(
-            (item) =>
-              textOf(item.etiqueta).toLowerCase() ===
-                textOf(card.etiqueta).toLowerCase() &&
-              (!textOf(card.origen) ||
-                textOf(item.origen) === textOf(card.origen)),
-          ) ||
-          inventory.find(
+  const resolveQrCardItem = (card: ChatViewerQr): ChatApiItem => {
+    const match =
+      (card.id != null
+        ? resultItems.find((item) => Number(item.id) === Number(card.id))
+        : undefined) ||
+      resultItems.find(
+        (item) =>
+          textOf(item.etiqueta).toLowerCase() ===
+            textOf(card.etiqueta).toLowerCase() &&
+          (!textOf(card.origen) ||
+            textOf(item.origen) === textOf(card.origen)),
+      ) ||
+      inventory.find(
+        (row) =>
+          textOf(row.etiqueta).toLowerCase() ===
+            textOf(card.etiqueta).toLowerCase() &&
+          (!textOf(card.origen) ||
+            textOf(row.origen) === textOf(card.origen)),
+      );
+    return {
+      id: card.id ?? match?.id ?? null,
+      etiqueta: card.etiqueta ?? match?.etiqueta ?? null,
+      articulo: card.articulo ?? match?.articulo ?? null,
+      persona: card.persona ?? match?.persona ?? null,
+      area: card.area ?? match?.area ?? null,
+      origen: card.origen ?? match?.origen ?? null,
+      marca: match?.marca ?? null,
+      modelo: match?.modelo ?? null,
+      serie: match?.serie ?? null,
+      cantidad: match?.cantidad ?? null,
+      estado: match?.estado ?? null,
+      observaciones: match?.observaciones ?? null,
+    };
+  };
+
+  /** QR: filtro estricto por área del foco + agrupación por etiqueta. */
+  const qrGroups = useMemo(() => {
+    if (!hasQr) return [] as Array<{
+      key: string;
+      item: ChatApiItem;
+      origenLabel: string;
+    }>;
+    const focusNorm = foldText(parsedFocus.label || focusArea);
+    const areaScoped =
+      focusNorm &&
+      !/^(todo el inventario|en el inventario|general|etiquetas)$/i.test(
+        String(parsedFocus.label || focusArea || "").trim(),
+      );
+    const cards = areaScoped
+      ? qrCards.filter((card) => {
+          const area = foldText(card.area);
+          if (area && area === focusNorm) return true;
+          const hit = inventory.find(
             (row) =>
-              textOf(row.etiqueta).toLowerCase() ===
+              Number(row.id) === Number(card.id) ||
+              (textOf(row.etiqueta).toLowerCase() ===
                 textOf(card.etiqueta).toLowerCase() &&
-              (!textOf(card.origen) ||
-                textOf(row.origen) === textOf(card.origen)),
+                (!textOf(card.origen) ||
+                  textOf(row.origen) === textOf(card.origen))),
           );
-        return {
-          id: card.id ?? match?.id ?? null,
-          etiqueta: card.etiqueta ?? match?.etiqueta ?? null,
-          articulo: card.articulo ?? match?.articulo ?? null,
-          persona: card.persona ?? match?.persona ?? null,
-          area: card.area ?? match?.area ?? null,
-          origen: card.origen ?? match?.origen ?? null,
-          marca: match?.marca ?? null,
-          modelo: match?.modelo ?? null,
-          serie: match?.serie ?? null,
-          cantidad: match?.cantidad ?? null,
-          estado: match?.estado ?? null,
-          observaciones: match?.observaciones ?? null,
-        };
-      })
+          return Boolean(hit && foldText(hit.area) === focusNorm);
+        })
+      : qrCards;
+
+    type Acc = {
+      item: ChatApiItem;
+      origens: string[];
+      bestNum: number;
+    };
+    const byEtiqueta = new Map<string, Acc>();
+    for (const card of cards) {
+      const etKey = textOf(card.etiqueta).toLowerCase();
+      if (!etKey) continue;
+      const item = resolveQrCardItem(card);
+      const origen = canonicalizeOrigenLabel(
+        textOf(card.origen) || textOf(item.origen),
+      );
+      const num = inventarioNumber(origen) ?? -1;
+      const prev = byEtiqueta.get(etKey);
+      if (!prev) {
+        byEtiqueta.set(etKey, {
+          item,
+          origens: origen ? [origen] : [],
+          bestNum: num,
+        });
+        continue;
+      }
+      if (origen && !prev.origens.some((o) => origensMatch(o, origen))) {
+        prev.origens.push(origen);
+      }
+      // Representante: inventario más reciente (mayor N) para abrir ficha.
+      if (num > prev.bestNum) {
+        prev.item = item;
+        prev.bestNum = num;
+      }
+    }
+    // Completar orígenes desde inventario (misma etiqueta, misma área si aplica).
+    for (const [etKey, acc] of byEtiqueta) {
+      for (const row of inventory) {
+        if (textOf(row.etiqueta).toLowerCase() !== etKey) continue;
+        if (areaScoped && foldText(row.area) !== focusNorm) continue;
+        const origen = canonicalizeOrigenLabel(textOf(row.origen));
+        if (!origen) continue;
+        if (!acc.origens.some((o) => origensMatch(o, origen))) {
+          acc.origens.push(origen);
+        }
+        const num = inventarioNumber(origen) ?? -1;
+        if (num > acc.bestNum) {
+          acc.bestNum = num;
+          acc.item = {
+            ...acc.item,
+            id: row.id ?? acc.item.id,
+            origen: row.origen ?? acc.item.origen,
+            area: row.area ?? acc.item.area,
+            persona: row.persona ?? acc.item.persona,
+            articulo: row.articulo ?? acc.item.articulo,
+          };
+        }
+      }
+    }
+    return [...byEtiqueta.entries()].map(([key, acc]) => ({
+      key,
+      item: acc.item,
+      origenLabel: formatInventarioOrigenChain(acc.origens),
+    }));
+  }, [
+    hasQr,
+    qrCards,
+    resultItems,
+    inventory,
+    parsedFocus.label,
+    focusArea,
+  ]);
+
+  const listItems: ChatApiItem[] = hasQr
+    ? qrGroups.map((g) => g.item)
     : resultItems.length > 0
       ? resultItems
       : [];
@@ -791,6 +912,10 @@ function ChatViewer({
   const displayFocusLabel = canonicalizeOrigenLabel(
     parsedFocus.label || focusArea,
   );
+  const todoInventarioFocus =
+    /^(todo el inventario|en el inventario|general)$/i.test(
+      String(parsedFocus.label || focusArea || "").trim(),
+    );
 
   const comparacionTitulo =
     textOf(comparacion?.titulo) ||
@@ -801,9 +926,31 @@ function ChatViewer({
     ? comparacion!.inventarios!.length
     : 0;
 
+  const qrAreaFocus = (() => {
+    if (!hasQr) return "";
+    const fromFocus = String(displayFocusLabel || "").trim();
+    if (
+      fromFocus &&
+      !/^(todo el inventario|en el inventario|general|etiquetas)$/i.test(
+        fromFocus,
+      )
+    ) {
+      return fromFocus;
+    }
+    const areas = [
+      ...new Set(
+        qrCards
+          .map((c) => textOf(c.area))
+          .filter(Boolean),
+      ),
+    ];
+    return areas.length === 1 ? areas[0] : "";
+  })();
+
   const contextLabel = hasResults
     ? hasQr
-      ? personLabel ||
+      ? qrAreaFocus ||
+        personLabel ||
         inventoryLabel(
           resultItems.length
             ? resultItems
@@ -822,8 +969,10 @@ function ChatViewer({
         : "Áreas"
       : overview === "areaTotal"
         ? displayFocusLabel || "Área"
-        : overview === "areaMatches"
-          ? `Coincidencias: «${displayFocusLabel || "Área"}»`
+                : overview === "areaMatches"
+          ? /^(y|e|o|u)$/i.test(displayFocusLabel || "")
+            ? "Áreas"
+            : `Coincidencias: «${displayFocusLabel || "Área"}»`
           : overview === "personTotal"
             ? displayFocusLabel || "Persona"
             : overview === "personMatches"
@@ -831,11 +980,39 @@ function ChatViewer({
               : overview === "recent"
                 ? "Recientes"
                 : overview === "stats"
-                  ? displayFocusLabel || "Vista previa"
+                  ? todoInventarioFocus
+                    ? "Todo el inventario"
+                    : displayFocusLabel || "Vista previa"
                   : overview === "personas"
-                    ? resultItems.length > 0
-                      ? "Personas del listado"
-                      : "Personas"
+                    ? (() => {
+                        const origenTitle = canonicalizeOrigenLabel(
+                          displayFocusLabel,
+                        );
+                        if (
+                          origenTitle &&
+                          /^(excel|inventario|csv|xls|xlsx)\s*\d+$/i.test(
+                            origenTitle,
+                          )
+                        ) {
+                          return origenTitle;
+                        }
+                        // Foco = área concreta (RH, Sistemas y TI…).
+                        if (
+                          displayFocusLabel &&
+                          !todoInventarioFocus &&
+                          !/^(personas|etiquetas)$/i.test(displayFocusLabel)
+                        ) {
+                          const byArea = inventory.some(
+                            (r) =>
+                              foldText(r.area) ===
+                              foldText(displayFocusLabel),
+                          );
+                          if (byArea) return displayFocusLabel;
+                        }
+                        return resultItems.length > 0
+                          ? "Personas del listado"
+                          : "Personas";
+                      })()
                     : overview === "estado"
                       ? "Estado"
                       : overview === "marcas"
@@ -844,9 +1021,10 @@ function ChatViewer({
                           ? displayFocusLabel || "En el inventario"
                           : displayFocusLabel || "En el inventario";
 
+  const qrUniqueCount = hasQr ? qrGroups.length : 0;
   const contextSub = hasResults
     ? hasQr
-      ? `${qrCards.length} código${qrCards.length === 1 ? "" : "s"} QR`
+      ? `${formatNumber(qrUniqueCount)} código${qrUniqueCount === 1 ? "" : "s"} QR`
       : multiInventario
         ? `${listItems.length} ficha${listItems.length === 1 ? "" : "s"} · ${resultOrigins.join(" · ")}`
         : `${listItems.length} etiqueta${listItems.length === 1 ? "" : "s"}`
@@ -873,13 +1051,46 @@ function ChatViewer({
               : overview === "recent"
                 ? `${recentAll.length} últimos registros`
                 : overview === "stats"
-                  ? resultItems.length > 0
-                    ? `${formatNumber(scopedTotal || resultItems.length)} registros · vista previa`
-                    : "Conteo en vivo"
+                  ? todoInventarioFocus
+                    ? `${formatNumber(scopedTotal || inventory.length)} registros · ${formatNumber(
+                        new Set(
+                          inventory
+                            .map((r) => canonicalizeOrigenLabel(textOf(r.origen)))
+                            .filter(Boolean),
+                        ).size,
+                      )} inventarios`
+                    : resultItems.length > 0
+                      ? `${formatNumber(scopedTotal || resultItems.length)} registros · vista previa`
+                      : "Conteo en vivo"
                   : overview === "full" && resultItems.length > 0
                     ? `${formatNumber(scopedTotal || resultItems.length)} registros · vista previa`
                   : overview === "personas"
-                    ? `${personasSorted.length} personas con equipo`
+                    ? (() => {
+                        const origenTitle = canonicalizeOrigenLabel(
+                          displayFocusLabel,
+                        );
+                        const n = personasSorted.length;
+                        if (
+                          origenTitle &&
+                          /^(excel|inventario|csv|xls|xlsx)\s*\d+$/i.test(
+                            origenTitle,
+                          )
+                        ) {
+                          return `Personas · ${formatNumber(n)} con equipo`;
+                        }
+                        if (
+                          displayFocusLabel &&
+                          !todoInventarioFocus &&
+                          inventory.some(
+                            (r) =>
+                              foldText(r.area) ===
+                              foldText(displayFocusLabel),
+                          )
+                        ) {
+                          return `Personas · ${formatNumber(n)} asignadas`;
+                        }
+                        return `${formatNumber(n)} personas con equipo`;
+                      })()
                     : overview === "estado"
                       ? "Activos vs inactivos"
                       : overview === "marcas"
@@ -2062,79 +2273,94 @@ function ChatViewer({
             ariaLabel="Resultados de la consulta"
             expanded={qrExpanded}
             onToggle={() => setQrExpanded((open) => !open)}
-            measureKey={`results:${listItems.length}:${hasQr ? "qr" : "list"}`}
+            measureKey={`results:${hasQr ? qrGroups.length : listItems.length}:${hasQr ? "qr" : "list"}`}
             showTitle={!hasQr}
             lockCollapsedHeight
           >
             <ul className={`chat-viewer-list${hasQr ? " is-qr-links" : ""}`}>
-              {listItems.map((item, index) => {
-                const etiqueta =
-                  textOf(item.etiqueta) || `Item ${index + 1}`;
-                const articulo = textOf(item.articulo) || "Artículo";
-                const marca = textOf(item.marca);
-                const marcaLabel =
-                  marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
-                    ? ` · ${marca}`
-                    : "";
-                const persona = textOf(item.persona) || "Sin asignar";
-                const area = textOf(item.area);
-                const origen = canonicalizeOrigenLabel(textOf(item.origen));
-
-                return (
-                  <li
-                    key={`${item.id ?? etiqueta}-${origen || "x"}-${index}`}
-                  >
-                    {hasQr ? (
-                      <div className="chat-viewer-list-item has-qr-link">
-                        <span className="chat-viewer-item-main">
-                          <span className="chat-viewer-badge">
-                            {etiqueta}
-                          </span>
-                          <span className="chat-viewer-list-copy">
-                            <strong>
-                              {articulo}
-                              {marcaLabel}
-                            </strong>
-                            <span>
-                              {[persona, area]
-                                .filter(Boolean)
-                                .join(" · ") ||
-                                origen ||
-                                "—"}
+              {hasQr
+                ? qrGroups.map((group) => {
+                    const item = group.item;
+                    const etiqueta = textOf(item.etiqueta) || group.key;
+                    const articulo = textOf(item.articulo) || "Artículo";
+                    const marca = textOf(item.marca);
+                    const marcaLabel =
+                      marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                        ? ` · ${marca}`
+                        : "";
+                    const persona = textOf(item.persona) || "Sin asignar";
+                    const area = textOf(item.area);
+                    return (
+                      <li key={group.key}>
+                        <div className="chat-viewer-list-item has-qr-link">
+                          <span className="chat-viewer-item-main">
+                            <span className="chat-viewer-badge">
+                              {etiqueta}
                             </span>
-                            {origen ? (
-                              <span className="chat-viewer-origen">
-                                <Layers size={12} aria-hidden="true" />
-                                {origen}
+                            <span className="chat-viewer-list-copy">
+                              <strong>
+                                {articulo}
+                                {marcaLabel}
+                              </strong>
+                              <span>
+                                {[persona, area]
+                                  .filter(Boolean)
+                                  .join(" · ") ||
+                                  group.origenLabel ||
+                                  "—"}
                               </span>
-                            ) : null}
+                              {group.origenLabel ? (
+                                <span className="chat-viewer-origen">
+                                  <Layers size={12} aria-hidden="true" />
+                                  {group.origenLabel}
+                                </span>
+                              ) : null}
+                            </span>
                           </span>
-                        </span>
-                        <button
-                          type="button"
-                          className="chat-viewer-qr-open"
-                          onClick={() => onSelectItem?.(item)}
-                          title={`Abrir ficha ${etiqueta}`}
-                        >
-                          <QrCode size={14} />
-                          <span>QR</span>
-                          <ChevronRight size={16} />
-                        </button>
-                      </div>
-                    ) : (
-                      <StaticRecordRow
-                        etiqueta={etiqueta}
-                        title={`${articulo}${marcaLabel}`}
-                        subtitle={
-                          [persona, area].filter(Boolean).join(" · ") ||
-                          "—"
-                        }
-                        origen={origen || undefined}
-                      />
-                    )}
-                  </li>
-                );
-              })}
+                          <button
+                            type="button"
+                            className="chat-viewer-qr-open"
+                            onClick={() => onSelectItem?.(item)}
+                            title={`Abrir ficha ${etiqueta}`}
+                          >
+                            <QrCode size={14} />
+                            <span>QR</span>
+                            <ChevronRight size={16} />
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })
+                : listItems.map((item, index) => {
+                    const etiqueta =
+                      textOf(item.etiqueta) || `Item ${index + 1}`;
+                    const articulo = textOf(item.articulo) || "Artículo";
+                    const marca = textOf(item.marca);
+                    const marcaLabel =
+                      marca && !/^(s\/m|sin marca|n\/a)$/i.test(marca)
+                        ? ` · ${marca}`
+                        : "";
+                    const persona = textOf(item.persona) || "Sin asignar";
+                    const area = textOf(item.area);
+                    const origen = canonicalizeOrigenLabel(
+                      textOf(item.origen),
+                    );
+                    return (
+                      <li
+                        key={`${item.id ?? etiqueta}-${origen || "x"}-${index}`}
+                      >
+                        <StaticRecordRow
+                          etiqueta={etiqueta}
+                          title={`${articulo}${marcaLabel}`}
+                          subtitle={
+                            [persona, area].filter(Boolean).join(" · ") ||
+                            "—"
+                          }
+                          origen={origen || undefined}
+                        />
+                      </li>
+                    );
+                  })}
             </ul>
           </OverflowCollapseCard>
         </div>

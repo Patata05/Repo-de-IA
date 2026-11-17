@@ -39,10 +39,13 @@ export const ORIGEN_SIN_ORIGEN = "S/O";
 /** Alta manual sin archivo ni conteo. */
 export const ORIGEN_NUEVO_REGISTRO = "nuevo registro";
 
-/** Etiqueta unificada de archivos importados (csv/xls/xlsx → excel N). */
+/**
+ * Legado: archivos antiguos pudieron guardarse como excel/csv/xls/xlsx N.
+ * Los imports nuevos usan siempre Inventario N (ver nextFileOrigenFromFileName).
+ */
 export const FILE_ORIGEN_LABEL = "excel";
 
-/** @deprecated Alias histórico; el origen siempre es excel. */
+/** @deprecated Alias histórico de extensión; el origen nuevo es Inventario N. */
 export type FileOrigenKind = "excel" | "xlsx" | "xls" | "csv";
 
 /** Extensión del archivo → kind (solo para detectar que es spreadsheet). */
@@ -57,7 +60,7 @@ export function detectFileOrigenKind(fileName: string): FileOrigenKind | null {
   return null;
 }
 
-/** Número de origen de archivo: excel N (y legado csv|xls|xlsx N). */
+/** Número de origen de archivo legado: excel N (y csv|xls|xlsx N). */
 function anyFileOrigenNumber(name: string): number | null {
   const n = foldOrigenText(name);
   const m = n.match(/^(?:excel|csv|xls|xlsx)\s*(\d+)$/);
@@ -66,16 +69,26 @@ function anyFileOrigenNumber(name: string): number | null {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
-/** csv/xls/xlsx N → excel N (para UI y matching). */
+/**
+ * Normaliza etiqueta de origen.
+ * Legado csv/xls/xlsx N → excel N (solo matching de datos viejos).
+ * Inventario N se conserva.
+ */
 export function canonicalizeOrigenLabel(name: string): string {
   const raw = String(name ?? "").trim();
   if (!raw) return raw;
+  const inv = inventarioNumber(raw);
+  if (inv != null) return `Inventario ${inv}`;
   const fileNum = anyFileOrigenNumber(raw);
   if (fileNum != null) return `${FILE_ORIGEN_LABEL} ${fileNum}`;
   return raw;
 }
 
-/** Misma “caja” de origen (excel 1 ≡ xlsx 1 ≡ csv 1; Inventario N por número). */
+/**
+ * Misma “caja” de origen.
+ * Inventario N ≡ Inventario N; legado excel/csv N entre sí.
+ * No mezcla excel N con Inventario N (números distintos de secuencia).
+ */
 export function origensMatch(a: string, b: string): boolean {
   const ca = canonicalizeOrigenLabel(a);
   const cb = canonicalizeOrigenLabel(b);
@@ -86,33 +99,28 @@ export function origensMatch(a: string, b: string): boolean {
 }
 
 /**
- * Siguiente origen de archivo: siempre `excel N` (contador global).
- * Cuenta también legados csv/xls/xlsx N para no reiniciar el número.
+ * Siguiente origen al importar archivo: siempre Inventario N (misma secuencia
+ * que crear inventario en chat/UI). Ya no crea excel N.
  */
 export function nextFileOrigenName(
   _kind: FileOrigenKind = "excel",
   existing: string[] = [],
 ): string {
-  let max = 0;
-  for (const name of existing) {
-    const num = anyFileOrigenNumber(name);
-    if (num != null && num > max) max = num;
-  }
-  return `${FILE_ORIGEN_LABEL} ${max + 1}`;
+  return nextInventarioName(existing);
 }
 
-/** Origen por defecto al importar un Excel/CSV → excel N. */
+/** Origen por defecto al importar un Excel/CSV → Inventario N. */
 export function nextFileOrigenFromFileName(
   fileName: string,
   existing: string[] = [],
 ): string {
   void fileName;
-  return nextFileOrigenName("excel", existing);
+  return nextInventarioName(existing);
 }
 
 /**
  * Ranking de “más actual” (mayor = más reciente / prioritario):
- * Inventario N > excel N (y legado csv/xlsx) > nuevo registro > S/O.
+ * Inventario N > excel N legado > nuevo registro > S/O.
  */
 export function origenCurrencyRank(origen: string): number {
   const raw = String(origen ?? "").trim();
@@ -126,7 +134,10 @@ export function origenCurrencyRank(origen: string): number {
   return 1_000;
 }
 
-/** Siguiente inventario de conteo: Inventario N+1 (después de S/O arranca en Inventario 1). */
+/**
+ * Siguiente inventario: Inventario N+1 según max de Inventario existentes.
+ * (Los excel N legado no incrementan esta secuencia.)
+ */
 export function nextInventarioName(existing: string[]): string {
   let max = 0;
   for (const name of existing) {
@@ -216,10 +227,13 @@ export function matchOrigenFromFileName(
     }
   }
 
-  // Ya es un origen de archivo tipado (excel 1, o legado csv/xlsx…)
+  // Nombre tipo “excel 1”: reutilizar legado si existe; si no → Inventario N.
   const fileNum = anyFileOrigenNumber(base);
   if (fileNum != null) {
-    return `${FILE_ORIGEN_LABEL} ${fileNum}`;
+    const legacy = existing.find((o) => anyFileOrigenNumber(o) === fileNum);
+    if (legacy) return canonicalizeOrigenLabel(legacy);
+    const invHit = existing.find((o) => inventarioNumber(o) === fileNum);
+    return invHit || `Inventario ${fileNum}`;
   }
 
   return undefined;
@@ -234,8 +248,8 @@ export type ImportOrigenPlan = {
 
 /**
  * Decide destino de importación:
- * prompt explícito → siguiente excel N → filtro.
- * El nombre de archivo/hoja NO mapea a Inventario N.
+ * prompt explícito → siguiente Inventario N → filtro.
+ * El nombre de archivo/hoja NO fuerza el número (salvo “Inventario N” en prompt).
  * La columna Origen del Excel no define el bucket del archivo.
  */
 export function planImportOrigen(input: {
@@ -254,7 +268,7 @@ export function planImportOrigen(input: {
     .trim();
   const asked = matchOrigenFromPrompt(promptOnly, existing);
   const fileSequential = input.fileName
-    ? nextFileOrigenFromFileName(input.fileName, existing)
+    ? nextInventarioName(existing)
     : null;
 
   const filter =
@@ -306,12 +320,15 @@ export function matchOrigenFromPrompt(
     }
   }
 
-  // excel N (también acepta legado csv/xls/xlsx/ecel/exel N → siempre excel N).
+  // “excel N” legado: si existe en BD, usarlo; si no → Inventario N (secuencia unificada).
   const fileHit = n.match(/\b(excel|csv|xls|xlsx|ecel|exel)\s*(\d+)\b/);
   if (fileHit) {
     const num = Number(fileHit[2]);
     if (Number.isFinite(num) && num > 0) {
-      return `${FILE_ORIGEN_LABEL} ${num}`;
+      const legacy = existing.find((o) => anyFileOrigenNumber(o) === num);
+      if (legacy) return canonicalizeOrigenLabel(legacy);
+      const invHit = existing.find((o) => inventarioNumber(o) === num);
+      return invHit || `Inventario ${num}`;
     }
   }
 
@@ -1202,6 +1219,7 @@ export type CreateInventarioAsk = {
 export type FillNewInventarioPlan =
   | { kind: "empty" }
   | { kind: "copy_origen"; source: string }
+  | { kind: "copy_origens"; sources: string[] }
   | { kind: "copy_etiquetas"; etiquetas: string[] }
   | { kind: "unclear" };
 
@@ -1330,6 +1348,234 @@ export function detectBulkCopyAllOthersToInventarioAsk(
   return { dest, sources };
 }
 
+/** Resuelve “Inventario N” contra orígenes existentes. */
+function resolveInventarioNum(num: number, existing: string[]): string {
+  return (
+    existing.find((o) => inventarioNumber(o) === num) || `Inventario ${num}`
+  );
+}
+
+/**
+ * Resuelve “excel N” (y alias): legado en BD si existe;
+ * si no → Inventario N (secuencia unificada).
+ */
+function resolveFileOrigenNum(num: number, existing: string[]): string {
+  const want = `${FILE_ORIGEN_LABEL} ${num}`;
+  const legacy = existing.find((o) => origensMatch(o, want));
+  if (legacy) return canonicalizeOrigenLabel(legacy);
+  return resolveInventarioNum(num, existing);
+}
+
+/** Todas las menciones de origen (Inventario N / excel N) en orden. */
+export function collectOrigenMentionsFromText(
+  text: string,
+  existing: string[] = [],
+): string[] {
+  const n = foldOrigenText(text);
+  if (!n) return [];
+  const out: string[] = [];
+  const push = (label: string) => {
+    const c = canonicalizeOrigenLabel(label);
+    if (!c || out.some((x) => origensMatch(x, c))) return;
+    out.push(c);
+  };
+  for (const m of n.matchAll(
+    new RegExp(
+      `\\b(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+      "g",
+    ),
+  )) {
+    const num = parseInventarioNumToken(m[1]);
+    if (num != null) push(resolveInventarioNum(num, existing));
+  }
+  for (const m of n.matchAll(
+    /\b(excel|csv|xls|xlsx|ecel|exel)\s*(\d+)\b/g,
+  )) {
+    const num = Number(m[2]);
+    if (Number.isFinite(num) && num > 0) push(resolveFileOrigenNum(num, existing));
+  }
+  return out;
+}
+
+/** Destino explícito: último “a/al/hacia Inventario|excel N” (o “crea Inventario N”). */
+export function extractTransferDestOrigen(
+  text: string,
+  existing: string[] = [],
+): string | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  let dest: string | undefined;
+  for (const m of n.matchAll(
+    /\b(?:a|al|hacia)\s+(?:el\s+)?(?:excel|csv|xls|xlsx|ecel|exel)\s*(\d+)\b/g,
+  )) {
+    const num = Number(m[1]);
+    if (Number.isFinite(num) && num > 0) {
+      dest = resolveFileOrigenNum(num, existing);
+    }
+  }
+  for (const m of n.matchAll(
+    new RegExp(
+      `\\b(?:a|al|hacia)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+      "g",
+    ),
+  )) {
+    const num = parseInventarioNumToken(m[1]);
+    if (num != null) dest = resolveInventarioNum(num, existing);
+  }
+  if (!dest) {
+    const createM = n.match(
+      new RegExp(
+        `\\b(?:crea|crear|crealo|creala|haz|hacer|abre|abrir|genera|generar)\\s+(?:un\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+      ),
+    );
+    if (createM) {
+      const num = parseInventarioNumToken(createM[1]);
+      if (num != null) dest = resolveInventarioNum(num, existing);
+    }
+  }
+  return dest;
+}
+
+export type MultiSourceCopyAsk = {
+  dest: string;
+  /** Orígenes completos a copiar (≠ destino). */
+  sources: string[];
+  /** Etiquetas sueltas adicionales (hilo o texto). */
+  etiquetas: string[];
+  /** Destino aún no aparece en orígenes existentes. */
+  createDest: boolean;
+};
+
+/**
+ * Transferencia multi/mixta hacia un destino:
+ * “crea inv 2 y agrega inventario 1 y excel 1”,
+ * “pasa excel 1 e inventario 1 a inventario 2”,
+ * “pasa inventario 1 y esta etiqueta a inventario 2”.
+ */
+export function detectMultiSourceCopyToInventarioAsk(
+  text: string,
+  existing: string[] = [],
+  contextEtiquetas: string[] = [],
+): MultiSourceCopyAsk | undefined {
+  const n = foldOrigenText(text);
+  if (!n) return undefined;
+  if (
+    /\bcompara\w*\b/.test(n) ||
+    /\b(diff|diferencia|versus)\b/.test(n) ||
+    /\bvs\b/.test(n)
+  ) {
+    return undefined;
+  }
+  if (detectBulkCopyAllOthersToInventarioAsk(text, existing)) {
+    return undefined;
+  }
+
+  const transferVerb =
+    /\b(pasa\w*|copia\w*|mete\w*|mueve\w*|mover\w*|traslad\w*|traspas\w*|importa\w*|trae\w*|traer\w*|pon\w*|agrega\w*|manda\w*|envia\w*)\b/.test(
+      n,
+    );
+  const createVerb =
+    /\b(crea|crear|crealo|creala|haz|hacer|abre|abrir|genera|generar)\b/.test(n);
+  if (!transferVerb && !createVerb) return undefined;
+  // Crear vacío sin “pasa/agrega…” → otro flujo.
+  if (createVerb && !transferVerb) return undefined;
+
+  // “crea un nuevo inventario y manda los dos / todos al más reciente”
+  let dest = extractTransferDestOrigen(text, existing);
+  if (
+    !dest &&
+    createVerb &&
+    transferVerb &&
+    (/\bnuevo\s+inventario\b/.test(n) ||
+      /\binventario\s+creado\b/.test(n) ||
+      /\bmas\s+reciente\b/.test(n) ||
+      /\brecien\s+creado\b/.test(n))
+  ) {
+    dest = nextInventarioName(existing);
+  }
+  if (!dest) return undefined;
+
+  const mentions = collectOrigenMentionsFromText(text, existing);
+  const sources: string[] = mentions.filter((o) => !origensMatch(o, dest));
+  // “los dos inventarios / todos los inventarios” → fuentes existentes.
+  if (
+    sources.length < 2 &&
+    (/\b(ambos|los\s+dos|dos\s+inventarios|todos?\s+los\s+inventarios)\b/.test(
+      n,
+    ) ||
+      (/\bmand\w*|pasa\w*|mete\w*|agrega\w*/.test(n) &&
+        /\b(dos|ambos|todos?)\b/.test(n) &&
+        /\binventari/.test(n)))
+  ) {
+    const invs = existing
+      .filter((o) => inventarioNumber(o) != null && !origensMatch(o, dest))
+      .sort((a, b) => (inventarioNumber(a) || 0) - (inventarioNumber(b) || 0));
+    const wantAll = /\btodos?\s+los\s+inventarios\b/.test(n);
+    for (const o of wantAll ? invs : invs.slice(0, 2)) {
+      if (!sources.some((s) => origensMatch(s, o))) sources.push(o);
+    }
+  }
+
+  const fromText = [
+    ...new Set(
+      [...text.matchAll(/\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,10}|\d{4,12})\b/g)].map(
+        (m) => m[1],
+      ),
+    ),
+  ].filter((et) => {
+    const low = et.toLowerCase();
+    return (
+      !/^inventario\d*$/i.test(low) &&
+      !/^(excel|csv|xls|xlsx)\d*$/i.test(low) &&
+      !/^\d{1,3}$/.test(low)
+    );
+  });
+  const deixisEtiqueta =
+    /\b(esta|este|esa|ese|la)\s+etiqueta\b/.test(n) ||
+    (/\b(esta|esa)\b/.test(n) && /\betiqueta\b/.test(n));
+  const etiquetas = fromText.length
+    ? fromText.slice(0, 40)
+    : deixisEtiqueta
+      ? contextEtiquetas.map((e) => String(e).trim()).filter(Boolean).slice(0, 40)
+      : [];
+
+  // “ambos / tanto X como Y” sin menciones claras → 2 exceles o inventarios+excel.
+  if (
+    sources.length < 2 &&
+    /\b(ambos|ambas|tanto|los\s+dos|las\s+dos)\b/.test(n)
+  ) {
+    const files = existing
+      .filter((o) =>
+        /^(?:excel|csv|xls|xlsx)\s*\d+$/i.test(canonicalizeOrigenLabel(o)),
+      )
+      .sort(
+        (a, b) => (anyFileOrigenNumber(a) || 0) - (anyFileOrigenNumber(b) || 0),
+      );
+    const invs = existing
+      .filter((o) => inventarioNumber(o) != null && !origensMatch(o, dest))
+      .sort((a, b) => (inventarioNumber(a) || 0) - (inventarioNumber(b) || 0));
+    const pool =
+      /\b(excel|csv|xls|xlsx|archivo)\b/.test(n) && files.length
+        ? [...files, ...invs]
+        : [...invs, ...files];
+    for (const o of pool) {
+      if (sources.length >= 2) break;
+      if (!origensMatch(o, dest) && !sources.some((s) => origensMatch(s, o))) {
+        sources.push(canonicalizeOrigenLabel(o));
+      }
+    }
+  }
+
+  if (!sources.length && !etiquetas.length) return undefined;
+
+  const createDest = !existing.some((o) => origensMatch(o, dest));
+  // 1 fuente sin etiquetas y destino ya existe → bulk 1→1.
+  if (sources.length === 1 && !etiquetas.length && !createDest) {
+    return undefined;
+  }
+  return { dest, sources, etiquetas, createDest };
+}
+
 /**
  * “pasa todas las etiquetas de Inventario 1 al Inventario 3;
  *  si ya existe alguna, notifícame”.
@@ -1348,9 +1594,15 @@ export function detectBulkCopyBetweenInventariosAsk(
     );
   if (!transferVerb) return undefined;
 
+  // Multi-fuente / mixto tiene prioridad.
+  if (detectMultiSourceCopyToInventarioAsk(text, existing)) {
+    return undefined;
+  }
+
   const hasInvMention =
     collectInventarioNumsFromText(n).length > 0 ||
-    new RegExp(`\\b(?:${INV_TOKEN})\\b`).test(n);
+    new RegExp(`\\b(?:${INV_TOKEN})\\b`).test(n) ||
+    /\b(excel|csv|xls|xlsx|ecel|exel)\s*\d+\b/.test(n);
   if (
     !/\b(etiqueta|etiquetas|registro|registros|regsitros|todo|toda|todas|todos|todosa|completo|completa)\b/.test(
       n,
@@ -1365,41 +1617,72 @@ export function detectBulkCopyBetweenInventariosAsk(
     }
   }
 
-  const resolveNum = (num: number) =>
-    existing.find((o) => inventarioNumber(o) === num) || `Inventario ${num}`;
+  const resolveNum = (num: number) => resolveInventarioNum(num, existing);
 
   // Preferir “de/del/desde Inventario X” → source y “a/al/hacia Inventario Y” → dest
   const fromRe = new RegExp(
     `\\b(?:de|del|desde)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+    "g",
   );
   const toRe = new RegExp(
-    `\\b(?:a|al|hacia|en)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+    `\\b(?:a|al|hacia)\\s+(?:el\\s+)?(?:${INV_TOKEN})\\s*(\\d+|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\\b`,
+    "g",
   );
-  const fromMatch = n.match(fromRe);
-  const toMatch = n.match(toRe);
+  const fromMatches = [...n.matchAll(fromRe)];
+  const toMatches = [...n.matchAll(toRe)];
+  const fromMatch = fromMatches[0];
+  const toMatch = toMatches[toMatches.length - 1];
 
   let source: string | undefined;
   let dest: string | undefined;
+
+  // Destino explícito “a inventario N” siempre gana (evita invertir por “crea inv 2…”).
+  const explicitDest = extractTransferDestOrigen(text, existing);
+  if (explicitDest) dest = explicitDest;
+
   if (fromMatch && toMatch) {
     const fromNum = parseInventarioNumToken(fromMatch[1]);
     const toNum = parseInventarioNumToken(toMatch[1]);
     if (fromNum == null || toNum == null) return undefined;
     source = resolveNum(fromNum);
-    dest = resolveNum(toNum);
+    if (!dest) dest = resolveNum(toNum);
   } else {
-    const uniqueNums = [
-      ...new Set(
-        collectInventarioNumsFromText(n).filter(
-          (x) => Number.isFinite(x) && x > 0,
+    const mentions = collectOrigenMentionsFromText(text, existing);
+    if (dest) {
+      const srcs = mentions.filter((o) => !origensMatch(o, dest!));
+      // También excel como única fuente: “pasa excel 1 a inventario 2”
+      if (srcs.length >= 1) source = srcs[0];
+    }
+    if (!source || !dest) {
+      const uniqueNums = [
+        ...new Set(
+          collectInventarioNumsFromText(n).filter(
+            (x) => Number.isFinite(x) && x > 0,
+          ),
         ),
-      ),
-    ];
-    if (uniqueNums.length < 2) return undefined;
-    source = resolveNum(uniqueNums[0]);
-    dest = resolveNum(uniqueNums[1]);
+      ];
+      if (uniqueNums.length < 2 && !source) return undefined;
+      if (dest) {
+        const destNum = inventarioNumber(dest);
+        const srcNum = uniqueNums.find((x) => x !== destNum);
+        if (srcNum != null) source = resolveNum(srcNum);
+      } else if (uniqueNums.length >= 2) {
+        // Con “a/al/hacia” → último = destino; si no, [0]→[1].
+        if (/\b(?:a|al|hacia)\s+(?:el\s+)?(?:al)?inventari/.test(n)) {
+          dest = resolveNum(uniqueNums[uniqueNums.length - 1]);
+          const srcNum = uniqueNums.find(
+            (x) => x !== uniqueNums[uniqueNums.length - 1],
+          );
+          source = srcNum != null ? resolveNum(srcNum) : resolveNum(uniqueNums[0]);
+        } else {
+          source = resolveNum(uniqueNums[0]);
+          dest = resolveNum(uniqueNums[1]);
+        }
+      }
+    }
   }
 
-  if (!source || !dest || source === dest) return undefined;
+  if (!source || !dest || origensMatch(source, dest)) return undefined;
 
   return { source, dest, notifyExisting: true };
 }
@@ -1466,8 +1749,8 @@ export function detectCopyPersonRecordsToInventarioAsk(
 }
 
 /**
- * “agrega etiqueta 283586 a Inventario 2” / “pasa esa a inventario 2” / “a csv 2”
- * (etiquetas pueden venir del hilo vía contextEtiquetas).
+ * “agrega etiqueta X a Inventario 2” / “pasa esa a inventario 2”.
+ * Etiquetas solo del mensaje actual del usuario (no del bot).
  * Destino “nuevo” → Inventario N+1.
  */
 export function detectCopyEtiquetasToInventarioAsk(
@@ -1480,6 +1763,10 @@ export function detectCopyEtiquetasToInventarioAsk(
 
   // “todos los demás inventarios → Inv N” tiene prioridad.
   if (detectBulkCopyAllOthersToInventarioAsk(text, existing)) {
+    return undefined;
+  }
+  // Multi-fuente / origen+etiqueta → otro detector.
+  if (detectMultiSourceCopyToInventarioAsk(text, existing, contextEtiquetas)) {
     return undefined;
   }
   // “todos sus registros → Inv N” lo maneja detectCopyPersonRecordsToInventarioAsk.
@@ -1634,6 +1921,10 @@ export function detectCreateInventarioAsk(
   if (/\b(compara|comparar|comparacion|diff|diferencia)\b/.test(n)) {
     return undefined;
   }
+  // “crea Inv 2 y pasa/agrega orígenes…” → multi-copy (crear implícito).
+  if (detectMultiSourceCopyToInventarioAsk(text, existing)) {
+    return undefined;
+  }
   // “mete/copia al nuevo inventario…” es relleno, no creación.
   if (
     /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|traslada|trasladar|agrega|agregar)\b/.test(
@@ -1733,23 +2024,72 @@ export function detectFillNewInventarioAsk(
   }
 
   const fillVerb =
-    /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|agrega|agregar|traslada|trasladar|llevalo|echale)\b/.test(
+    /\b(mete|meter|pon|poner|pasa|pasar|copia|copiar|agrega|agregar|traslada|trasladar|llevalo|echale|manda|mandar|envia|enviar)\b/.test(
       n,
     );
 
-  const source = matchOrigenFromPrompt(text, existing);
+  // Fuentes explícitas (Inventario N / excel legado), excluyendo el destino pendiente.
+  const sources: string[] = collectOrigenMentionsFromText(text, existing).filter(
+    (o) => !origensMatch(o, pending.name),
+  );
+  // “pasa el 1 y el 2” / “inventario 2 y 1” sin repetir destino.
+  if (!sources.length) {
+    const bare = [
+      ...new Set(
+        [...n.matchAll(/\b(?:el|la|los|las)?\s*(\d{1,2})\b/g)]
+          .map((m) => Number(m[1]))
+          .filter((x) => Number.isFinite(x) && x > 0 && x <= 99),
+      ),
+    ];
+    for (const num of bare) {
+      const label = resolveInventarioNum(num, existing);
+      if (!origensMatch(label, pending.name) && !sources.some((s) => origensMatch(s, label))) {
+        // Solo si existe o el usuario dijo “inventario N” / “todo”.
+        if (
+          existing.some((o) => inventarioNumber(o) === num) ||
+          /\binventari/.test(n) ||
+          /\btodo\b/.test(n)
+        ) {
+          sources.push(label);
+        }
+      }
+    }
+  }
+  if (
+    sources.length < 2 &&
+    /\b(ambos|ambas|los\s+dos|las\s+dos|dos\s+inventarios)\b/.test(n)
+  ) {
+    const invs = existing
+      .filter((o) => inventarioNumber(o) != null && !origensMatch(o, pending.name))
+      .sort((a, b) => (inventarioNumber(a) || 0) - (inventarioNumber(b) || 0));
+    for (const o of invs) {
+      if (sources.length >= 2) break;
+      if (!sources.some((s) => origensMatch(s, o))) sources.push(o);
+    }
+  }
+
   const wantsWhole =
     fillVerb &&
-    /\b(todo|toda|completo|completa|entero|entera)\b/.test(n) &&
-    /\binventario\s*\d+\b/.test(n);
+    (/\b(todo|toda|completo|completa|entero|entera|ambos|los\s+dos)\b/.test(n) ||
+      sources.length >= 2);
+
+  if (sources.length >= 2 && (fillVerb || wantsWhole)) {
+    return { kind: "copy_origens", sources };
+  }
+
+  const source = sources[0] || matchOrigenFromPrompt(text, existing);
   if (
     source &&
     foldOrigenText(source) !== foldOrigenText(pending.name) &&
-    wantsWhole
+    (wantsWhole ||
+      (fillVerb &&
+        /\b(todo|toda|completo|completa|entero|entera)\b/.test(n) &&
+        /\binventario\s*\d+\b/.test(n)))
   ) {
     return { kind: "copy_origen", source };
   }
 
+  // Solo etiquetas del mensaje actual del usuario (nunca del bot).
   const etiquetas = [
     ...new Set(
       [...text.matchAll(/\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,8}|\d{4,10})\b/g)].map(
@@ -1758,7 +2098,11 @@ export function detectFillNewInventarioAsk(
     ),
   ].filter((et) => {
     const low = et.toLowerCase();
-    return !/^inventario\d*$/i.test(low) && !/^\d{1,3}$/.test(low);
+    return (
+      !/^inventario\d*$/i.test(low) &&
+      !/^(excel|csv|xls|xlsx)\d*$/i.test(low) &&
+      !/^\d{1,3}$/.test(low)
+    );
   });
 
   // Solo meter etiquetas si hay verbo de relleno o el mensaje es casi solo códigos.
@@ -1934,23 +2278,65 @@ export function formatDuplicateEtiquetasReply(
   );
 }
 
+/**
+ * Procedencia histórica: inventario más reciente (mayor N) donde ya exista
+ * la etiqueta, excluyendo el destino. Legado excel N cuenta por debajo de Inventario N.
+ */
+export function resolveMostRecentFuenteOrigen(
+  etiqueta: string,
+  destOrigen: string,
+  catalog: InventarioRow[] = [],
+  fallbackOrigen?: string | null,
+): string {
+  const etq = String(etiqueta || "").trim().toLowerCase();
+  const destFold = foldOrigenText(destOrigen);
+  const fallback = String(fallbackOrigen ?? "").trim();
+  if (!etq || !catalog.length) return fallback;
+  const candidates = catalog.filter((r) => {
+    if (String(r.etiqueta ?? "").trim().toLowerCase() !== etq) return false;
+    const o = String(r.origen ?? "").trim();
+    return Boolean(o) && foldOrigenText(o) !== destFold;
+  });
+  if (!candidates.length) return fallback;
+  candidates.sort((a, b) => {
+    const d =
+      origenCurrencyRank(String(b.origen ?? "")) -
+      origenCurrencyRank(String(a.origen ?? ""));
+    if (d !== 0) return d;
+    return rowTimestamp(b) - rowTimestamp(a);
+  });
+  return String(candidates[0]?.origen ?? "").trim() || fallback;
+}
+
 export function rowToNewInventarioItem(
   row: InventarioRow,
   destOrigen: string,
+  catalog: InventarioRow[] = [],
 ): NewInventarioItem {
-  const from = String(row.origen ?? "").trim();
+  const etiqueta = String(row.etiqueta ?? "").trim();
+  const from = resolveMostRecentFuenteOrigen(
+    etiqueta,
+    destOrigen,
+    catalog,
+    String(row.origen ?? "").trim(),
+  );
   const prevObs = row.observaciones?.toString().trim() || "";
   const copyNote =
     from && foldOrigenText(from) !== foldOrigenText(destOrigen)
       ? `Copiado desde ${from}.`
       : "";
+  // Sustituir nota vieja de procedencia para no acumular “Copiado desde…” contradictorios.
+  const obsSinCopia = prevObs
+    .replace(/(^|\n)\s*Copiado desde[^\n]*/gi, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
   const observaciones = copyNote
-    ? prevObs && !/copiado desde/i.test(prevObs)
-      ? `${prevObs}\n${copyNote}`
-      : prevObs || copyNote
-    : prevObs || null;
+    ? obsSinCopia
+      ? `${obsSinCopia}\n${copyNote}`
+      : copyNote
+    : obsSinCopia || null;
   return {
-    etiqueta: String(row.etiqueta ?? "").trim(),
+    etiqueta,
     articulo: String(row.articulo ?? "").trim(),
     marca: row.marca?.toString().trim() || null,
     modelo: row.modelo?.toString().trim() || null,
@@ -2010,12 +2396,12 @@ export function displayOrigenLabel(
   const fold = foldOrigenText(current);
   const fuente = resolveFuenteOrigen(product, catalog);
   if (fuente) return fuente;
-  // Orígenes de archivo → siempre excel N en UI.
+  // Legado excel N (solo datos antiguos) → etiqueta canónica.
   if (anyFileOrigenNumber(current) != null) {
     return canonicalizeOrigenLabel(current);
   }
   if (fold === "nuevo registro" || fold === "nuevo") return ORIGEN_NUEVO_REGISTRO;
-  // Conteo Inventario N sin fuente → registro nuevo en ese conteo.
+  // Inventario N sin fuente → registro nativo de ese inventario.
   if (inventarioNumber(current) != null) return ORIGEN_NUEVO_REGISTRO;
   return current || ORIGEN_NUEVO_REGISTRO;
 }
@@ -2090,19 +2476,26 @@ export function pickSourceRowsForEtiquetas(
 export function buildCreateInventarioAskReply(
   name: string,
   existing: string[],
+  sampleEtiquetas: string[] = [],
 ): string {
   const others = existing
     .filter((o) => o !== ORIGEN_SIN_ORIGEN)
     .slice(0, 4)
     .map((o) => `**${o}**`)
     .join(", ");
+  const realSamples = sampleEtiquetas
+    .map((e) => String(e || "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const tagHint = realSamples.length
+    ? ` etiquetas vigentes como ${realSamples.map((e) => `**${e}**`).join(", ")}`
+    : " una o varias etiquetas vigentes";
+  const othersHint = others
+    ? ` También puedo traer **todo** un inventario existente (${others}).`
+    : " También puedo traer **todo** un inventario existente.";
   return (
-    `De acuerdo: preparo **${name}**.\n\n` +
-    `¿Qué meto en ese inventario?\n` +
-    `• Una o varias **etiquetas** (ej. \`283586\` o \`OF-0026, 264162\`)\n` +
-    `• **Todo** un inventario existente` +
-    (others ? ` (${others})` : "") +
-    `\n` +
-    `• O dime **vacío** si solo quieres dejarlo creado sin registros`
+    `De acuerdo: dejo listo **${name}** como destino pendiente. ` +
+    `Dime qué quieres meter ahí: puedo copiar${tagHint}, o pasar el contenido completo de otro origen.${othersHint} ` +
+    `Si solo quieres crearlo sin registros, responde **vacío** y lo dejamos preparado para más adelante.`
   );
 }

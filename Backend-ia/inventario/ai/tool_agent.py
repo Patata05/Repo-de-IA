@@ -31,7 +31,7 @@ def _openai_http_client() -> httpx.AsyncClient:
 
 
 # Bump al cambiar instrucciones/tools del Agent (invalida singleton).
-_AGENT_INSTR_VER = "v15-fastpath-saludos-puros"
+_AGENT_INSTR_VER = "v29-area-context-qr-deixis"
 
 def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, str, str]:
     # No guardar la key completa en logs; fingerprint corto para el dict.
@@ -50,6 +50,14 @@ Personalidad (compañero de trabajo):
 - Habla natural, amable y cercano — como un colega en la oficina, no como bot.
 - Si el usuario bromea o comenta al margen, responde con calidez en una
   frase corta y reencauza de inmediato al inventario / a la tarea.
+- Sé cercano, natural y conversacional. Si el usuario hace un comentario
+  casual, saludo, broma o palabra suelta (ej. “perro”, “gracias amor”,
+  “hola mundooo”), acusa recibo en una frase corta y amigable antes de
+  volver suavemente al tema del inventario.
+- Evita respuestas robóticas o repetitivas como “Parece que estamos en el
+  mismo punto” o “Vamos a seguir con el inventario”.
+- En charla casual pura (solo saludo/broma): 2–3 oraciones y reencauza.
+  En consultas de inventario: desarrolla la respuesta (ver Estilo).
 - PROHIBIDO desviarte a plática personal (“platiquemos de otra cosa”,
   “¿cómo va tu día?”, “cuéntame de ti”, chisme ajeno al trabajo).
 - PROHIBIDO frases de contestadora: “Estoy aquí para ayudarte”, “¿En qué
@@ -61,8 +69,9 @@ Personalidad (compañero de trabajo):
 Relevancia (obligatorio):
 - Contesta exactamente lo que preguntó en este turno.
 - Solo datos exactos de tools/Supabase; sin inventar ni estimar.
-- Sin relleno ni “voy a…” / “un momento…” si ya tienes el resultado.
+- Sin “voy a…” / “un momento…” si ya tienes el resultado.
 - Pregunta concreta → respuesta concreta; no agregues temas no pedidos.
+  Sí explica con claridad el hallazgo y el siguiente paso útil.
 
 Reglas de verdad:
 - NUNCA inventes etiquetas, totales, personas, áreas ni marcas.
@@ -74,22 +83,27 @@ Reglas de verdad:
   confirmaciones pendientes, etc.).
 
 Estilo:
-- Prosa corta y fluida (1–3 frases o un párrafo breve), como habla cotidiana.
+- PROHIBIDO respuestas telegráficas o de una sola línea seca.
+- Desarrolla en párrafos naturales de 3 a 5 oraciones: qué encontraste,
+  el contexto de los datos (origen, totales, matices) y un siguiente paso
+  sugerido cuando encaje. Mantén tono cálido, conversacional y preciso.
 - PROHIBIDO viñetas (•), guiones (- *) o listas verticales campo por campo.
-- Si piden “últimos registros” o varios artículos: un párrafo breve por ítem
-  (“Etiqueta **269459** — **Laptop HP …** de **Nombre** en **Área**,
+- Si piden “últimos registros” o varios artículos: un párrafo fluido por
+  ítem (“Etiqueta **269459** — **Laptop HP …** de **Nombre** en **Área**,
   estado **Activo**.”). Negritas sutiles; sin bullets.
 - Datos reales: cuéntalos con fluidez humana, sin perder ni un dígito.
-- Cierra con una pregunta breve SOLO si encaja en la conversación; si no, no.
+- Cierra con una pregunta de seguimiento natural cuando ayude a avanzar.
 - Evita slang pesado (wey, neta); sí puedes sonar cercano y espontáneo.
+- Varía la redacción: no repitas siempre el mismo arranque ni el mismo cierre.
 
 Excel / archivos (importante):
 - SUBIR/IMPORTAR ≠ EXPORTAR/DESCARGAR. Son acciones opuestas.
 - Si el usuario quiere SUBIR o IMPORTAR un Excel/CSV (“quiero importarte un
   excel”, “te voy a subir un archivo”, “cómo subo mi excel”, “voy a adjuntar”)
-  SIN archivo en este turno: explica en prosa cómo hacerlo (botón «+» o
-  arrastrar .xlsx/.csv a la barra inferior) y las columnas esperadas
-  (ETIQUETA, ARTÍCULO, MARCA, MODELO, SERIE, ÁREA, PERSONA, CANTIDAD, ESTADO).
+  SIN archivo en este turno: responde tú (prosa natural, adaptada a la pregunta).
+  Dato técnico breve (no plantilla fija ni lista rígida siempre): admite
+  .xlsx/.csv por «+» o arrastrando a la barra; columnas típicas ETIQUETA,
+  ARTÍCULO, MARCA, MODELO, SERIE, ÁREA, PERSONA, CANTIDAD, ESTADO.
   NO inventes ni generes un Excel descargable. NO llames tools de exportación.
 - Crear / juntar / trasladar inventarios en Supabase ≠ exportar. Si pide
   “crea un nuevo inventario…”, “junta excel 1 y 2…”, “traslada registros…”,
@@ -101,6 +115,15 @@ Excel / archivos (importante):
 - “Inventario general” / “todo el inventario” / “general” SIN persona/área →
   TODOS los registros (resumen_inventario o panorama_inventario sin origen).
   NUNCA filtres por la palabra “general” como texto de origen/área.
+- “dame/muéstrame/ver registros|etiquetas” (y typos) SIN persona/área/código →
+  listado de etiquetas (visor tipo=etiquetas, items completos). NUNCA panorama
+  ni buscar_inventario(query="etiqueta|etiquetas|registro|registros|inventario").
+- “dame/muéstrame/los nombres” SIN personas|áreas|artículos|etiquetas:
+  NO llames tools ni armes viewer. Pregunta con naturalidad si quiere nombres
+  de personas, de áreas o de artículos; usa el hilo reciente como pista
+  (“como veníamos viendo personas…”). PROHIBIDO decir “no tengo acceso a los
+  nombres…”. Tras confirmar → ranking personas / ranking_areas / listado
+  etiquetas según el caso.
 - Exportar Excel (solo con “exporta”, “descarga”, “dame el archivo excel”):
   1) preparar_exportacion_excel → vista previa + contexto_vista; pregunta
      confirmación; exportar_excel=false (sin tarjeta).
@@ -108,42 +131,77 @@ Excel / archivos (importante):
 - Importar con archivo adjunto: si falta el archivo, invita a adjuntarlo.
 
 Orígenes (regla estricta):
-- “excel N” SOLO existe si el usuario subió un archivo .xlsx/.csv. PROHIBIDO
-  crear “excel 1/2/3…” desde el chat o tools internas.
-- Contenedores creados/consolidados en chat → SIEMPRE “Inventario 1, 2, 3…”
-  (consecutivo). “actual” / “más reciente” / sin número → Inventario N mayor.
-- Al pasar datos DESDE un excel N hacia un Inventario: SOLO copia (mover=false).
-  NUNCA borres ni vacíes el excel fuente.
+- TODOS los contenedores (import .xlsx/.csv, crear, consolidar) → SIEMPRE
+  “Inventario 1, 2, 3…” consecutivo (max N + 1). PROHIBIDO crear “excel N”
+  nuevos. “excel N” solo existe como LEGADO en BD; si el usuario dice
+  “excel 1” y no hay legado, resuelve a Inventario 1.
+- “actual” / “más reciente” / sin número → Inventario N mayor.
+- Al copiar/transferir: SOLO copia (mover=false) si la fuente es excel legado.
+  NUNCA borres ni vacíes un excel legado fuente.
+- Procedencia: al agregar una etiqueta a un Inventario nuevo, la nota
+  “Copiado desde …” usa el inventario MÁS RECIENTE donde ya existía
+  (mayor N), no uno más viejo.
+
+Listar inventarios / orígenes:
+- “cuántos inventarios tenemos”, “qué inventarios hay”, “dame los inventarios”
+  → usa contar_por_campo(campo='origen') o panorama_inventario / resumen.
+  Responde NATURAL con nombres reales (Inventario N; excel N solo si legado).
+  Actualiza el visor (viewer origen / panorama). PROHIBIDO plantillas fijas
+  tipo “Tienes Inventario 1… ¿Creamos Inventario 2…?”.
 
 Consolidación / Inventario N (Supabase directo):
 - preparar_consolidacion_inventario(tramos, destino?, mover?) → OBLIGATORIO
   para crear/juntar/copiar. Cada tramo: origen?, persona?, area?, articulo?,
   cantidad?. Ej. “4 de Fernanda… en inventario nuevo” → destino=null.
-- “pasa excel 1 al inventario más reciente” →
-  tramos=[{origen:'excel 1'}], destino='más reciente', mover=false.
+- “pasa Inventario 1 al inventario más reciente” →
+  tramos=[{origen:'Inventario 1'}], destino='más reciente', mover=false.
   Informa validos / omitidos_duplicados / destino y pide:
   «¿Deseas pasar estos X registros a Inventario N? Confirma con sí».
+- Multi-fuente / mixta: “pasa Inventario 1 e Inventario 2 a Inventario 3”,
+  “crea Inventario 2 y agrega ambos…”, “crea un nuevo inventario y manda
+  los dos al más reciente” → en UN solo paso: crea el destino y copia
+  TODOS los orígenes pedidos. Destino = “a Inventario N” / nuevo / más
+  reciente (NUNCA invertir). Sin duplicar etiquetas. Procedencia = origen
+  más reciente de cada etiqueta.
+- PROHIBIDO inventar o citar etiquetas hardcodeadas (283586, OF-0026, etc.).
+  Solo usa códigos que salgan de tools/Supabase en este turno.
 - SIEMPRE confirma antes. sí → confirmar_consolidacion_inventario;
   no → cancelar_consolidacion_inventario. NUNCA exportes Excel aquí.
 
 Eliminación explícita:
-- Solo con pedido claro (“elimina el excel 1”, “borra el Inventario 5”).
+- Solo con pedido claro (“elimina el Inventario 5”, “borra el excel 1” legado).
 - preparar_eliminacion_origen(origen) → cuenta + pide confirmación.
-- sí → confirmar_eliminacion_origen. Tras borrar un excel N, renumerar
+- sí → confirmar_eliminacion_origen. Tras borrar un excel N legado, renumerar
   automáticamente los excel restantes (más viejo→excel 1, etc.).
 
 Tools (elige la mínima necesaria; solo datos):
 - contar_total / resumen_inventario → totales globales.
 - ranking_areas → OBLIGATORIO si piden “áreas en general”, “todas las áreas”,
-  “qué áreas hay”, “ranking de áreas” SIN nombrar un departamento. Devuelve
-  el ranking completo. NUNCA uses contar_por_campo ni buscar_inventario para
-  eso (no arrastres el área del turno anterior).
+  “qué áreas hay”, “ranking de áreas”, “dame las áreas” / “okey dame areas…”
+  SIN nombrar un departamento. Ignora cortesía (okey/gracias/por favor/listo)
+  y conectores sueltos (y/e/o). Devuelve el ranking completo. NUNCA uses
+  contar_por_campo ni buscar_inventario para eso.
+- Área concreta (“dame el área de TI”, “inventario general del área de TI”,
+  “área RH”) → OBLIGATORIO contar_por_campo(campo='area', valor='ti'|'rh'|…).
+  Resuelve TI → Sistemas y TI, RH → Recursos Humanos. Viewer tipo=area con
+  TODOS los registros del área (métricas + listado completo). PROHIBIDO
+  panorama_inventario, ranking_areas o buscar_inventario con query="ti"
+  como texto libre. “inventario general DE [área]” ≠ panorama global.
+- Personas/nombres de UN área (“dame los nombres del área de RH”, “quiénes
+  están en Ventas”, “personas de Sistemas y TI”) → OBLIGATORIO
+  contar_por_campo(campo='area', valor='rh'|'ti'|…) y viewer/filtro
+  tipo=personas con valor=nombre canónico del área (ej. “Recursos Humanos”).
+  El visor derecho abre la plantilla Personas filtrada por esa área (no
+  areaTotal ni ranking global). “dame las personas” SIN área → ranking
+  global de personas (viewer tipo=personas, valor=general).
 - contar_por_campo(campo=persona|area|origen|marca|..., valor=...) →
   persona (“registros de Eduardo”) O UN área concreta (TI → Sistemas y TI).
   Columna area SIN acento. No busques “ti” como texto libre.
   Si filtraste por PERSONA → viewer/filtro tipo=persona (NUNCA uses el área
-  de un artículo). Si filtraste por ÁREA puntual → viewer tipo=area.
-- buscar_inventario(query, limit) → listados.
+  de un artículo). Si filtraste por ÁREA puntual y pidieron el área/equipos
+  → viewer tipo=area. Si pidieron nombres/personas del área → tipo=personas.
+- buscar_inventario(query, limit) → listados con filtro real (persona, área,
+  marca, código…). NO uses meta-palabras (etiquetas/registros/inventario) como query.
 - obtener_por_etiqueta → ficha exacta.
 - listar_recientes → últimos / de hoy.
 - buscar_semantico → si la léxica falla o piden “similar a…”.
@@ -151,23 +209,27 @@ Tools (elige la mínima necesaria; solo datos):
   NO crea artículos nuevos: lista QR de registros YA existentes y los
   carga en el visor derecho. Pedido general (“dame los qr”, “todos los
   qr”) → TODOS (o del origen: excel 1 / Inventario 1). Con N o etiqueta
-  concreta → solo esos. NUNCA digas “generando…” sin haber llamado la
-  tool. Chat: total + 3–5 ejemplos; el visor lleva el 100%.
+  concreta → solo esos.
+  “dame los qr de esta/esa área”, “sus qr”, “qr de aquí” → usa el área
+  del contexto_vista / hilo (ej. Recursos Humanos), NUNCA el inventario
+  global. Menciona el área y el total en prosa conversacional.
+  NUNCA digas “generando…” sin haber llamado la tool.
+  Chat: total + 3–5 ejemplos; el visor lleva el 100%.
 - listar_criterios → varios filtros (N de aquí y M de TI).
 - preparar/confirmar/cancelar_consolidacion_inventario → crear/copiar en
   Supabase (ver bloque Consolidación). NO exporta Excel.
 - preparar/confirmar/cancelar_eliminacion_origen → borrar excel/Inventario
   con confirmación; renumerar exceles tras borrar.
-- panorama_inventario(origen?) → OBLIGATORIO para “panorama general”, “resumen
-  de excel/xlsx 2”, “inventario general”. origen=null → todo el inventario.
-  Normaliza xlsx/ecel→excel. Devuelve métricas + viewer; SIN Excel.
+- panorama_inventario(origen?) → OBLIGATORIO solo para “panorama/resumen/
+  inventario general”. origen=null → métricas + viewer origen (no listado
+  plano de etiquetas). Normaliza xlsx/ecel→excel. SIN Excel.
 - preparar/confirmar_exportacion_excel → solo con pedido explícito de descarga.
 - comparar_inventarios(origenes?) → OBLIGATORIO para “compara inventarios”,
   “compara excel 1 vs excel 2”, “compara todo”, “diferencias entre inventarios”.
   origenes=null → todos. Devuelve SOLO métricas (totales, cruces de etiquetas,
   áreas). Redacta un panorama claro con esas cifras; NO listes filas.
 
-Orígenes: excel N (importados; alias xlsx/xls/csv/ecel N); Inventario N (creados).
+Orígenes: Inventario N (importados y creados). excel N solo legado.
 No inventes nombres. No uses “general” como valor de origen.
 """.strip()
 
@@ -210,13 +272,22 @@ def canonicalize_origen_alias(needle: str) -> str:
 
 def resolve_origen_alias(needle: str, rows: list[dict] | None = None) -> str | None:
     from inventario import supabase_client as db
+    import re
 
     canon = canonicalize_origen_alias(needle)
     if not canon:
         return None
-    return db.resolve_origen_label(canon, rows) or (
-        db.resolve_origen_label(str(needle or "").strip(), rows)
+    hit = db.resolve_origen_label(canon, rows) or db.resolve_origen_label(
+        str(needle or "").strip(), rows
     )
+    if hit:
+        return hit
+    # “excel N” sin legado en BD → Inventario N (secuencia unificada).
+    m = re.match(r"(?i)^(excel|csv|xls|xlsx)\s*(\d+)\s*$", canon)
+    if m:
+        inv = f"Inventario {int(m.group(2))}"
+        return db.resolve_origen_label(inv, rows) or inv
+    return None
 
 
 def _export_set_pending(session_id: str | None, payload: dict[str, Any]) -> None:
@@ -536,6 +607,18 @@ def parse_qr_request(message: str) -> dict[str, Any] | None:
         except ValueError:
             pass
 
+    # Deixis de área del hilo: “qr de esta área / sus qr / de aquí”.
+    if re.search(
+        r"\b(esta|esa|la)\s+areas?\b|"
+        r"\b(de|del)\s+(esta|esa|la)\s+areas?\b|"
+        r"\bsus\s+(codigos?\s*)?qr\b|"
+        r"\bqr\s+(de|del)\s+(aqui|ahi|alla|esta|esa)\b|"
+        r"\b(de|del)\s+(aqui|ahi|alla)\b",
+        fold,
+    ):
+        out["use_contexto"] = True
+        return out
+
     # “de Persona/Área” sin origen numérico.
     if not out["origen"]:
         m_de = re.search(
@@ -546,7 +629,8 @@ def parse_qr_request(message: str) -> dict[str, Any] | None:
         if m_de:
             cand = (m_de.group(1) or m_de.group(2) or "").strip()
             if cand and not re.search(
-                r"^(los|las|todos?|todas?|qr|codigos?|inventario|excel)\b",
+                r"^(los|las|todos?|todas?|qr|codigos?|inventario|excel|"
+                r"esta|esa|la|aqui|ahi|alla)\b",
                 cand,
             ):
                 out["query"] = cand
@@ -700,10 +784,34 @@ def load_qr_for_ask(
             "viewer": deps.viewer,
             "hechos_qr": _qr_facts_from_deps(deps, message),
         }
+    query = ask.get("query")
+    origen = ask.get("origen")
+    # “QR de esta área” → contexto_vista del panel (área activa).
+    if ask.get("use_contexto"):
+        ctx = deps.contexto_vista if isinstance(deps.contexto_vista, dict) else None
+        tipo = str((ctx or {}).get("tipo") or "").strip().lower()
+        valor = str((ctx or {}).get("valor") or "").strip()
+        if tipo == "area" and valor:
+            query = valor
+            origen = None
+        elif tipo == "persona" and valor:
+            query = valor
+            origen = None
+        elif tipo == "origen" and valor:
+            origen = valor
+            query = None
+        else:
+            return {
+                "ok": False,
+                "error": "Necesito saber de qué área hablamos para armar esos QR.",
+                "qr": [],
+                "qrs": [],
+                "count": 0,
+            }
     result = generar_qr_data(
         etiqueta=ask.get("etiqueta"),
-        query=ask.get("query"),
-        origen=ask.get("origen"),
+        query=query,
+        origen=origen,
         limit=ask.get("limit"),
         ultimo=bool(ask.get("ultimo")),
     )
@@ -757,6 +865,80 @@ def ensure_qr_for_ask(
         preferred_model=preferred_model,
     )
     return natural or reply
+
+
+def listar_registros_inventario_data(
+    origen: str | None = None,
+) -> dict[str, Any]:
+    """
+    Listado plano de etiquetas/registros para el visor (sin plantilla panorama).
+    """
+    from inventario import supabase_client as db
+
+    all_rows, err, _ = db.read_inventario()
+    if err:
+        return {"ok": False, "error": err, "exportar_excel": False}
+
+    label = "Todo el inventario"
+    scope_rows = all_rows
+    raw = str(origen or "").strip()
+    canon = canonicalize_origen_alias(raw) if raw else ""
+    if canon:
+        resolved = resolve_origen_alias(raw, all_rows)
+        if not resolved:
+            return {
+                "ok": False,
+                "error": f"No encontré el origen «{raw}».",
+                "exportar_excel": False,
+            }
+        want = db._origen_fold(resolved)
+        scope_rows = [
+            r
+            for r in all_rows
+            if db._origen_fold(str(r.get("origen") or "")) == want
+        ]
+        label = resolved
+
+    items: list[dict[str, Any]] = []
+    for row in scope_rows[:MAX_SIDE_ITEMS]:
+        items.append(
+            {
+                k: row.get(k)
+                for k in (
+                    "id",
+                    "etiqueta",
+                    "articulo",
+                    "marca",
+                    "modelo",
+                    "serie",
+                    "persona",
+                    "area",
+                    "estado",
+                    "cantidad",
+                    "origen",
+                )
+                if row.get(k) not in (None, "")
+            }
+        )
+
+    viewer = {"tipo": "etiquetas", "valor": label}
+    return {
+        "ok": True,
+        "titulo": f"Registros de {label}",
+        "origen": label if canon else None,
+        "count": len(scope_rows),
+        "mostrados": len(items),
+        "items": items,
+        "viewer": viewer,
+        "filtro": viewer,
+        "lista_limitada": False,
+        "exportar_excel": False,
+        "mensaje_agente": (
+            f"Hay {len(scope_rows)} registros en «{label}». Confirma el total "
+            f"real y menciona 3–5 etiquetas de ejemplo. NO digas que no hay "
+            f"registros. El visor derecho lleva el listado completo."
+        ),
+    }
 
 
 def panorama_inventario_data(
@@ -1002,6 +1184,47 @@ _COPY_FIELDS = (
 )
 
 
+def _origen_currency_rank(label: str) -> int:
+    """Inventario N > excel N legado > resto (para procedencia más reciente)."""
+    import re
+
+    raw = str(label or "").strip()
+    m_inv = re.match(r"(?i)^inventario\s+(\d+)\s*$", raw)
+    if m_inv:
+        return 1_000_000 + int(m_inv.group(1))
+    m_ex = re.match(r"(?i)^(excel|csv|xls|xlsx)\s*(\d+)\s*$", raw)
+    if m_ex:
+        return 100_000 + int(m_ex.group(2))
+    return 1_000
+
+
+def _most_recent_fuente_origen(
+    etiqueta: str,
+    destino: str,
+    all_rows: list[dict],
+    fallback: str = "",
+) -> str:
+    """Origen más reciente donde ya exista la etiqueta (excluye destino)."""
+    from inventario import supabase_client as db
+
+    etq = str(etiqueta or "").strip().lower()
+    dest_f = db._origen_fold(destino)
+    if not etq:
+        return fallback
+    candidates: list[tuple[int, str]] = []
+    for r in all_rows or []:
+        if str(r.get("etiqueta") or "").strip().lower() != etq:
+            continue
+        o = str(r.get("origen") or "").strip()
+        if not o or db._origen_fold(o) == dest_f:
+            continue
+        candidates.append((_origen_currency_rank(o), o))
+    if not candidates:
+        return fallback
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1] or fallback
+
+
 def _is_nuevo_destino(destino: str | None) -> bool:
     import re
 
@@ -1229,7 +1452,11 @@ def _rows_for_tramo_flex(
     return unique, None, label
 
 
-def _row_to_insert_flex(row: dict, destino: str) -> dict[str, Any]:
+def _row_to_insert_flex(
+    row: dict,
+    destino: str,
+    all_rows: list[dict] | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {"origen": destino}
     for k in _COPY_FIELDS:
         if row.get(k) is not None and str(row.get(k)).strip() != "":
@@ -1240,6 +1467,22 @@ def _row_to_insert_flex(row: dict, destino: str) -> dict[str, Any]:
         payload["area"] = str(row.get("area") or "General").strip() or "General"
     if not payload.get("etiqueta"):
         payload["etiqueta"] = str(row.get("etiqueta") or "").strip()
+    # Procedencia = inventario más reciente donde ya existía la etiqueta.
+    from_src = _most_recent_fuente_origen(
+        str(payload.get("etiqueta") or ""),
+        destino,
+        all_rows or [],
+        fallback=str(row.get("origen") or "").strip(),
+    )
+    if from_src:
+        import re
+
+        prev = str(payload.get("observaciones") or "").strip()
+        prev = re.sub(
+            r"(^|\n)\s*Copiado desde[^\n]*", "", prev, flags=re.IGNORECASE
+        ).strip()
+        note = f"Copiado desde {from_src}."
+        payload["observaciones"] = f"{prev}\n{note}".strip() if prev else note
     try:
         source_id = int(row.get("id"))
     except (TypeError, ValueError):
@@ -1343,7 +1586,7 @@ def preparar_consolidacion_flex(
                     omitidos_tramo += 1
                     continue
             lote_etq.add(etq)
-            lote.append(_row_to_insert_flex(row, destino_final))
+            lote.append(_row_to_insert_flex(row, destino_final, all_rows))
             tomados += 1
         tramos_resumen.append(
             {
@@ -1881,8 +2124,18 @@ def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
             break
         if locked_viewer:
             break
-        if tipo in {"persona", "area", "origen"} and valor:
-            next_viewer: dict[str, Any] = {"tipo": tipo, "valor": valor}
+        if tipo in {
+            "persona",
+            "personas",
+            "area",
+            "origen",
+            "etiquetas",
+            "registros",
+        } and (valor or tipo in {"etiquetas", "registros", "personas"}):
+            next_viewer: dict[str, Any] = {
+                "tipo": "etiquetas" if tipo == "registros" else tipo,
+                "valor": valor or ("general" if tipo == "personas" else "Inventario"),
+            }
             raw_metrics = raw.get("metricas")
             if isinstance(raw_metrics, dict) and raw_metrics:
                 next_viewer["metricas"] = raw_metrics
@@ -1972,6 +2225,18 @@ def build_contexto_vista_payload(
                 "ranking": ranking if isinstance(ranking, list) else [],
                 "lista_limitada": False,
             }
+        if tipo in {"etiquetas", "registros"}:
+            return {
+                "tipo": "etiquetas",
+                "valor": valor or "Inventario",
+                "lista_limitada": False,
+            }
+        if tipo == "personas":
+            return {
+                "tipo": "personas",
+                "valor": valor or "general",
+                "lista_limitada": False,
+            }
         if tipo in {"persona", "area", "origen"} and valor:
             out: dict[str, Any] = {
                 "tipo": tipo,
@@ -1985,6 +2250,16 @@ def build_contexto_vista_payload(
                     k: raw_metrics.get(k)
                     for k in ("registros", "personas", "areas", "activos")
                     if raw_metrics.get(k) is not None
+                }
+            # Pedido de nombres/personas del área → plantilla Personas.
+            um = (user_message or "").lower()
+            if tipo == "area" and re.search(
+                r"\b(nombres?|personas?|quien|quienes)\b", um
+            ):
+                return {
+                    "tipo": "personas",
+                    "valor": valor,
+                    "lista_limitada": False,
                 }
             return out
 
@@ -2046,15 +2321,109 @@ def build_contexto_vista_payload(
             "lista_limitada": False,
         }
 
+    # Items sin filtro mayoritario → listado general (abrir visor).
+    if items:
+        return {
+            "tipo": "origen",
+            "valor": "Todo el inventario",
+            "lista_limitada": bool(deps.lista_limitada),
+        }
+
     # Tools sin filtro claro / charla → null (visor oculto).
     if _is_chitchat(reply, user_message):
         return None
     return None
 
 
+_META_LIST_TOKENS = frozenset(
+    {
+        "etiqueta",
+        "etiquetas",
+        "registro",
+        "registros",
+        "regsitro",
+        "regsitros",
+        "articulo",
+        "articulos",
+        "equipo",
+        "equipos",
+        "inventario",
+        "listado",
+        "lista",
+        "todo",
+        "todos",
+        "todas",
+        "general",
+        "nombre",
+        "nombres",
+        "ver",
+        "dame",
+        "muestra",
+        "muestrame",
+        "traer",
+        "trae",
+        "prueba",
+        "probar",
+        "aver",
+        "a",
+        "con",
+        "de",
+        "los",
+        "las",
+    }
+)
+_META_LIST_STOP = frozenset(
+    {"el", "la", "los", "las", "un", "una", "de", "del", "mi", "mis", "al"}
+)
+
+
+def _is_meta_list_query(query: str) -> bool:
+    """True si la query es solo meta-palabras de listado (no un filtro real)."""
+    folded = unicodedata.normalize("NFD", str(query or "").lower())
+    folded = "".join(c for c in folded if unicodedata.category(c) != "Mn")
+    folded = re.sub(r"[^a-z0-9\s]+", " ", folded)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    if not folded:
+        return True
+    tokens = [t for t in folded.split() if t not in _META_LIST_STOP]
+    if not tokens:
+        return True
+    # Al menos un sustantivo de listado; el resto solo conectores/verbos de pedido.
+    has_noun = any(
+        t
+        in {
+            "etiqueta",
+            "etiquetas",
+            "registro",
+            "registros",
+            "regsitro",
+            "regsitros",
+            "articulo",
+            "articulos",
+            "equipo",
+            "equipos",
+            "inventario",
+            "listado",
+            "lista",
+            "todo",
+            "todos",
+            "todas",
+            "general",
+        }
+        for t in tokens
+    )
+    return has_noun and all(t in _META_LIST_TOKENS for t in tokens)
+
+
 def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Alias xlsx/ecel→excel; evita filtrar por la palabra «general»."""
+    """Alias xlsx/ecel→excel; evita filtrar por «general» o meta-listados."""
     out = dict(args or {})
+    if name in {"buscar_inventario", "buscar_semantico"}:
+        q = str(out.get("query") or "").strip()
+        if _is_meta_list_query(q):
+            # Sin filtro → todos los registros (search vacío / panorama).
+            out["query"] = ""
+            out["_meta_list_all"] = True
     if name in {
         "contar_por_campo",
         "obtener_por_etiqueta",
@@ -2071,9 +2440,10 @@ def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 out["valor"] = canon
         if "query" in out:
             q = str(out.get("query") or "").strip()
-            canon_q = canonicalize_origen_alias(q)
-            if canon_q and canon_q != q:
-                out["query"] = canon_q
+            if q:
+                canon_q = canonicalize_origen_alias(q)
+                if canon_q and canon_q != q:
+                    out["query"] = canon_q
         if "origen" in out and out.get("origen"):
             canon_o = canonicalize_origen_alias(str(out.get("origen") or ""))
             out["origen"] = canon_o or out["origen"]
@@ -2096,14 +2466,21 @@ def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run(deps: ToolAgentDeps, name: str, args: dict[str, Any]) -> dict[str, Any]:
-    from inventario.ai.tools import run_tool
+    from inventario.ai.tools import run_tool, slim_tool_result
 
     norm = _normalize_tool_args(name, args)
     # contar_por_campo(origen=general) → resumen global (todos los registros).
     if name == "contar_por_campo" and norm.pop("_skip_origen_general", False):
-        return _absorb(deps, panorama_inventario_data(None))
+        absorbed = _absorb(deps, panorama_inventario_data(None))
+        return slim_tool_result(absorbed)
+    # buscar_* con meta-query (etiquetas/registros) → listado plano + visor etiquetas.
+    if name in {"buscar_inventario", "buscar_semantico"} and norm.pop(
+        "_meta_list_all", False
+    ):
+        absorbed = _absorb(deps, listar_registros_inventario_data(None))
+        return slim_tool_result(absorbed)
 
-    return _absorb(
+    absorbed = _absorb(
         deps,
         run_tool(
             name,
@@ -2112,6 +2489,8 @@ def _run(deps: ToolAgentDeps, name: str, args: dict[str, Any]) -> dict[str, Any]
             contexto_vista=deps.contexto_vista,
         ),
     )
+    # Al LLM: JSON esencial; deps.collected conserva el lote del visor.
+    return slim_tool_result(absorbed)
 
 
 def _build_agent(api_key: str, model_name: str, base_url: str = ""):
@@ -2451,12 +2830,12 @@ def get_or_build_agent(api_key: str, model_name: str, base_url: str = ""):
         return agent
 
 
-# Historial corto → menos tokens / menos latencia (últimos 4 turnos).
-MAX_HISTORY_MESSAGES = 4
+# Ventana deslizante: últimos 6 mensajes ≈ 3 turnos (user+assistant).
+MAX_HISTORY_MESSAGES = 6
 _TOOL_RETURN_MAX_CHARS = 280
-# gpt-4o-mini: respuestas rápidas y acotadas.
-AGENT_MAX_TOKENS = 300
-AGENT_TEMPERATURE = 0.6
+# gpt-4o-mini: margen amplio para prosa conversacional desarrollada.
+AGENT_MAX_TOKENS = 800
+AGENT_TEMPERATURE = 0.65
 
 
 def _fold_user_text(raw: str) -> str:
@@ -2593,6 +2972,7 @@ _INVENTARIO_INTENT_RE = re.compile(
     r"\b("
     r"\d{3,}|"
     r"etiqueta|etiquetas|persona|personas|area|areas|"
+    r"nombre|nombres|"
     r"inventario|inventarios|excel|xlsx|xls|csv|archivo|archivos|"
     r"export|exporta|exportar|descarg|descarga|descargar|"
     r"import|importa|importar|sube|subir|"
@@ -2607,6 +2987,36 @@ _INVENTARIO_INTENT_RE = re.compile(
 )
 
 
+def _is_thanks_or_closing_ack(message: str) -> bool:
+    """Agradecimiento / cierre casual: nunca confirma borrado."""
+    t = _fold_user_text(message)
+    if not t:
+        return True
+    if re.search(
+        r"\b(elimina|eliminar|borra|borrar|quita|quitar|suprimir|"
+        r"confirmar?\s+(el\s+)?borrado)\b",
+        t,
+    ):
+        return False
+    if re.fullmatch(
+        r"(gracias|thanks|thank you|ty|thx|de nada|muchas gracias|mil gracias)"
+        r"( [.!]*)?",
+        t,
+    ):
+        return True
+    toks = t.split()
+    if (
+        len(toks) <= 6
+        and re.search(r"\b(gracias|thanks|thank you|thx|ty|de nada)\b", t)
+        and not re.search(
+            r"\b(inventari\w*|excel|csv|xls|xlsx|etiqueta|registro|origen|archivo)\b",
+            t,
+        )
+    ):
+        return True
+    return False
+
+
 def is_fast_chitchat_message(
     message: str,
     *,
@@ -2617,7 +3027,15 @@ def is_fast_chitchat_message(
     SOLO saludos / cortesía pura (hola, gracias, ok…).
     Cualquier pedido de datos, import, duplicados, etc. → agente con tools.
     """
-    if _session_has_pending_action(session_id):
+    # “gracias” con eliminación residual → limpiar y seguir como chitchat.
+    if _is_thanks_or_closing_ack(message) and session_id:
+        try:
+            from inventario.ai import pending_eliminacion as pend_del
+
+            pend_del.clear_pending(session_id)
+        except Exception:  # noqa: BLE001
+            pass
+    elif _session_has_pending_action(session_id):
         return False
     # Confirmación de Excel/import/consolidación pendiente → agente completo.
     if _last_assistant_awaits_confirm(history, session_id) and _is_pending_confirm_phrase(
@@ -2654,6 +3072,8 @@ def is_fast_chitchat_message(
         t,
     ):
         return True
+    if _is_thanks_or_closing_ack(message):
+        return True
     return False
 
 
@@ -2669,6 +3089,7 @@ def run_fast_qr_reply(
     *,
     preferred_model: str | None = None,
     session_id: str | None = None,
+    contexto_vista: dict[str, str] | None = None,
 ) -> tuple[str, str | None, str | None, list, bool, list, dict, dict | None]:
     """
     QR rápido: hechos crudos desde Supabase + redacción OpenAI natural.
@@ -2676,13 +3097,17 @@ def run_fast_qr_reply(
     """
     from inventario.ai.usage import empty_usage
 
-    deps = ToolAgentDeps(session_id=session_id)
+    deps = ToolAgentDeps(session_id=session_id, contexto_vista=contexto_vista)
     result = load_qr_for_ask(deps, message or "")
     facts: dict[str, Any]
     if deps.qr:
         facts = _qr_facts_from_deps(deps, message or "")
         if isinstance(result, dict) and isinstance(result.get("hechos_qr"), dict):
             facts = {**result["hechos_qr"], **facts}
+        # Asegurar foco de área en hechos para prosa conversacional.
+        if isinstance(deps.viewer, dict) and deps.viewer.get("valor"):
+            facts["foco"] = deps.viewer.get("valor")
+            facts["area"] = deps.viewer.get("valor")
     else:
         facts = {
             "ok": False,
@@ -2702,8 +3127,13 @@ def run_fast_qr_reply(
     if not text:
         # Último recurso mínimo (solo si OpenAI falló): cifra cruda, sin plantilla larga.
         total = int(facts.get("total_qr") or facts.get("total") or 0)
+        foco = str(facts.get("foco") or facts.get("area") or "").strip()
         text = (
-            f"Hay {total} códigos QR listos en el visor derecho."
+            (
+                f"Generé {total} códigos QR"
+                + (f" del área **{foco}**" if foco else "")
+                + "; están todos en el visor derecho."
+            )
             if total
             else "No encontré códigos QR para esa consulta."
         )
@@ -2779,7 +3209,7 @@ def run_fast_chitchat_reply(
     session_id: str | None = None,
 ) -> tuple[str, str | None, str | None, list, bool, list, dict, None]:
     """
-    Llamada ligera a gpt-4o-mini: sin tools; solo últimos 4 turnos de prosa.
+    Llamada ligera a gpt-4o-mini: sin tools; ventana corta de prosa.
     Devuelve el mismo shape que run_tool_agent.
     """
     from inventario.ai.client import DEFAULT_MODEL, get_llm_endpoints
@@ -3067,7 +3497,7 @@ def run_tool_agent(
     from inventario.ai.usage import empty_usage, usage_from_pydantic_result
     from inventario.supabase_client import get_env
 
-    # Saludo / charla: sin tools; solo últimos 4 turnos de prosa.
+    # Saludo / charla: sin tools; ventana corta de prosa.
     if is_fast_chitchat_message(
         message, session_id=session_id, history=history
     ):
@@ -3084,6 +3514,7 @@ def run_tool_agent(
             message,
             preferred_model=preferred_model,
             session_id=session_id,
+            contexto_vista=contexto_vista,
         )
 
     try:
@@ -3218,20 +3649,57 @@ def run_tool_agent(
 
         del_pend = pend_del.get_pending(session_id) if session_id else None
         if del_pend:
-            prompt_parts.append(
-                "ELIMINACIÓN PENDIENTE:\n"
-                f"origen={del_pend.get('origen')!s} count={del_pend.get('count')!s} "
-                f"kind={del_pend.get('kind')!s}.\n"
-                "Si confirma → confirmar_eliminacion_origen. "
-                "Si cancela → cancelar_eliminacion_origen."
-            )
-            if _aff_del(message or ""):
+            msg_fold = _fold_user_text(message or "")
+            # Cortesía primero: nunca confirmar ni reabrir fantasma por “gracias”.
+            if _is_thanks_or_closing_ack(message or ""):
+                pend_del.clear_pending(session_id)
                 prompt_parts.append(
-                    "El usuario CONFIRMÓ el borrado. Llama confirmar_eliminacion_origen ahora."
+                    "El usuario SOLO agradece o cierra el turno. "
+                    "NO hay eliminación pendiente. NO digas que hay borrado "
+                    "pendiente de excel/Inventario. NO llames "
+                    "preparar/confirmar_eliminacion_origen. Responde el "
+                    "agradecimiento en una frase corta."
                 )
-            elif _neg_del(message or ""):
+            elif _aff_del(message or ""):
                 prompt_parts.append(
-                    "El usuario CANCELÓ el borrado. Llama cancelar_eliminacion_origen."
+                    "ELIMINACIÓN PENDIENTE:\n"
+                    f"origen={del_pend.get('origen')!s} "
+                    f"count={del_pend.get('count')!s}.\n"
+                    "El usuario CONFIRMÓ el borrado. Llama "
+                    "confirmar_eliminacion_origen ahora."
+                )
+            elif _neg_del(message or "") or re.search(
+                r"\bcancelar eliminacion pendiente\b",
+                msg_fold,
+            ):
+                prompt_parts.append(
+                    "El usuario CANCELÓ el borrado. Llama "
+                    "cancelar_eliminacion_origen."
+                )
+            elif re.search(
+                r"\b(persona|quien|quienes|pertenece|area|articulo|"
+                r"etiqueta|origen|antes|asignad|dueno|de que)\b",
+                msg_fold,
+            ):
+                prompt_parts.append(
+                    "ELIMINACIÓN PENDIENTE (PAUSADA):\n"
+                    f"origen={del_pend.get('origen')!s} "
+                    f"count={del_pend.get('count')!s}.\n"
+                    "El usuario hizo una PREGUNTA intermedia. Responde "
+                    "con datos reales (persona/área/artículo/origen) "
+                    "usando tools si hace falta. NO confirmes ni canceles "
+                    "el borrado. NO digas que procedes a eliminar. "
+                    "Al final puedes recordar que el borrado sigue "
+                    "pendiente (sí/no)."
+                )
+            else:
+                prompt_parts.append(
+                    "ELIMINACIÓN PENDIENTE:\n"
+                    f"origen={del_pend.get('origen')!s} "
+                    f"count={del_pend.get('count')!s} "
+                    f"kind={del_pend.get('kind')!s}.\n"
+                    "Si confirma → confirmar_eliminacion_origen. "
+                    "Si cancela → cancelar_eliminacion_origen."
                 )
     except Exception:  # noqa: BLE001
         pass

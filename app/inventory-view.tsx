@@ -102,7 +102,7 @@ import {
   detectExcludedEtiquetasAsk,
   detectFillNewInventarioAsk,
   canonicalizeOrigenLabel,
-  detectListInventariosAsk,
+  detectMultiSourceCopyToInventarioAsk,
   diffInventarios,
   displayOrigenLabel,
   findDuplicateEtiquetas,
@@ -138,9 +138,12 @@ import {
   formatDeleteModalPrompt,
   formatDeleteSoftConfirm,
   formatOrigensListEs,
+  isCasualThanksOrClosingAck,
+  looksLikeDeleteDeixisSingular,
   looksLikeDeleteInventoryAsk,
   looksLikeWipeAllInventariosAsk,
   planDeleteOrigens,
+  recoverDeletePlanFromBotConfirm,
   resolveChatDeleteRows,
   type ChatDeletePlan,
 } from "@/lib/chat-delete-plan";
@@ -209,8 +212,10 @@ async function polishInventoryReply(opts: {
       ...opts.facts,
       // Evita que el modelo copie plantillas locales literales.
       plantilla_sugerida: undefined,
-      tono: "conversacional_natural",
+      tono: "conversacional_calido_detallado",
+      extension: "desarrollada_3_a_5_oraciones",
       prohibido_copiar_plantilla: true,
+      prohibido_respuesta_telegrafica: true,
     },
     sessionId: opts.sessionId,
   });
@@ -657,9 +662,24 @@ function parseEtiquetaListAsk(userText: string): number | null {
 }
 
 /** "esas / esos / las de arriba / las anteriores" → resultados del mensaje previo. */
+/** QR del área del hilo: “dame los qr de esta área / sus qr / de aquí”. */
+function looksLikeAreaQrDeixis(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n || !userAskedQr(userText)) return false;
+  return (
+    /\b(esta|esa|la)\s+areas?\b/.test(n) ||
+    /\b(de|del)\s+(esta|esa|la)\s+areas?\b/.test(n) ||
+    /\bsus\s+(codigos?\s*)?qr\b/.test(n) ||
+    /\bqr\s+(de|del)\s+(aqui|ahi|alla|esta|esa)\b/.test(n) ||
+    (/\b(de|del)\s+(aqui|ahi|alla)\b/.test(n) && /\bqr\b/.test(n))
+  );
+}
+
 function looksLikeResultAnaphora(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
+  // QR del área activa → no reutilizar listado global anterior.
+  if (looksLikeAreaQrDeixis(userText)) return false;
   // “todo lo que está en el inventario 2…” ≠ anáfora de listado.
   if (
     /\binventari/.test(n) &&
@@ -2101,58 +2121,58 @@ function looksLikeImportPreviewAsk(text: string) {
   return (mentionsFile && asksConfirm) || softPreview;
 }
 
+/** Normaliza confirmación Excel: minúsculas, sin acentos ni signos. */
+function foldImportConfirmText(value: string): string {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * Confirmación de carga del Excel pendiente.
- * Acepta “si”, “si confirma”, “si ponlo”, “sí, impórtalo”, “adelante súbelo”, “dale”.
+ * Tolera typos/coloquial: “si hasla”, “si has la importacion”, “dale”, “va”.
  * No dispara con consultas (dame/busca/compara/…).
  */
 function isExplicitImportConfirm(value: string): boolean {
-  const t = String(value || "").trim();
+  const t = foldImportConfirmText(value);
   if (!t) return false;
   if (
-    /\b(compara\w*|diff|diferencia|borra|elimina|pasa|copia|lista|muestra|dame|panorama|inventario\s+total|busca|checa|duplicad)\b/i.test(
+    /\b(compara\w*|diff|diferencia|borra|elimina|pasa|copia|lista|muestra|dame|panorama|inventario\s+total|busca|checa|duplicad)\b/.test(
       t,
     )
   ) {
     return false;
   }
-  const loadVerb =
-    String.raw`importa\w*|carga\w*|sube\w*|s[uú]be\w*|imp[oó]rta\w*|confirma\w*|` +
-    String.raw`adelante|hazlo|ponlo|ponla|metelo|metela|guardalo|guardala|procede`;
+  // Verbos / typos de carga (has≈haz, hasla, ijmportacion…).
+  const loadBit =
+    /\b(importa\w*|ijmporta\w*|carga\w*|sube\w*|confirma\w*|hazla|hasla|hazlo|haslo|hazlas|haslas|haz|has|ponlo|ponla|metelo|metela|guardalo|guardala|procede|adelante)\b/;
+  const affirm =
+    /^(si|yes|ok|okay|okey|vale|va|dale|claro|listo|adelante|confirma|confirmo)\b/;
+
   // Chips / verbos de carga solos
   if (
-    new RegExp(
-      String.raw`^(importa(?:r|los|las|me|lo|la|nos)?|carga(?:r|los|las|lo|la)?|sube(?:r|los|las|lo|la)?|súbe(?:los|las|lo|la)?|imp[oó]rtalo(?:s)?|s[uú]belo(?:s)?|ponlo|ponla)([.!\s]*)$`,
-      "i",
-    ).test(t)
+    /^(importa(r|los|las|me|lo|la|nos)?|carga(r|los|las|lo|la)?|sube(r|los|las|lo|la)?|subelo(s)?|importalo(s)?|ponlo|ponla|hazla|hasla|hazlo|haslo)([.\s]*)$/.test(
+      t,
+    )
   ) {
     return true;
   }
-  // “sí subelo” / “si ponlo” / “si, impórtalo” / “si confirma”
-  if (
-    new RegExp(
-      String.raw`^(sí|si|yes)\s*[,.]?\s*(por\s+favor\s+)?(${loadVerb})([.!\s]*)?$`,
-      "i",
-    ).test(t)
-  ) {
+  // “si has la importacion” / “si hasla” / “dale hasla” / “adelante subelo”
+  if (affirm.test(t) && loadBit.test(t)) {
     return true;
   }
-  // “adelante súbelo” / “dale importalo” / “listo confírmalo”
-  if (
-    new RegExp(
-      String.raw`^(adelante|dale|listo)\s*[,.]?\s*(por\s+favor\s+)?(${loadVerb})?([.!\s]*)?$`,
-      "i",
-    ).test(t)
-  ) {
-    return true;
-  }
-  if (
-    /^(confirma|confirmo)(\s+la\s+importaci[oó]n)?([.!\s]*)$/i.test(t)
-  ) {
+  // “confirma la importacion” / “confirmo”
+  if (/^(confirma|confirmo)(\s+la\s+i?j?mporta\w*)?([.\s]*)$/.test(t)) {
     return true;
   }
   // Cortos — solo válidos con preview pendiente en el caller
-  return /^(sí|si|yes|confirma|confirmo|adelante|dale)([.!\s]*)$/i.test(t);
+  return /^(si|yes|ok|okay|okey|vale|va|dale|claro|listo|adelante|confirma|confirmo)([.\s]*)$/.test(
+    t,
+  );
 }
 
 /** Chips fijos tras preview de Excel (prompt dispara confirm/cancel). */
@@ -2396,6 +2416,12 @@ function buildAnaphoraEtiquetasReply(items: ChatApiItem[]) {
   );
 }
 
+/** Siglas reales de área: nunca borrar al limpiar stopwords/cortesía. */
+const AREA_PROTECTED_ACRONYMS = new Set(["ti", "rh", "rrhh"]);
+
+/** Conectores sueltos que NO son área (aparecen en “Sistemas y TI”). */
+const AREA_CONNECTOR_STOP = new Set(["y", "e", "o", "u"]);
+
 const AREA_STOP_WORDS = new Set([
   "area",
   "areas",
@@ -2461,6 +2487,23 @@ const AREA_STOP_WORDS = new Set([
   "ahora",
   "quiero",
   "me",
+  // Cortesía / relleno
+  "ok",
+  "okay",
+  "okey",
+  "vale",
+  "gracias",
+  "muchas",
+  "favor",
+  "listo",
+  "ya",
+  "hola",
+  "hey",
+  "claro",
+  "perfecto",
+  "bien",
+  "bueno",
+  ...AREA_CONNECTOR_STOP,
 ]);
 
 function looksLikeAreaQuery(plain: string) {
@@ -2569,7 +2612,8 @@ function extractAreaNeedle(
   const raw = (afterArea?.[1] || user)
     .split(/\s+/)
     .filter((t, i, toks) => {
-      if (AREA_STOP_WORDS.has(t)) return false;
+      if (AREA_PROTECTED_ACRONYMS.has(t)) return true;
+      if (AREA_STOP_WORDS.has(t) || AREA_CONNECTOR_STOP.has(t)) return false;
       // Abreviaturas cortas (RH, TI, TICs…) sí cuentan.
       if (t.length <= 1) return false;
       if (t.length === 2 && !/^[a-z]{2}$/.test(t)) return false;
@@ -2628,6 +2672,32 @@ function rowsForAreaNeedle(
     if (out.length >= limit) break;
     if (!String(row.etiqueta ?? "").trim()) continue;
     if (areaMatchesNeedle(String(row.area ?? ""), n)) out.push(row);
+  }
+  return out;
+}
+
+/** Filas del área con match exacto (QR / listado estricto; no mezcla otras áreas). */
+function rowsForAreaExact(
+  inventory: InventarioRow[],
+  areaName: string,
+  limit: number,
+): InventarioRow[] {
+  const want = normalizePlain(areaName);
+  if (!want) return [];
+  // Resolver sigla (rh → Recursos Humanos) vía catálogo, luego igualdad exacta.
+  const catalog = getAllAreaCatalog(inventory);
+  const resolved =
+    catalog.find((c) => c.norm === want)?.name ||
+    catalog.find((c) => areaAcronym(c.norm) === want)?.name ||
+    catalog.find((c) => areaMatchesNeedle(c.name, want) && c.norm.includes(want))
+      ?.name ||
+    areaName;
+  const wantExact = normalizePlain(resolved);
+  const out: InventarioRow[] = [];
+  for (const row of inventory) {
+    if (out.length >= limit) break;
+    if (!String(row.etiqueta ?? "").trim()) continue;
+    if (normalizePlain(String(row.area ?? "")) === wantExact) out.push(row);
   }
   return out;
 }
@@ -3010,6 +3080,22 @@ const AREA_QUERY_STOP_WORDS = new Set([
   "listado",
   "visor",
   "bienes",
+  "ok",
+  "okay",
+  "okey",
+  "vale",
+  "gracias",
+  "muchas",
+  "listo",
+  "ya",
+  "hola",
+  "hey",
+  "claro",
+  "perfecto",
+  "bien",
+  "bueno",
+  "y",
+  "e",
 ]);
 
 const ORDINAL_INDEX_MAP: Record<string, number> = {
@@ -3146,6 +3232,10 @@ function matchSingleAreaVocabularyToken(
   allAreaTokens: Set<string>,
 ): AreaTokenMatch | null {
   if (!rawTok) return null;
+  // Nunca tratar conectores (“y” de “Sistemas y TI”) como aguja de búsqueda.
+  if (AREA_CONNECTOR_STOP.has(rawTok) && !AREA_PROTECTED_ACRONYMS.has(rawTok)) {
+    return null;
+  }
   if (allAreaTokens.has(rawTok)) return { token: rawTok, confidence: "exact" };
   // Prefijo o singular/plural simple (ej. "cubiculos" -> "cubiculo", "salas" -> "sala")
   if (rawTok.endsWith("s") && rawTok.length > 3) {
@@ -3223,11 +3313,22 @@ function extractAreaQueryTokens(
     .split(" ")
     .filter((tok, idx, arr) => {
       if (!tok) return false;
-      if (AREA_QUERY_STOP_WORDS.has(tok)) return false;
+      // TI / RH siempre se conservan.
+      if (AREA_PROTECTED_ACRONYMS.has(tok)) return true;
+      if (AREA_QUERY_STOP_WORDS.has(tok) || AREA_CONNECTOR_STOP.has(tok)) {
+        return false;
+      }
+      if (INTENT_DISCOURSE_LOCK.has(tok)) return false;
       if (tok === "general" && arr[idx - 1] === "inventario") return false;
       return true;
     });
-  if (!rawTokens.length) return null;
+  // Solo conectores / vacío tras limpiar → consulta general (no «Coincidencias: y»).
+  if (
+    !rawTokens.length ||
+    rawTokens.every((t) => AREA_CONNECTOR_STOP.has(t) && !AREA_PROTECTED_ACRONYMS.has(t))
+  ) {
+    return null;
+  }
 
   // Alias semántico: "biblioteca vieja" / "biblioteca antigua" -> EDIF. B BIBLIOTECA
   if (
@@ -3413,12 +3514,13 @@ function findMatchingAreasForPrompt(
   ) {
     return undefined;
   }
-  // Ranking general de todas las áreas ("todas las áreas", "qué áreas hay")
+  // Ranking general de todas las áreas ("todas las áreas", "okey dame areas y gracias")
   if (
-    intentHas(n, "areas", "area") &&
-    (intentHas(n, "todas", "todos", "ranking", "distribucion", "desglose") ||
-      /^(que|cuales|cuantas)\s+areas\s+(hay|existen|tiene)/.test(n) ||
-      /^(areas|por areas)$/.test(n))
+    wantsGlobalAreasRanking(userText) ||
+    (intentHas(n, "areas", "area") &&
+      (intentHas(n, "todas", "todos", "ranking", "distribucion", "desglose") ||
+        /^(que|cuales|cuantas)\s+areas\s+(hay|existen|tiene)/.test(n) ||
+        /^(areas|por areas)$/.test(n)))
   ) {
     return undefined;
   }
@@ -4088,6 +4190,8 @@ function resolvePendingDisambiguation(
 function looksLikeDeleteRecordAsk(userText: string) {
   const n = normalizeChatIntent(userText);
   if (!n || isNonConcreteChatAsk(userText)) return false;
+  if (isCasualThanksOrClosingAck(userText)) return false;
+  if (looksLikeDeleteDeixisSingular(userText)) return true;
   const deleteVerb =
     /\b(elimina|eliminar|elimine|eliminaras|borra|borrar|borre|quita|quitar|suprimir)\b/.test(
       n,
@@ -4098,6 +4202,24 @@ function looksLikeDeleteRecordAsk(userText: string) {
     /\b(registro|registros|etiqueta|etiquetas|articulo|articulos|equipo|equipos|este|esta|ese|esa|uno|un)\b/.test(
       n,
     ) || /\b\d{3,}\b/.test(n)
+  );
+}
+
+/** “sí / confirmar borrado / elimínala / adelante” sobre plan pendiente. */
+function isPendingDeleteConfirmCue(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (
+    /^(si|sip|sep|dale|ok|okay|okey|vale|claro|adelante|procede|hazlo|confirmo)([.!\s]*)$/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /\b(confirmar?\s+(el\s+)?borrado|confirma(\s+el)?\s+borrado|eliminar?\s*(la|lo|las|los)?|borra(r|la|lo)?)\b/.test(
+      n,
+    ) && n.split(/\s+/).length <= 5
   );
 }
 
@@ -4579,10 +4701,18 @@ function looksLikeRecordMutationAsk(userText: string) {
 function shouldKeepLocalWritePipeline(
   userText: string,
   inventory: InventarioRow[],
-  opts?: { pendingNewInventario?: boolean; pendingCopyEtiquetaDest?: boolean },
+  opts?: {
+    pendingNewInventario?: boolean;
+    pendingCopyEtiquetaDest?: boolean;
+    pendingChatImport?: boolean;
+  },
 ): boolean {
   if (opts?.pendingNewInventario) return true;
   if (opts?.pendingCopyEtiquetaDest) return true;
+  // Excel pendiente + frase afirmativa → no mandar al agente.
+  if (opts?.pendingChatImport && isExplicitImportConfirm(userText)) return true;
+  // “gracias” / acuse → local (evita que el agente reabra borrado BE residual).
+  if (isCasualThanksOrClosingAck(userText)) return true;
   if (looksLikeRecordMutationAsk(userText)) return true;
   if (looksLikeDeleteRecordAsk(userText) || looksLikeDeleteInventoryAsk(userText)) {
     return true;
@@ -4611,12 +4741,13 @@ function shouldKeepLocalWritePipeline(
   ) {
     return true;
   }
+  if (detectMultiSourceCopyToInventarioAsk(userText, origens)) return true;
   if (detectBulkCopyBetweenInventariosAsk(userText, origens)) return true;
   if (detectBulkCopyAllOthersToInventarioAsk(userText, origens)) return true;
   if (detectCopyEtiquetasToInventarioAsk(userText, origens)) return true;
   if (detectCopyEtiquetaNeedsDestAsk(userText, origens)) return true;
   if (detectCopyPersonRecordsToInventarioAsk(userText, origens)) return true;
-  if (detectListInventariosAsk(userText)) return true;
+  // Listar inventarios → agente (respuesta natural + visor).
   if (detectBulkTransferAsk(userText)) return true;
   if (looksLikeInventarioMultiAsk(userText)) return true;
   return false;
@@ -5528,11 +5659,15 @@ const INTENT_DISCOURSE_LOCK = new Set([
   "hey",
   "ok",
   "okay",
+  "okey",
   "vale",
   "bueno",
   "bien",
   "claro",
   "listo",
+  "ya",
+  "gracias",
+  "muchas",
   "ahora",
   "entonces",
   "pues",
@@ -5545,6 +5680,8 @@ const INTENT_DISCOURSE_LOCK = new Set([
   "lo",
   "la",
   "de",
+  "y",
+  "e",
   "dije",
   "dicho",
 ]);
@@ -6127,11 +6264,17 @@ function detectAreaPersonasAsk(
   const n = normalizeChatIntent(userText);
   if (!n || !inventory.length) return undefined;
   if (looksLikeRecordMutationAsk(userText)) return undefined;
+  if (userAskedQr(userText)) return undefined;
+  // “nombres de las áreas” = ranking de áreas.
+  if (/\bnombres?\s+de\s+(las\s+)?areas?\b/.test(n)) return undefined;
   if (
-    !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
+    !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres") &&
+    !/\b(nombres?|personas?|quien|quienes)\b/.test(n)
   ) {
     return undefined;
   }
+  // “dame los nombres” solo (sin personas/área) → desambiguación global, no aquí.
+  if (isAmbiguousNombresAsk(userText)) return undefined;
   if (
     !intentHas(
       n,
@@ -6150,7 +6293,8 @@ function detectAreaPersonasAsk(
       "quien",
       "quienes",
     ) &&
-    !/\bquien(es)?\b/.test(n)
+    !/\bquien(es)?\b/.test(n) &&
+    !/\bnombres?\b/.test(n)
   ) {
     return undefined;
   }
@@ -6198,10 +6342,16 @@ function detectAreaPersonasAsk(
   }
 
   // Needle suelto con typo aunque findMatchingAreas falló por tokens basura.
+  // Conservar siglas TI/RH (2 chars) aunque el filtro genérico pida ≥3.
   const plain = normalizePlain(userText);
   const toks = plain
     .split(" ")
-    .filter((t) => t.length >= 3 && !AREA_QUERY_STOP_WORDS.has(t) && !PERSON_STOP_WORDS.has(t));
+    .filter(
+      (t) =>
+        (AREA_PROTECTED_ACRONYMS.has(t) || t.length >= 3) &&
+        !AREA_QUERY_STOP_WORDS.has(t) &&
+        !PERSON_STOP_WORDS.has(t),
+    );
   const allAreaTokens = new Set<string>();
   for (const c of catalog) for (const t of c.tokens) allAreaTokens.add(t);
   const fuzzyHits: AreaCandidateSummary[] = [];
@@ -6287,11 +6437,10 @@ function detectOrigenPersonasAsk(
   const n = normalizeChatIntent(userText);
   if (!n || !inventory.length) return undefined;
   if (looksLikeRecordMutationAsk(userText)) return undefined;
-  if (
-    !intentHas(n, "persona", "personas", "quien", "quienes", "nombre", "nombres")
-  ) {
+  if (!intentHas(n, "persona", "personas", "quien", "quienes")) {
     return undefined;
   }
+  if (isAmbiguousNombresAsk(userText)) return undefined;
   if (
     !intentHas(
       n,
@@ -6747,36 +6896,15 @@ function buildLocalOverviewReply(
   }
 
   if (overview === "personas") {
-    const topPeople = [...personCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8);
-    const namesProse = topPeople.length
-      ? topPeople
-          .map(([name, count]) => `**${name}** (${fmt(count)})`)
-          .join(", ")
-      : "";
-    const more =
-      personCounts.size > topPeople.length
-        ? ` y **${fmt(personCounts.size - topPeople.length)}** más`
+    // Fallback corto: el texto natural lo arma polishInventoryReply / el agente.
+    const scopeBit =
+      focus && !/^(todo el inventario|inventario general)$/i.test(focus)
+        ? ` en **${scopeTitle}**`
         : "";
-    const wantsNames =
-      /\b(nombres?|esas?\s+\d+\s+personas|quienes|listar?|dame|muestra)\b/.test(
-        ask,
-      );
-    if (wantsNames && namesProse) {
-      return pickChatVariant(
-        [
-          `Estas son las **${fmt(personCounts.size)}** personas de **${scopeTitle}**: ${namesProse}${more}. El ranking completo está en el cuadro de incidencias. ¿Abrimos el inventario de alguien?`,
-          `Hay **${fmt(personCounts.size)}** personas con equipo (**${fmt(total)}** registros). Empiezan: ${namesProse}${more}. Mira la plantilla de personas a la derecha o dime un nombre.`,
-          `Listo: **${fmt(personCounts.size)}** asignaciones en **${scopeTitle}**. ${namesProse}${more}. ¿Ver más en el panel o filtrar a una persona?`,
-        ],
-        `personas:${personCounts.size}`,
-      );
-    }
     return (
-      `En **${scopeTitle}** hay **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"} ` +
-      `con equipo asignado (**${fmt(total)}** registros). ` +
-      `Te abrí la plantilla de personas; dime un nombre para ver su inventario.`
+      `Encontré **${fmt(personCounts.size)}** persona${personCounts.size === 1 ? "" : "s"}` +
+      `${scopeBit} (**${fmt(total)}** registros). ` +
+      `El detalle está a la derecha; dime un nombre si quieres ver su inventario.`
     );
   }
 
@@ -6832,6 +6960,23 @@ function wantsPersonAreasBreakdown(userText: string): boolean {
   );
 }
 
+/** Quita cortesía/conectores; conserva siglas TI/RH. */
+function stripAreaAskFillerTokens(user: string): string {
+  return user
+    .split(/\s+/)
+    .filter((t) => {
+      if (!t) return false;
+      if (AREA_PROTECTED_ACRONYMS.has(t)) return true;
+      if (AREA_QUERY_STOP_WORDS.has(t) || AREA_CONNECTOR_STOP.has(t)) {
+        return false;
+      }
+      if (INTENT_DISCOURSE_LOCK.has(t)) return false;
+      return true;
+    })
+    .join(" ")
+    .trim();
+}
+
 /** Pedido de ranking global de áreas (todas / en general / qué áreas hay). */
 function wantsGlobalAreasRanking(userText: string): boolean {
   const user = normalizeChatIntent(userText);
@@ -6848,6 +6993,17 @@ function wantsGlobalAreasRanking(userText: string): boolean {
   if (/\b(registro|registros|etiqueta|etiquetas)\s+(de|del|en)\b/.test(user)) {
     return false;
   }
+  // “okey dame areas y gracias” / “dame las áreas por favor” → ranking global.
+  if (/\bareas?\b/.test(user)) {
+    const stripped = stripAreaAskFillerTokens(user);
+    if (
+      !stripped ||
+      /^(areas?)$/.test(stripped) ||
+      AREA_CONNECTOR_STOP.has(stripped)
+    ) {
+      return true;
+    }
+  }
   return (
     /^(equipos?|articulos?|registros?)\s+por\s+areas?$/.test(user) ||
     /\bareas?\s+en\s+general\b/.test(user) ||
@@ -6862,6 +7018,147 @@ function wantsGlobalAreasRanking(userText: string): boolean {
   );
 }
 
+/** Listado plano etiquetas/registros (no plantilla persona/área/panorama). */
+function isEtiquetasRegistrosListAsk(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  if (/\bnombres?\s+de\s+(los\s+)?articulos?\b/.test(n)) return true;
+  if (/^ver\s+registros?\b/.test(n) || n === "ver registros") return true;
+  // “etiquetas/registros de X” (persona/área) → no listado global.
+  if (/\b(etiquetas?|registros?)\s+de\b/.test(n)) return false;
+  if (/\b(panorama|resumen|metricas?|ranking|compar\w*)\b/.test(n)) {
+    return false;
+  }
+  return (
+    /\b(etiquetas?|registros?|regsitros?|regsitro\w*)\b/.test(n) &&
+    !/\b(personas?|areas?)\b/.test(n)
+  );
+}
+
+/** “dame los nombres” sin personas/áreas/artículos → desambiguar, no abrir visor. */
+function isAmbiguousNombresAsk(userText: string): boolean {
+  const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  const mentionsNombres =
+    /^(los\s+)?nombres?\b/.test(n) ||
+    /\b(dame|muestra|muestrame|ensena|ensename|lista|listar|ver|trae|dime)\s+(los\s+)?nombres?\b/.test(
+      n,
+    ) ||
+    /\blos\s+nombres?\b/.test(n);
+  if (!mentionsNombres) return false;
+  if (
+    /\b(personas?|areas?|articulos?|equipos?|registros?|etiquetas?|marcas?)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  if (/\bnombres?\s+de\s+(esas?\s+)?(las\s+)?personas?\b/.test(n)) {
+    return false;
+  }
+  return true;
+}
+
+function inferNombresThreadHint(
+  recent: Array<{ from: string; text?: string; viewerOverview?: string }>,
+): "personas" | "areas" | "articulos" | null {
+  for (let i = recent.length - 1; i >= 0; i -= 1) {
+    const m = recent[i];
+    const ov = String(m.viewerOverview || "");
+    if (ov === "personas" || ov === "personTotal" || ov === "personMatches") {
+      return "personas";
+    }
+    if (ov === "areas" || ov === "areaTotal" || ov === "areaMatches") {
+      return "areas";
+    }
+    if (!ov && m.from === "bot") {
+      // Listado etiquetas sin overview
+      const t = normalizeChatIntent(String(m.text || ""));
+      if (/\b(etiqueta|etiquetas|articulo|articulos|registro|registros)\b/.test(t)) {
+        return "articulos";
+      }
+    }
+    const t = normalizeChatIntent(String(m.text || ""));
+    if (/\bpersonas?\b/.test(t) && !/\bareas?\b/.test(t)) return "personas";
+    if (/\bareas?\b/.test(t) && !/\bpersonas?\b/.test(t)) return "areas";
+    if (/\b(articulos?|etiquetas?|registros?)\b/.test(t)) return "articulos";
+  }
+  return null;
+}
+
+function buildAmbiguousNombresAskReply(
+  hint: "personas" | "areas" | "articulos" | null,
+): string {
+  if (hint === "personas") {
+    return (
+      "Tengo nombres de **personas**, **áreas** y **artículos**. " +
+      "Como veníamos viendo lo de personas, ¿quieres los nombres de las **personas** " +
+      "o prefieres los de **áreas** o **artículos**?"
+    );
+  }
+  if (hint === "areas") {
+    return (
+      "Tengo nombres de **personas**, **áreas** y **artículos**. " +
+      "Como veníamos con áreas, ¿te muestro los nombres de las **áreas** " +
+      "o prefieres **personas** o **artículos**?"
+    );
+  }
+  if (hint === "articulos") {
+    return (
+      "Tengo nombres de **personas**, **áreas** y **artículos**. " +
+      "Como veníamos con artículos/etiquetas, ¿quieres esos nombres " +
+      "o prefieres **personas** o **áreas**?"
+    );
+  }
+  return (
+    "Tengo nombres de **personas**, **áreas** y **artículos**. " +
+    "¿Cuáles te muestro?"
+  );
+}
+
+function resolveNombresClarifyChoice(
+  userText: string,
+  hint: "personas" | "areas" | "articulos" | null,
+): "personas" | "areas" | "articulos" | null {
+  const n = normalizeChatIntent(userText);
+  if (!n) return null;
+  // Texto visible de chips / frases naturales.
+  if (
+    /\bnombres?\s+de\s+(los\s+)?articulos?\b/.test(n) ||
+    /^(los\s+)?articulos?\b/.test(n) ||
+    (/\barticulos?\b/.test(n) && !/\bpersonas?\b/.test(n) && !/\bareas?\b/.test(n))
+  ) {
+    return "articulos";
+  }
+  if (
+    /\bnombres?\s+de\s+(las\s+)?areas?\b/.test(n) ||
+    /^(las\s+)?areas?\b/.test(n) ||
+    (/\bareas?\b/.test(n) && !/\bpersonas?\b/.test(n) && !/\barticulos?\b/.test(n))
+  ) {
+    return "areas";
+  }
+  if (
+    /\bnombres?\s+de\s+(las\s+)?personas?\b/.test(n) ||
+    /^(las\s+)?personas?\b/.test(n) ||
+    (/\bpersonas?\b/.test(n) && !/\bareas?\b/.test(n) && !/\barticulos?\b/.test(n))
+  ) {
+    return "personas";
+  }
+  // “Ver registros” → listado etiquetas (no elección de nombres).
+  if (isEtiquetasRegistrosListAsk(userText)) {
+    return null;
+  }
+  if (
+    /^(si|sip|sep|dale|ok|okay|okey|vale|claro|eso|esas|esos|ese|esa|los\s+mismos|las\s+mismas)([.!\s]*)$/.test(
+      n,
+    ) ||
+    /\b(si|dale|ok)\b.*\b(esos|esas|ese|esa|mismo|misma|personas?)\b/.test(n)
+  ) {
+    return hint;
+  }
+  return null;
+}
+
 function detectViewerOverview(userText: string): ViewerOverview | undefined {
   // Solo incidencia visual/contable (estilo Google): no en cada mensaje.
   const user = normalizeChatIntent(userText);
@@ -6869,8 +7166,31 @@ function detectViewerOverview(userText: string): ViewerOverview | undefined {
   // Atajos del home (sin nombres inventados tipo “Juan Pérez”).
   if (/^(busqueda|buscar)\s+por\s+personas?$/.test(user)) return "personas";
   if (/^(equipos?|articulos?|registros?)\s+por\s+areas?$/.test(user)) return "areas";
+  // Personas/nombres de un área concreta → plantilla Personas (con foco área).
+  if (
+    /\b(nombres?|personas?|quien|quienes)\b/.test(user) &&
+    (/\bareas?\b/.test(user) ||
+      /\b(de|del|en)\s+(ti|rh|rrhh|sistemas|marketing|contabilidad|ventas|recursos)\b/.test(
+        user,
+      )) &&
+    !/\bnombres?\s+de\s+(las\s+)?areas?\b/.test(user)
+  ) {
+    return "personas";
+  }
+  // Área concreta (“área de TI / RH”) ≠ ranking global de áreas.
+  if (
+    /\b(de|del|en)\s+(ti|rh|rrhh|sistemas|marketing|contabilidad|recursos)\b/.test(
+      user,
+    ) ||
+    /\bareas?\s+(de|del)\s+[a-z0-9]{2,}/.test(user)
+  ) {
+    return undefined;
+  }
   // “areas en general” / “ranking de áreas” (también sin verbo dame).
   if (wantsGlobalAreasRanking(userText)) return "areas";
+  // Chips: “Nombres de áreas” / “Nombres de personas”.
+  if (/^nombres?\s+de\s+(las\s+)?areas?\b/.test(user)) return "areas";
+  if (/^nombres?\s+de\s+(las\s+)?personas?\b/.test(user)) return "personas";
   const turn = analyzeTurnQuick(userText);
   // Escritura / corrección / muletillas: nunca ranking personas/áreas/estado.
   if (turn.isWriteTurn || turn.discourseOnly || looksLikeRecordMutationAsk(userText)) {
@@ -7746,11 +8066,26 @@ function inferSideFromAgentResult(
   const apiTipo = String(apiViewer?.tipo || "").trim().toLowerCase();
   const apiValor = String(apiViewer?.valor || "").trim();
 
-  // Ranking global de áreas gana sobre un área puntual del turno anterior.
+  // Listado etiquetas/registros → plantilla Etiquetas (nunca persona/área).
   if (
-    overviewAsk === "areas" ||
-    apiTipo === "areas" ||
-    apiTipo === "areas_general"
+    isEtiquetasRegistrosListAsk(userText) ||
+    apiTipo === "etiquetas" ||
+    apiTipo === "registros"
+  ) {
+    return {
+      resultItems,
+      qr,
+      viewerOverview: undefined,
+      viewerFocus: undefined,
+    };
+  }
+
+  // Ranking global de áreas — no si el hint/API ya es un área concreta.
+  if (
+    apiTipo !== "area" &&
+    (overviewAsk === "areas" ||
+      apiTipo === "areas" ||
+      apiTipo === "areas_general")
   ) {
     return {
       resultItems: [],
@@ -7899,7 +8234,14 @@ function inferSideFromAgentResult(
       viewerFocus: topMarca,
     };
   }
-  if (focusHint && resultItems.length) {
+  // No reutilizar foco de origen/excel como “persona”.
+  if (
+    focusHint &&
+    resultItems.length &&
+    !/^(inventario\s*\d+|excel\s*\d+|csv\s*\d+|xls\s*\d+|xlsx\s*\d+|todo el inventario)$/i.test(
+      focusHint,
+    )
+  ) {
     return {
       resultItems,
       qr,
@@ -7948,10 +8290,12 @@ function buildContextualFollowUpsFromReply(
   }
 
   const ups: ChatFollowUp[] = [];
-  const add = (label: string, prompt: string) => {
-    if (!label || !prompt || ups.length >= 3) return;
-    if (ups.some((u) => u.prompt.toLowerCase() === prompt.toLowerCase())) return;
-    ups.push({ label, prompt });
+  const add = (label: string, prompt?: string) => {
+    // El click envía chip.label; prompt = label para no sustituir el texto.
+    const text = String(label || "").trim();
+    if (!text || ups.length >= 3) return;
+    if (ups.some((u) => u.label.toLowerCase() === text.toLowerCase())) return;
+    ups.push({ label: text, prompt: text });
   };
 
   const boldToks = [...reply.matchAll(/\*\*([^*]{2,60})\*\*/g)].map((m) =>
@@ -7989,28 +8333,28 @@ function buildContextualFollowUpsFromReply(
     /\bbaja\b/.test(estadoFold);
 
   if (etq && rows.length <= 3) {
-    add(`Exportar etiqueta ${etq}`, `exporta a excel solo la etiqueta ${etq}`);
-    add(`Generar QR de ${etq}`, `genera el código QR de la etiqueta ${etq}`);
+    add(`Exportar etiqueta ${etq}`);
+    add(`Generar QR de ${etq}`);
     if (estadoBad) {
-      add("Cambiar estado a Activo", `cambia el estado de ${etq} a Activo`);
+      add(`Cambiar estado de ${etq} a Activo`);
     } else {
-      add("Reasignar equipo", `reasigna la etiqueta ${etq} a otra persona`);
+      add(`Reasignar etiqueta ${etq}`);
     }
     return ups;
   }
 
   if (persona && rows.length >= 2) {
     const short = persona.split(/\s+/).slice(0, 2).join(" ");
-    add(`Exportar lista de ${short}`, `exporta ${persona} a excel`);
-    add("Ver desglose por área", `en qué áreas está ${persona}`);
-    add(`Generar QR de ${short}`, `genera QR de ${persona}`);
+    add(`Exportar lista de ${short}`);
+    add(`Áreas de ${persona}`);
+    add(`Generar QR de ${short}`);
     return ups;
   }
 
   if (estadoBad) {
-    add("Cambiar estado a Activo", "cambia el estado de estos a Activo");
-    add("Reasignar equipo", "reasigna estos equipos a otra persona");
-    add("Exportar Excel", "exporta estos registros a excel");
+    add("Cambiar estado a Activo");
+    add("Reasignar equipo");
+    add("Exportar Excel");
     return ups;
   }
 
@@ -8053,12 +8397,31 @@ function ChatSuggestedActions({
           key={`${messageId}-${chip.prompt}`}
           type="button"
           className="chat-follow-up"
-          onClick={() => onPick(chip.prompt)}
+          onClick={() => onPick(chip.label)}
         >
           {chip.label}
         </button>
       ))}
     </div>
+  );
+}
+
+/** Chips de nombres: label === prompt (el chat envía el texto visible). */
+const NOMBRES_FOLLOW_UPS: ChatFollowUp[] = [
+  { label: "Nombres de personas", prompt: "Nombres de personas" },
+  { label: "Nombres de artículos", prompt: "Nombres de artículos" },
+  { label: "Nombres de áreas", prompt: "Nombres de áreas" },
+  { label: "Ver registros", prompt: "Ver registros" },
+];
+
+function looksLikeNombresClarifyReply(replyText?: string): boolean {
+  const f = normalizeChatIntent(replyText || "");
+  if (!f) return false;
+  return (
+    /\bnombres?\b/.test(f) &&
+    /\bpersonas?\b/.test(f) &&
+    /\bareas?\b/.test(f) &&
+    /\b(articulos?|etiquetas?)\b/.test(f)
   );
 }
 
@@ -8074,6 +8437,19 @@ function buildChatFollowUps(
   replyText?: string,
 ): ChatFollowUp[] {
   const overview = side?.viewerOverview;
+  const focus = String(side?.viewerFocus || "").trim();
+  const hasItems = (side?.resultItems?.length || 0) > 0;
+  const hasQr = (side?.qr?.length || 0) > 0;
+  const n = normalizeChatIntent(userText || "");
+
+  // Desambiguación de nombres → opciones exactas a elegir.
+  if (
+    looksLikeNombresClarifyReply(replyText) ||
+    isAmbiguousNombresAsk(userText || "")
+  ) {
+    return NOMBRES_FOLLOW_UPS;
+  }
+
   // Rankings globales: no inferir chips de un área/persona mencionada en el texto.
   const skipContextual =
     overview === "areas" ||
@@ -8091,124 +8467,97 @@ function buildChatFollowUps(
     if (contextual.length) return contextual;
   }
 
-  const focus = String(side?.viewerFocus || "").trim();
-  const hasItems = (side?.resultItems?.length || 0) > 0;
-  const hasQr = (side?.qr?.length || 0) > 0;
-  const n = normalizeChatIntent(userText || "");
-  const justAskedAreas = /\bare+as?\b/.test(n);
   const ups: ChatFollowUp[] = [];
 
-  if (overview === "areas") {
-    ups.push(
-      { label: "Personas", prompt: "dame el ranking de personas" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Exportar Excel", prompt: "exporta el inventario a excel" },
-    );
-  } else if (overview === "recent") {
-    ups.push(
-      { label: "Generar QR", prompt: "genera códigos QR de estos registros" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
-      { label: "Equipos por área", prompt: "equipos por área" },
-      { label: "Exportar Excel", prompt: "exporta estos registros a excel" },
-    );
-  } else if (overview === "personTotal" && focus) {
-    ups.push(
-      { label: "Ver etiquetas", prompt: `dame las etiquetas de ${focus}` },
-      { label: "Generar QR", prompt: `genera QR de ${focus}` },
-      { label: "Exportar Excel", prompt: `exporta ${focus} a excel` },
-    );
-    if (justAskedAreas) {
-      ups.push({
-        label: "Últimos registros",
-        prompt: "últimos registros",
-      });
-    } else {
-      ups.push({
-        label: "Áreas",
-        prompt: `en qué áreas está ${focus}`,
-      });
-    }
-  } else if (overview === "areaTotal" && focus) {
-    ups.push(
-      { label: "Personas del área", prompt: `quiénes hay en ${focus}` },
-      { label: "Generar QR", prompt: `genera QR de ${focus}` },
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Exportar Excel", prompt: `exporta ${focus} a excel` },
-    );
-  } else if (overview === "areaMatches" || overview === "personMatches") {
-    ups.push(
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
-      { label: "Equipos por área", prompt: "equipos por área" },
-    );
+  // label === prompt: el click envía el texto visible.
+  const chip = (label: string): ChatFollowUp => ({ label, prompt: label });
+
+  if (overview === "full" || overview === "stats") {
+    ups.push(...NOMBRES_FOLLOW_UPS);
   } else if (overview === "areas") {
     ups.push(
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
-      { label: "Exportar Excel", prompt: "exporta el inventario a excel" },
+      chip("Nombres de personas"),
+      chip("Nombres de artículos"),
+      chip("Últimos registros"),
+      chip("Ver registros"),
     );
   } else if (overview === "personas") {
     ups.push(
-      { label: "Equipos por área", prompt: "equipos por área" },
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
+      chip("Nombres de áreas"),
+      chip("Nombres de artículos"),
+      chip("Últimos registros"),
+      chip("Ver registros"),
+    );
+  } else if (overview === "recent") {
+    ups.push(
+      chip("Nombres de personas"),
+      chip("Nombres de áreas"),
+      chip("Generar QR de estos registros"),
+      chip("Exportar estos registros a excel"),
+    );
+  } else if (overview === "personTotal" && focus) {
+    ups.push(
+      chip(`Áreas de ${focus}`),
+      chip(`Artículos de ${focus}`),
+      chip("Nombres de personas"),
+      chip("Ver registros"),
+    );
+  } else if (overview === "areaTotal" && focus) {
+    ups.push(
+      chip(`Personas de ${focus}`),
+      chip(`Artículos de ${focus}`),
+      chip("Nombres de personas"),
+      chip("Ver registros"),
+    );
+  } else if (overview === "areaMatches" || overview === "personMatches") {
+    ups.push(
+      chip("Nombres de personas"),
+      chip("Nombres de áreas"),
+      chip("Últimos registros"),
+      chip("Ver registros"),
     );
   } else if (overview === "marcas") {
     ups.push(
-      { label: "Equipos por área", prompt: "equipos por área" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
+      chip("Nombres de personas"),
+      chip("Nombres de áreas"),
+      chip("Últimos registros"),
+      chip("Ver registros"),
     );
   } else if (overview === "estado") {
     ups.push(
-      { label: "Activos", prompt: "muéstrame los activos" },
-      { label: "Inactivos", prompt: "muéstrame los inactivos" },
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Totales", prompt: "dame el resumen del inventario" },
+      chip("Activos"),
+      chip("Inactivos"),
+      chip("Nombres de personas"),
+      chip("Ver registros"),
     );
   } else if (hasQr) {
     ups.push(
-      { label: "Más registros", prompt: "últimos registros" },
-      { label: "Buscar otra etiqueta", prompt: "buscar por etiqueta" },
-      { label: "Exportar Excel", prompt: "exporta esto a excel" },
+      chip("Ver registros"),
+      chip("Nombres de personas"),
+      chip("Exportar esto a excel"),
     );
   } else if (hasItems) {
     const person = majorityItemField(side?.resultItems || [], "persona");
     const area = majorityItemField(side?.resultItems || [], "area");
-    if (person) {
+    if (person && !/\b(todo el inventario|inventario general)\b/i.test(focus)) {
       ups.push(
-        { label: "Ver etiquetas", prompt: `dame las etiquetas de ${person}` },
-        { label: "Generar QR", prompt: `genera QR de ${person}` },
-        { label: "Exportar Excel", prompt: `exporta ${person} a excel` },
-        { label: "Áreas", prompt: `en qué áreas está ${person}` },
+        chip(`Áreas de ${person}`),
+        chip(`Artículos de ${person}`),
+        chip("Nombres de personas"),
+        chip("Ver registros"),
       );
-    } else if (area) {
+    } else if (area && n.includes("area")) {
       ups.push(
-        { label: "Personas del área", prompt: `quiénes hay en ${area}` },
-        { label: "Generar QR", prompt: `genera QR de ${area}` },
-        { label: "Exportar Excel", prompt: `exporta ${area} a excel` },
-        { label: "Últimos registros", prompt: "últimos registros" },
+        chip(`Personas de ${area}`),
+        chip(`Artículos de ${area}`),
+        chip("Nombres de áreas"),
+        chip("Ver registros"),
       );
     } else {
-      ups.push(
-        { label: "Generar QR", prompt: "genera QR de estas etiquetas" },
-        { label: "Exportar Excel", prompt: "exporta esto a excel" },
-        { label: "Últimos registros", prompt: "últimos registros" },
-        { label: "Buscar por persona", prompt: "buscar por persona" },
-      );
+      ups.push(...NOMBRES_FOLLOW_UPS);
     }
   } else {
-    ups.push(
-      { label: "Últimos registros", prompt: "últimos registros" },
-      { label: "Buscar por persona", prompt: "buscar por persona" },
-      { label: "Equipos por área", prompt: "equipos por área" },
-      { label: "Ideas de consulta", prompt: "ideas de consulta" },
-    );
+    ups.push(...NOMBRES_FOLLOW_UPS);
   }
 
   const seen = new Set<string>();
@@ -8950,6 +9299,27 @@ const InventoryTableRow = memo(function InventoryTableRow({
           : "Haz clic para ver detalles y opciones de este artículo"
       }
     >
+      {selectMode ? (
+        <td className="col-select">
+          <button
+            type="button"
+            className={isChecked ? "rep-checkbox-btn is-checked" : "rep-checkbox-btn"}
+            aria-label={
+              isChecked
+                ? `Deseleccionar ${textOf(row.etiqueta) || "artículo"}`
+                : `Seleccionar ${textOf(row.etiqueta) || "artículo"}`
+            }
+            aria-checked={isChecked}
+            disabled={!hasId}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (hasId) onToggle(rowId);
+            }}
+          >
+            {isChecked ? <Check size={12} strokeWidth={3} /> : null}
+          </button>
+        </td>
+      ) : null}
       {COLUMNS.map(([key, label]) => (
         <td
           key={label}
@@ -8967,17 +9337,7 @@ const InventoryTableRow = memo(function InventoryTableRow({
                 : undefined
           }
         >
-          {key === "etiqueta" && selectMode ? (
-            <span className="table-select-cell">
-              <span
-                className={isChecked ? "rep-checkbox-btn is-checked" : "rep-checkbox-btn"}
-                aria-hidden="true"
-              >
-                {isChecked ? <Check size={12} strokeWidth={3} /> : null}
-              </span>
-              <span>{textOf(row.etiqueta) || "—"}</span>
-            </span>
-          ) : key === "persona" && textOf(row.persona) ? (
+          {key === "persona" && textOf(row.persona) ? (
             <span className="person-cell">
               <span
                 className="avatar"
@@ -9577,6 +9937,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const chatAttachRef = useRef<HTMLDivElement>(null);
   const chatImageInputRef = useRef<HTMLInputElement>(null);
   const chatFileInputRef = useRef<HTMLInputElement>(null);
+  const chatInputRef = useRef<HTMLInputElement>(null);
+  const prevChatComposerBusyRef = useRef(false);
   const chatId = useRef(1);
   const messagesRef = useRef<ChatMessage[]>([]);
   const activeChatIdRef = useRef<string | null>(null);
@@ -9588,11 +9950,23 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const pendingFixContextRef = useRef<PendingFixContext | null>(null);
   const pendingBulkTransferRef = useRef<PendingBulkTransfer | null>(null);
   const pendingDisambiguationRef = useRef<PendingDisambiguationState | null>(null);
+  /** “dame los nombres” → esperar personas|áreas|artículos. */
+  const pendingNombresClarifyRef = useRef<{
+    askedAt: number;
+    hint: "personas" | "areas" | "articulos" | null;
+  } | null>(null);
+  /**
+   * Destino pendiente tras “preparo Inventario N” (pendingTargetInventory).
+   * El siguiente turno de relleno usa este nombre como destino obligatorio.
+   */
   const pendingNewInventarioRef = useRef<PendingNewInventario | null>(null);
-  /** Confirmación: meter todos los demás inventarios → destino. */
+  const pendingTargetInventoryRef = pendingNewInventarioRef;
+  /** Confirmación: meter orígenes (y/o etiquetas) → destino. */
   const pendingOrigenMergeRef = useRef<{
     dest: string;
     sources: string[];
+    etiquetas?: string[];
+    createDest?: boolean;
     askedAt: number;
   } | null>(null);
   /** Tras “pásala a un inventario”: esperando destino nuevo/existente. */
@@ -9607,6 +9981,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     viewerOverview?: ViewerOverview;
     viewerFocus?: string;
   } | null>(null);
+  /** Última área consultada (TI / RH…) para QR “de esta área”. */
+  const activeAreaContextRef = useRef<{ name: string; at: number } | null>(
+    null,
+  );
   const chatStarted = messages.some((message) => message.from === "user");
   const chatComposerBusy = useMemo(
     () =>
@@ -9617,6 +9995,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }),
     [messages],
   );
+  // Tras respuesta del asistente, devolver foco al input (evita clic manual).
+  useEffect(() => {
+    const wasBusy = prevChatComposerBusyRef.current;
+    prevChatComposerBusyRef.current = chatComposerBusy;
+    if (!wasBusy || chatComposerBusy) return;
+    if (
+      pendingChatDeletePlan?.phase === "modal" ||
+      isAddModalOpen ||
+      selectedProduct
+    ) {
+      return;
+    }
+    chatInputRef.current?.focus();
+  }, [
+    chatComposerBusy,
+    pendingChatDeletePlan?.phase,
+    isAddModalOpen,
+    selectedProduct,
+  ]);
   /**
    * Visor: último bot CON datos de panel.
    * La visibilidad real la controla sideViewerVisible (oculto al enviar / reiniciar;
@@ -9648,8 +10045,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const showSideViewer = Boolean(activeSideCompanion) && sideViewerVisible;
 
   /** Panel derecho activo → backend («de aquí»). */
-  const getContextoVista = (): ChatContextoVista | null =>
-    buildContextoVista({
+  const getContextoVista = (
+    userTextForDeixis?: string,
+  ): ChatContextoVista | null => {
+    const built = buildContextoVista({
       overview:
         activeSideCompanion?.overview ||
         lastConcreteSideRef.current?.viewerOverview,
@@ -9661,6 +10060,31 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ? activeSideCompanion.resultItems
           : lastConcreteSideRef.current?.resultItems) || [],
     });
+    if (built?.tipo === "area" && built.valor) return built;
+    // QR “de esta área”: priorizar área activa aunque el panel esté en ranking.
+    if (
+      userTextForDeixis &&
+      looksLikeAreaQrDeixis(userTextForDeixis)
+    ) {
+      const active = activeAreaContextRef.current;
+      if (active?.name && Date.now() - active.at < 30 * 60 * 1000) {
+        return { tipo: "area", valor: active.name };
+      }
+      const focus = String(
+        lastConcreteSideRef.current?.viewerFocus ||
+          activeSideCompanion?.overviewFocus ||
+          "",
+      ).trim();
+      if (
+        focus &&
+        (lastConcreteSideRef.current?.viewerOverview === "areaTotal" ||
+          activeSideCompanion?.overview === "areaTotal")
+      ) {
+        return { tipo: "area", valor: focus };
+      }
+    }
+    return built;
+  };
 
   const chatTurns = useMemo(() => {
     const turns: Array<
@@ -9900,8 +10324,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const meterId = `${provider}:${model}:${keyFingerprint}`;
       setTokenMeters((prev) => {
         const current = prev[meterId];
+        // Decaimiento suave ≈ ventana deslizante: no acumular 128k de por vida.
+        const decayed = Math.round((current?.used || 0) * 0.65);
         const nextEntry: TokenMeterEntry = {
-          used: (current?.used || 0) + turnTotal,
+          used: Math.min(budget, decayed + turnTotal),
           promptUsed: (current?.promptUsed || 0) + promptTokens,
           completionUsed: (current?.completionUsed || 0) + completionTokens,
           budget,
@@ -10895,26 +11321,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         return !/^(consultando el inventario|importando)\b/i.test(t);
       });
 
-  const asksChatFileImport = (value: string) => {
-    const t = value.trim();
-    if (!t) return false;
-    // Cubre importarte/subo/cómo subo/te voy a subir…
-    return (
-      /\b(import\w*|subir\w*|subo|subire|cargar\w*|adjunt\w*|pasarte|mandarte|enviarte)\b[\s\S]{0,60}\b(excel|csv|archivo|xlsx|xls)\b/i.test(
-        t,
-      ) ||
-      /\b(excel|csv|xlsx|xls|archivo)\b[\s\S]{0,60}\b(import\w*|subir\w*|subo|cargar\w*|adjunt\w*)\b/i.test(
-        t,
-      ) ||
-      /\b(como|cómo)\s+(subo|subir|importo|importar|cargo|cargar|adjunto)\b/i.test(
-        t,
-      ) ||
-      /\b(te\s+voy\s+a|voy\s+a|quiero)\b[\s\S]{0,40}\b(subir|importar|cargar|adjuntar|pasar|mandar)\b[\s\S]{0,40}\b(excel|csv|archivo|xlsx|xls)\b/i.test(
-        t,
-      )
-    );
-  };
-
   const CHAT_IMPORT_CHUNK = 100;
 
   const pendingImportAskedAtRef = useRef<number>(0);
@@ -10949,9 +11355,34 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setPendingBulkTransfer(transfer);
   };
 
+  /** Evita recuperar plan fantasma tras cancelar/borrar (p. ej. “gracias”). */
+  const deleteClosedAtRef = useRef(0);
+  /** Pista para el agente si hay pregunta intermedia con borrado pendiente. */
+  const deleteCollateralHintRef = useRef("");
+
+  /** Cancela pendiente BE sin tocar el plan FE (p. ej. “gracias” con await_yes). */
+  const clearBackendDeletePendingOnly = () => {
+    const sid = activeChatIdRef.current;
+    if (!sid) return;
+    void askInventoryChat("cancelar eliminación pendiente", [], {
+      sessionId: sid,
+      memory:
+        "SISTEMA: Limpia residual de eliminación. Llama " +
+        "cancelar_eliminacion_origen YA. No reabras confirmación ni " +
+        "menciones excel/Inventario pendiente. Respuesta mínima o vacía.",
+    }).catch(() => {
+      /* ignore */
+    });
+  };
+
   const setPendingChatDeletePlanSafe = (plan: ChatDeletePlan | null) => {
     pendingChatDeletePlanRef.current = plan;
     setPendingChatDeletePlan(plan);
+    if (!plan) {
+      deleteClosedAtRef.current = Date.now();
+      // Limpia pendiente del agente backend si quedó de un prepare previo.
+      clearBackendDeletePendingOnly();
+    }
   };
 
   const contextRowsForDelete = (): InventarioRow[] => {
@@ -10997,6 +11428,46 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     return rows;
   };
 
+  /** Visor derecho de borrado: listado sin inferir personas/áreas/full. */
+  const finishDeleteSidePreview = (
+    sessionId: string,
+    botId: number,
+    reply: string,
+    rows: InventarioRow[],
+    followUps?: ChatFollowUp[],
+    opts?: { wipeAll?: boolean },
+  ) => {
+    if (opts?.wipeAll) {
+      // Resumen global (no ficha de la última etiqueta/persona).
+      finishBotReply(sessionId, botId, reply, {
+        resultItems: [],
+        qr: [],
+        viewerOverview: "stats",
+        viewerFocus: "todo el inventario",
+        skipExpand: true,
+        followUps,
+      });
+      return;
+    }
+    finishBotReply(sessionId, botId, reply, {
+      resultItems: rows
+        .slice(0, CHAT_SIDE_RESULT_CAP)
+        .map((row) => rowToChatApiItem(row)),
+      qr: [],
+      // Sin overview: plantilla de etiquetas (no personTotal/full).
+      viewerOverview: undefined,
+      viewerFocus: undefined,
+      skipExpand: true,
+      followUps,
+    });
+  };
+
+  /** Cierra/limpia el visor tras confirmar o cancelar borrado. */
+  const clearDeleteSideViewer = () => {
+    lastConcreteSideRef.current = null;
+    setSideViewerVisible(false);
+  };
+
   const confirmChatDeleteRecord = async () => {
     const plan = pendingChatDeletePlanRef.current || pendingChatDeletePlan;
     if (!plan?.rows.length || chatDeleteBusy) return;
@@ -11007,52 +11478,72 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     setChatDeleteBusy(true);
     try {
       const ids = targets.map((r) => Number(r.id));
-      const origenes = planDeleteOrigens(plan);
-      const result =
-        plan.wholeOrigen && origenes.length
-          ? await deleteInventarioByOrigensAction(origenes).then((res) =>
-              res.success
-                ? {
-                    success: true as const,
-                    deletedIds: res.deletedIds || ids,
-                    error: null as string | null,
-                  }
-                : {
-                    success: false as const,
-                    deletedIds: [] as number[],
-                    error: res.error || "No se pudo eliminar.",
-                  },
-            )
-          : ids.length === 1
-            ? await deleteInventarioAction(ids[0]).then((res) =>
-                res.success
-                  ? {
-                      success: true as const,
-                      deletedIds: [ids[0]],
-                      error: null as string | null,
-                    }
-                  : {
-                      success: false as const,
-                      deletedIds: [] as number[],
-                      error: res.error || "No se pudo eliminar.",
-                    },
-              )
-            : await deleteInventarioManyAction(ids).then((res) =>
-                res.success
-                  ? {
-                      success: true as const,
-                      deletedIds: res.deletedIds || [],
-                      error: null as string | null,
-                    }
-                  : {
-                      success: false as const,
-                      deletedIds: [] as number[],
-                      error: res.error || "No se pudo eliminar.",
-                    },
-              );
+      const wipeAll =
+        Boolean(plan.wipeAllOrigens) || plan.mode === "whole_all_origens";
+      const origenes = wipeAll
+        ? planDeleteOrigens(plan).length
+          ? planDeleteOrigens(plan)
+          : listExistingOrigens(items)
+        : planDeleteOrigens(plan);
+      const mapDeleteRes = (res: {
+        success: boolean;
+        deletedIds?: number[];
+        error?: string | null;
+      }, fallbackIds: number[]) =>
+        res.success
+          ? {
+              success: true as const,
+              deletedIds: res.deletedIds?.length
+                ? res.deletedIds
+                : fallbackIds,
+              error: null as string | null,
+            }
+          : {
+              success: false as const,
+              deletedIds: [] as number[],
+              error: res.error || "No se pudo eliminar.",
+            };
+      // Wipe global: borrar por ids (cubre filas sin origen) + orígenes si hay.
+      let result: {
+        success: boolean;
+        deletedIds: number[];
+        error: string | null;
+      };
+      if (wipeAll) {
+        const many = await deleteInventarioManyAction(ids);
+        result = mapDeleteRes(many, ids);
+        if (
+          result.success &&
+          origenes.length &&
+          result.deletedIds.length < ids.length
+        ) {
+          const byOrig = await deleteInventarioByOrigensAction(origenes);
+          if (byOrig.success) {
+            const merged = new Set([
+              ...result.deletedIds,
+              ...(byOrig.deletedIds || []),
+            ]);
+            result = {
+              success: true,
+              deletedIds: [...merged],
+              error: null,
+            };
+          }
+        }
+      } else if (plan.wholeOrigen && origenes.length) {
+        result = mapDeleteRes(
+          await deleteInventarioByOrigensAction(origenes),
+          ids,
+        );
+      } else if (ids.length === 1) {
+        result = mapDeleteRes(await deleteInventarioAction(ids[0]), [ids[0]]);
+      } else {
+        result = mapDeleteRes(await deleteInventarioManyAction(ids), ids);
+      }
       if (!result.success || !result.deletedIds?.length) {
         setChatDeleteBusy(false);
         setPendingChatDeletePlanSafe(null);
+        clearDeleteSideViewer();
         const sessionId = activeChatIdRef.current;
         if (sessionId) {
           const botId = chatId.current++;
@@ -11075,30 +11566,38 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
       const deletedSet = new Set(result.deletedIds);
       let deletedRows = targets.filter((r) => deletedSet.has(Number(r.id)));
-      if (plan.wholeOrigen && origenes.length && !deletedRows.length) {
+      if (
+        (wipeAll || (plan.wholeOrigen && origenes.length)) &&
+        !deletedRows.length
+      ) {
         deletedRows = targets;
       }
       const totalBefore = items.length;
-      setItems((prev) =>
-        prev.filter((row) => {
-          if (deletedSet.has(Number(row.id))) return false;
-          if (
-            plan.wholeOrigen &&
-            origenes.length &&
-            origenes.some((o) =>
-              origensMatch(String(row.origen ?? ""), o),
-            )
-          ) {
-            return false;
-          }
-          return true;
-        }),
-      );
-      if (
-        selectedProduct?.id != null &&
-        deletedSet.has(Number(selectedProduct.id))
-      ) {
+      if (wipeAll) {
+        setItems([]);
         setSelectedProduct(null);
+      } else {
+        setItems((prev) =>
+          prev.filter((row) => {
+            if (deletedSet.has(Number(row.id))) return false;
+            if (
+              plan.wholeOrigen &&
+              origenes.length &&
+              origenes.some((o) =>
+                origensMatch(String(row.origen ?? ""), o),
+              )
+            ) {
+              return false;
+            }
+            return true;
+          }),
+        );
+        if (
+          selectedProduct?.id != null &&
+          deletedSet.has(Number(selectedProduct.id))
+        ) {
+          setSelectedProduct(null);
+        }
       }
       const origenesLabel = formatOrigensListEs(origenes);
       rememberMutation({
@@ -11124,6 +11623,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         origen: plan.origen,
         origenes,
         wholeOrigen: plan.wholeOrigen,
+        wipeAllOrigens: wipeAll,
+        mode: plan.mode,
         deletedCount: deletedRows.length,
       });
       const polished = await polishInventoryReply({
@@ -11136,10 +11637,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           origen: plan.origen || "",
           origenes,
           whole_origen: Boolean(plan.wholeOrigen),
-          sample: deletedRows.slice(0, 5).map((r) => ({
-            etiqueta: String(r.etiqueta ?? "").trim(),
-            articulo: String(r.articulo ?? "").trim(),
-          })),
+          wipe_all: wipeAll,
+          sample: wipeAll
+            ? []
+            : deletedRows.slice(0, 5).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+              })),
           plantilla_sugerida: fallback,
           tono: "claro_conversacional",
         },
@@ -11163,6 +11667,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         setMessages(next);
         upsertChatSession(sessionId, next);
       }
+      clearDeleteSideViewer();
     } finally {
       setChatDeleteBusy(false);
       setPendingChatDeletePlanSafe(null);
@@ -11198,6 +11703,22 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       (side?.viewerOverview === "stats" || side?.viewerOverview === "full") &&
       origenFocus;
     let resolvedSide = side;
+    // Listado etiquetas/registros → plantilla Etiquetas (no persona/panorama).
+    if (
+      side &&
+      !importPreviewLocked &&
+      (isEtiquetasRegistrosListAsk(side.userText || "") ||
+        side.apiViewer?.tipo === "etiquetas" ||
+        side.apiViewer?.tipo === "registros")
+    ) {
+      resolvedSide = {
+        ...side,
+        resultItems: side.resultItems || [],
+        viewerOverview: undefined,
+        viewerFocus: undefined,
+        skipExpand: true,
+      };
+    } else
     // Comparación de inventarios: métricas, sin lista de etiquetas.
     if (
       side &&
@@ -11218,6 +11739,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     } else if (
       side &&
       !importPreviewLocked &&
+      // Nunca pisar área concreta ni Personas filtradas por área.
+      side.viewerOverview !== "areaTotal" &&
+      side.viewerOverview !== "personas" &&
+      side.apiViewer?.tipo !== "area" &&
+      side.apiViewer?.tipo !== "personas" &&
       (side.viewerOverview === "areas" ||
         side.apiViewer?.tipo === "areas" ||
         side.apiViewer?.tipo === "areas_general" ||
@@ -11328,6 +11854,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     } else if (
       side &&
       !importPreviewLocked &&
+      side.viewerOverview !== "areaTotal" &&
+      side.viewerOverview !== "personas" &&
+      side.apiViewer?.tipo !== "area" &&
+      side.apiViewer?.tipo !== "personas" &&
       (side.viewerOverview === "areas" ||
         side.apiViewer?.tipo === "areas" ||
         side.apiViewer?.tipo === "areas_general" ||
@@ -11340,6 +11870,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         viewerOverview: "areas",
         viewerFocus: undefined,
       };
+    }
+    // Área concreta activa → memoria de contexto (QR “de esta área”).
+    {
+      const focusName = String(resolvedSide?.viewerFocus || "").trim();
+      const ov = resolvedSide?.viewerOverview;
+      if (
+        focusName &&
+        (ov === "areaTotal" ||
+          (ov === "personas" &&
+            items.some((r) => areaMatchesNeedle(String(r.area ?? ""), focusName))))
+      ) {
+        activeAreaContextRef.current = { name: focusName, at: Date.now() };
+      }
     }
     const followUps =
       resolvedSide?.followUps !== undefined
@@ -11495,13 +12038,14 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       });
     }
 
+    // Misma ventana deslizante que el backend: 6 mensajes ≈ 3 turnos.
     const currentHistory = cleaned
       .filter((m) => m.text.trim() && !isTypingBot(m))
-      .slice(-8)
+      .slice(-6)
       .map((m) => ({
         role: (m.from === "user" ? "user" : "assistant") as "user" | "assistant",
         content:
-          m.text.length > 500 ? `${m.text.slice(0, 499)}…` : m.text,
+          m.text.length > 400 ? `${m.text.slice(0, 399)}…` : m.text,
       }));
     const crossHistory = buildCrossChatHistorySnippet(
       chatSessions,
@@ -11509,7 +12053,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       2,
       2,
     );
-    const history = [...crossHistory, ...currentHistory].slice(-10);
+    const history = [...crossHistory, ...currentHistory].slice(-6);
 
     const pendingMessages: ChatMessage[] = [
       ...cleaned,
@@ -11730,13 +12274,30 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       });
     };
 
-    // Confirmar / cancelar eliminación pendiente (sí → modal; no → cancelar)
+    // Confirmar / cancelar eliminación pendiente (sí → modal; no → cancelar).
+    // Preguntas intermedias → NO borrar el plan; caer al agente con el plan intacto.
     {
       const pendingDel =
         pendingChatDeletePlanRef.current || pendingChatDeletePlan;
-      if (pendingDel?.phase === "await_yes") {
+      const thanksAck = isCasualThanksOrClosingAck(userText || text);
+
+      // Cortesía (“gracias”): nunca confirma ni recupera borrado; limpia residual BE.
+      if (thanksAck) {
+        if (pendingDel?.phase === "await_yes") {
+          // Conserva plan FE; limpia solo fantasma BE (excel completo).
+          clearBackendDeletePendingOnly();
+        } else {
+          pendingChatDeletePlanRef.current = null;
+          setPendingChatDeletePlan(null);
+          deleteClosedAtRef.current = Date.now();
+          clearBackendDeletePendingOnly();
+        }
+      }
+
+      if (pendingDel?.phase === "await_yes" && !thanksAck) {
         if (isNegativeChat(text)) {
           setPendingChatDeletePlanSafe(null);
+          clearDeleteSideViewer();
           const cancelReply =
             "Listo, cancelé el borrado. No toqué ningún registro.";
           try {
@@ -11747,21 +12308,100 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
           return;
         }
-        if (isAffirmativeChat(text)) {
+        if (isAffirmativeChat(text) || isPendingDeleteConfirmCue(text)) {
           try {
             const nextPlan: ChatDeletePlan = {
               ...pendingDel,
               phase: "modal",
             };
-            setPendingChatDeletePlanSafe(nextPlan);
+            // No usar setPending…Safe(null) aquí: solo cambiar a modal.
+            pendingChatDeletePlanRef.current = nextPlan;
+            setPendingChatDeletePlan(nextPlan);
             const replyText = formatDeleteModalPrompt(nextPlan);
             await ensureTypingPause(replyText);
-            finishBotReply(sessionId, botId, replyText, {
-              resultItems: nextPlan.rows
-                .slice(0, CHAT_SIDE_RESULT_CAP)
-                .map((row) => rowToChatApiItem(row)),
-              qr: [],
-            });
+            finishDeleteSidePreview(
+              sessionId,
+              botId,
+              replyText,
+              nextPlan.rows,
+              undefined,
+              {
+                wipeAll: Boolean(
+                  nextPlan.wipeAllOrigens ||
+                    nextPlan.mode === "whole_all_origens",
+                ),
+              },
+            );
+          } catch {
+            /* abort */
+          }
+          return;
+        }
+        // Consulta intermedia (persona/área/artículo…): conservar plan y seguir.
+        if (
+          !looksLikeDeleteInventoryAsk(userText || text) &&
+          !looksLikeDeleteRecordAsk(userText || text)
+        ) {
+          const sample = pendingDel.rows.slice(0, 3).map((r) => ({
+            etiqueta: String(r.etiqueta ?? "").trim(),
+            articulo: String(r.articulo ?? "").trim(),
+            persona: String(r.persona ?? "").trim(),
+            area: String(r.area ?? "").trim(),
+            origen: String(r.origen ?? "").trim(),
+          }));
+          deleteCollateralHintRef.current = [
+            "BORRADO_PENDIENTE (no confirmar aún): responde SOLO la pregunta " +
+              "del usuario con datos reales (persona/área/artículo/origen). " +
+              "NO digas que confirmas el borrado. Al final puedes recordar que " +
+              "el borrado sigue pendiente (sí/no).",
+            `filas=${JSON.stringify(sample)}`,
+          ].join("\n");
+          // No return → agente / pipeline local con plan intacto.
+        }
+      }
+
+      // Agente pidió “sí” para borrar excel/Inventario → abrir modal FE.
+      // No recuperar si cortesía / acabamos de cancelar/completar (fantasma “gracias”).
+      const recentlyClosedDelete =
+        deleteClosedAtRef.current > 0 &&
+        Date.now() - deleteClosedAtRef.current < 10 * 60 * 1000;
+      if (
+        !thanksAck &&
+        !pendingDel &&
+        !recentlyClosedDelete &&
+        (isAffirmativeChat(text) || isPendingDeleteConfirmCue(text)) &&
+        !pendingChatImportRef.current?.length &&
+        !isNonConcreteChatAsk(text)
+      ) {
+        const lastBot = getLastConcreteBotMessage();
+        const recovered = recoverDeletePlanFromBotConfirm(
+          String(lastBot?.text || ""),
+          items,
+          userText || text,
+        );
+        if (recovered?.rows.length) {
+          try {
+            const nextPlan: ChatDeletePlan = {
+              ...recovered,
+              phase: "modal",
+            };
+            pendingChatDeletePlanRef.current = nextPlan;
+            setPendingChatDeletePlan(nextPlan);
+            const replyText = formatDeleteModalPrompt(nextPlan);
+            await ensureTypingPause(replyText);
+            finishDeleteSidePreview(
+              sessionId,
+              botId,
+              replyText,
+              nextPlan.rows,
+              undefined,
+              {
+                wipeAll: Boolean(
+                  nextPlan.wipeAllOrigens ||
+                    nextPlan.mode === "whole_all_origens",
+                ),
+              },
+            );
           } catch {
             /* abort */
           }
@@ -11809,7 +12449,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             const savedAll: InventarioRow[] = [];
             const skippedDup: string[] = [];
             let lastError = "";
-            for (const source of pendingMerge.sources) {
+            const mergeSources = pendingMerge.sources || [];
+            for (const source of mergeSources) {
               const sourceFold = foldOrig(source);
               const sourceRows = items.filter(
                 (row) =>
@@ -11830,7 +12471,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               }
               if (!toCopy.length) continue;
               const payload = toCopy.map((row) =>
-                rowToNewInventarioItem(row, pendingMerge.dest),
+                rowToNewInventarioItem(row, pendingMerge.dest, items),
               );
               for (let i = 0; i < payload.length; i += CHAT_IMPORT_CHUNK) {
                 if (
@@ -11852,6 +12493,39 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 messagesRef.current = progressing;
                 setMessages(progressing);
                 const result = await addInventarioBulkAction(chunk);
+                if (result.success && result.data?.length) {
+                  savedAll.push(...result.data);
+                  for (const row of result.data) {
+                    const k = String(row.etiqueta ?? "").trim().toLowerCase();
+                    if (k) destEtq.add(k);
+                  }
+                } else if (result.error) {
+                  lastError = result.error;
+                }
+              }
+            }
+            // Etiquetas sueltas adicionales (mixtas con orígenes completos).
+            const extraTags = (pendingMerge.etiquetas || [])
+              .map((e) => String(e).trim())
+              .filter(Boolean);
+            if (extraTags.length) {
+              const picked = pickSourceRowsForEtiquetas(
+                items,
+                extraTags,
+                pendingMerge.dest,
+              );
+              const tagRows = (picked.found || []).filter((row) => {
+                const key = String(row.etiqueta ?? "").trim().toLowerCase();
+                return key && !destEtq.has(key);
+              });
+              for (const et of picked.alreadyInDest || []) {
+                skippedDup.push(`${et} (ya en destino)`);
+              }
+              if (tagRows.length) {
+                const payload = tagRows.map((row) =>
+                  rowToNewInventarioItem(row, pendingMerge.dest, items),
+                );
+                const result = await addInventarioBulkAction(payload);
                 if (result.success && result.data?.length) {
                   savedAll.push(...result.data);
                   for (const row of result.data) {
@@ -11895,9 +12569,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               chatId: sessionId,
               fact: `Merge ${pendingMerge.sources.join("+")}→${pendingMerge.dest}: +${savedAll.length}`,
             });
-            const lines = pendingMerge.sources
-              .map((s) => `• **${s}**`)
-              .join("\n");
+            const lines = [
+              ...mergeSources.map((s) => `• **${s}**`),
+              ...(extraTags.length
+                ? [`• etiquetas: ${extraTags.map((e) => `**${e}**`).join(", ")}`]
+                : []),
+            ].join("\n");
             const doneReply =
               `Listo, ya confirmaste y terminé la carga.\n\n` +
               `Metí en **${pendingMerge.dest}** los registros nuevos desde:\n${lines}\n\n` +
@@ -12237,16 +12914,33 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       looksLikeDeleteRecordAsk(userText || text)
     ) {
       try {
-        const intent = detectChatDeleteIntent(
+        const existingOrigens = listExistingOrigens(items);
+        let intent = detectChatDeleteIntent(
           userText || text,
-          listExistingOrigens(items),
+          existingOrigens,
         );
         const wipeAll =
           Boolean(intent?.wipeAllOrigens) ||
           looksLikeWipeAllInventariosAsk(userText || text);
-        const contextRows = contextRowsForDelete();
+        // Wipe global: ignora deixis / etiqueta previa del visor.
+        if (wipeAll) {
+          intent = {
+            mode: "whole_all_origens",
+            origen: undefined,
+            origenes: existingOrigens.length ? existingOrigens : undefined,
+            etiquetas: [],
+            includeScopedList: false,
+            wholeOrigen: true,
+            wipeAllOrigens: true,
+          };
+        }
+        const contextRows = wipeAll ? [] : contextRowsForDelete();
         let rows: InventarioRow[] = [];
-        if (intent) {
+        if (wipeAll) {
+          rows = items.filter(
+            (r) => r.id != null && Number.isFinite(Number(r.id)),
+          );
+        } else if (intent) {
           rows = resolveChatDeleteRows({
             intent,
             inventory: items,
@@ -12311,7 +13005,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 whole_origen: Boolean(intent?.wholeOrigen),
                 need_list: Boolean(intent?.includeScopedList),
                 origen: emptyLabel || null,
-                existing_origens: listExistingOrigens(items).slice(0, 12),
+                existing_origens: existingOrigens.slice(0, 12),
               },
               sessionId,
             });
@@ -12324,39 +13018,73 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           return;
         }
 
-        const planOrigens = intent
-          ? planDeleteOrigens(intent)
-          : [];
+        const deixisOnly =
+          looksLikeDeleteDeixisSingular(userText || text) &&
+          !wipeAll &&
+          rows.length > 0 &&
+          rows.length <= 20;
+        const planOrigens = wipeAll
+          ? existingOrigens
+          : intent
+            ? planDeleteOrigens(intent)
+            : [];
+        // “elimínala” → solo esas filas contextuales, nunca todo el excel.
+        const forceEtiquetas = deixisOnly && Boolean(intent?.wholeOrigen);
         const plan: ChatDeletePlan = {
-          mode:
-            intent?.mode ||
-            (wipeAll
+          mode: forceEtiquetas
+            ? rows.length > 1
+              ? "mixed"
+              : "etiquetas"
+            : wipeAll
               ? "whole_all_origens"
-              : rows.length > 1
-                ? "mixed"
-                : "etiquetas"),
-          origen: intent?.origen || planOrigens[0],
-          origenes: planOrigens.length ? planOrigens : intent?.origenes,
-          etiquetas: intent?.etiquetas || [],
-          includeScopedList: Boolean(intent?.includeScopedList),
-          wholeOrigen: Boolean(intent?.wholeOrigen) || wipeAll,
-          wipeAllOrigens: wipeAll,
+              : intent?.mode ||
+                (rows.length > 1 ? "mixed" : "etiquetas"),
+          origen: forceEtiquetas
+            ? String(rows[0]?.origen ?? "").trim() || intent?.origen
+            : wipeAll
+              ? undefined
+              : intent?.origen || planOrigens[0],
+          origenes: forceEtiquetas
+            ? undefined
+            : planOrigens.length
+              ? planOrigens
+              : intent?.origenes,
+          etiquetas: forceEtiquetas
+            ? rows
+                .map((r) => String(r.etiqueta ?? "").trim())
+                .filter(Boolean)
+            : wipeAll
+              ? []
+              : intent?.etiquetas || [],
+          includeScopedList: forceEtiquetas
+            ? false
+            : wipeAll
+              ? false
+              : Boolean(intent?.includeScopedList),
+          wholeOrigen: forceEtiquetas
+            ? false
+            : Boolean(intent?.wholeOrigen) || wipeAll,
+          wipeAllOrigens: forceEtiquetas ? false : wipeAll,
           phase: "await_yes",
           rows,
           askedAt: Date.now(),
         };
-        setPendingChatDeletePlanSafe(plan);
+        // Abrir plan nuevo: no dispare clear del backend.
+        pendingChatDeletePlanRef.current = plan;
+        setPendingChatDeletePlan(plan);
         const softFacts = {
           count: plan.rows.length,
           origenes: planDeleteOrigens(plan),
           wipe_all: Boolean(plan.wipeAllOrigens || plan.mode === "whole_all_origens"),
           whole_origen: Boolean(plan.wholeOrigen),
           mode: plan.mode,
-          sample: plan.rows.slice(0, 5).map((r) => ({
-            etiqueta: String(r.etiqueta ?? "").trim(),
-            articulo: String(r.articulo ?? "").trim(),
-            origen: String(r.origen ?? "").trim(),
-          })),
+          sample: wipeAll
+            ? []
+            : plan.rows.slice(0, 5).map((r) => ({
+                etiqueta: String(r.etiqueta ?? "").trim(),
+                articulo: String(r.articulo ?? "").trim(),
+                origen: String(r.origen ?? "").trim(),
+              })),
         };
         const softFallback = formatDeleteSoftConfirm(plan);
         let replyText = softFallback;
@@ -12373,16 +13101,17 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           /* softFallback */
         }
         await ensureTypingPause(replyText);
-        finishBotReply(sessionId, botId, replyText, {
-          resultItems: rows
-            .slice(0, CHAT_SIDE_RESULT_CAP)
-            .map((row) => rowToChatApiItem(row)),
-          qr: [],
-          followUps: [
+        finishDeleteSidePreview(
+          sessionId,
+          botId,
+          replyText,
+          rows,
+          [
             { label: "Confirmar borrado", prompt: "sí" },
             { label: "Cancelar", prompt: "no" },
           ],
-        });
+          { wipeAll },
+        );
       } catch {
         /* abort */
       }
@@ -13086,41 +13815,6 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       return;
     }
 
-    // Pedir Excel/CSV sin adjunto → guía conversacional (OpenAI; NO exportar).
-    if (!attach && asksChatFileImport(userText || text)) {
-      const guideFallback =
-        "accion=guiar_adjunto_excel; columnas=ETIQUETA,ARTÍCULO,MARCA,MODELO,SERIE,ÁREA,PERSONA,CANTIDAD,ESTADO";
-      let guideReply = guideFallback;
-      try {
-        const polished = await polishInventoryReply({
-          userText: userText || text,
-          kind: "import_guide",
-          fallback: guideFallback,
-          facts: {
-            has_attachment: false,
-            accept: [".xlsx", ".xls", ".csv"],
-            columns: [
-              "ETIQUETA",
-              "ARTÍCULO",
-              "MARCA",
-              "MODELO",
-              "SERIE",
-              "ÁREA",
-              "PERSONA",
-              "CANTIDAD",
-              "ESTADO",
-            ],
-          },
-          sessionId,
-        });
-        guideReply = polished.reply;
-      } catch {
-        /* hechos */
-      }
-      finishBotReply(sessionId, botId, guideReply, { followUps: [] });
-      return;
-    }
-
     let reply = "Sin respuesta del asistente.";
     let sideItems: ChatApiItem[] = [];
     let mutated = false;
@@ -13178,6 +13872,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         text: m.text || "",
       })),
     });
+    if (deleteCollateralHintRef.current) {
+      resolvedTurn.threadHint = [
+        resolvedTurn.threadHint || "",
+        deleteCollateralHintRef.current,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      deleteCollateralHintRef.current = "";
+    }
     /** Texto enriquecido con contexto (detectores locales / IA). */
     let intentText = resolvedTurn.effectiveText || spokenText;
 
@@ -13200,47 +13903,314 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
     // Lecturas → agente backend (texto crudo). Writes/Excel/QR siguen locales.
     {
+      const hasPendingImport = Boolean(
+        pendingChatImportRef.current?.length || pendingChatImport?.length,
+      );
       const keepLocal =
         shouldKeepLocalWritePipeline(spokenRaw, items, {
           pendingNewInventario: Boolean(pendingNewInventarioRef.current),
           pendingCopyEtiquetaDest: Boolean(pendingCopyEtiquetaDestRef.current),
+          pendingChatImport: hasPendingImport,
         }) ||
         shouldKeepLocalWritePipeline(intentText, items, {
           pendingNewInventario: Boolean(pendingNewInventarioRef.current),
           pendingCopyEtiquetaDest: Boolean(pendingCopyEtiquetaDestRef.current),
+          pendingChatImport: hasPendingImport,
         });
       if (preferAgentConsultas && !keepLocal) {
-        // Plantilla de personas/nombres: local antes del agente (abre el visor).
+        // QR “de esta área” → área activa local (antes del fast-QR global).
+        if (looksLikeAreaQrDeixis(spokenRaw) && items.length) {
+          const areaName =
+            activeAreaContextRef.current?.name ||
+            (lastConcreteSideRef.current?.viewerOverview === "areaTotal"
+              ? String(lastConcreteSideRef.current.viewerFocus || "").trim()
+              : "") ||
+            getContextoVista(spokenRaw)?.valor ||
+            "";
+          if (areaName) {
+            try {
+              const areaRows = rowsForAreaExact(
+                items,
+                areaName,
+                CHAT_SIDE_RESULT_CAP,
+              );
+              if (areaRows.length) {
+                const side = buildQrSideFromRows(areaRows);
+                const n = new Set(
+                  areaRows
+                    .map((r) =>
+                      String(r.etiqueta ?? "").trim().toLowerCase(),
+                    )
+                    .filter(Boolean),
+                ).size;
+                const localReply =
+                  `Perfecto: generé **${n.toLocaleString("es-MX")}** códigos QR del área **${areaName}**` +
+                  ` (etiquetas únicas; si una etiqueta está en varios inventarios, se agrupa). ` +
+                  `Están en el visor derecho; abre cualquiera con el botón QR. ` +
+                  `Si quieres, acotamos por persona o exportamos ese mismo conjunto.`;
+                recordTokenConsumption(null, spokenRaw, localReply);
+                await ensureTypingPause(localReply);
+                activeAreaContextRef.current = {
+                  name: areaName,
+                  at: Date.now(),
+                };
+                finishBotReply(sessionId, botId, localReply, {
+                  resultItems: side.resultItems,
+                  qr: side.qr,
+                  viewerOverview: undefined,
+                  viewerFocus: areaName,
+                  skipExpand: true,
+                  userText: spokenRaw,
+                  apiViewer: { tipo: "area", valor: areaName },
+                });
+                return;
+              }
+            } catch {
+              /* caer al agente */
+            }
+          }
+        }
+        // Confirmar desambiguación de “nombres” → abrir visor correcto.
+        try {
+          const pendingNombres = pendingNombresClarifyRef.current;
+          if (
+            pendingNombres &&
+            Date.now() - pendingNombres.askedAt < 10 * 60 * 1000
+          ) {
+            const choice = resolveNombresClarifyChoice(
+              spokenRaw,
+              pendingNombres.hint,
+            );
+            if (
+              !choice &&
+              !isAmbiguousNombresAsk(spokenRaw) &&
+              /\b(registros?|etiquetas?|personas?|areas?|ultimos?|qr|export)\b/i.test(
+                spokenRaw,
+              )
+            ) {
+              // Chip concreto distinto (ej. Ver registros) → soltar pending.
+              pendingNombresClarifyRef.current = null;
+            }
+            if (choice && items.length) {
+              pendingNombresClarifyRef.current = null;
+              if (choice === "personas") {
+                const localReply = buildLocalOverviewReply(
+                  "personas",
+                  items,
+                  undefined,
+                  "dame las personas",
+                );
+                if (localReply) {
+                  recordTokenConsumption(null, spokenRaw, localReply);
+                  await ensureTypingPause(localReply);
+                  finishBotReply(sessionId, botId, localReply, {
+                    resultItems: [],
+                    qr: [],
+                    viewerOverview: "personas",
+                    userText: spokenRaw,
+                  });
+                  return;
+                }
+              }
+              if (choice === "areas") {
+                const localReply = buildLocalOverviewReply(
+                  "areas",
+                  items,
+                  undefined,
+                  "dame las areas",
+                );
+                if (localReply) {
+                  recordTokenConsumption(null, spokenRaw, localReply);
+                  await ensureTypingPause(localReply);
+                  finishBotReply(sessionId, botId, localReply, {
+                    resultItems: [],
+                    qr: [],
+                    viewerOverview: "areas",
+                    userText: spokenRaw,
+                  });
+                  return;
+                }
+              }
+              if (choice === "articulos") {
+                const resultItems = items
+                  .slice(0, CHAT_SIDE_RESULT_CAP)
+                  .map((row) => rowToChatApiItem(row));
+                const n = resultItems.length;
+                const reply =
+                  `Aquí tienes los **${n.toLocaleString("es-MX")}** artículos/etiquetas. ` +
+                  `El listado completo está en el visor derecho.`;
+                recordTokenConsumption(null, spokenRaw, reply);
+                await ensureTypingPause(reply);
+                finishBotReply(sessionId, botId, reply, {
+                  resultItems,
+                  qr: [],
+                  viewerOverview: undefined,
+                  userText: spokenRaw,
+                });
+                return;
+              }
+            }
+          } else if (pendingNombres) {
+            pendingNombresClarifyRef.current = null;
+          }
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+        }
+
+        // Listado etiquetas/registros / “Nombres de artículos” → plantilla Etiquetas.
+        try {
+          if (isEtiquetasRegistrosListAsk(spokenRaw) && items.length) {
+            pendingNombresClarifyRef.current = null;
+            const resultItems = items
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row));
+            const n = resultItems.length;
+            const reply =
+              `Aquí tienes **${n.toLocaleString("es-MX")}** registros/etiquetas. ` +
+              `El listado completo está en el visor derecho.`;
+            recordTokenConsumption(null, spokenRaw, reply);
+            await ensureTypingPause(reply);
+            finishBotReply(sessionId, botId, reply, {
+              resultItems,
+              qr: [],
+              viewerOverview: undefined,
+              viewerFocus: undefined,
+              userText: spokenRaw,
+              skipExpand: true,
+            });
+            return;
+          }
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+        }
+
+        // “dame los nombres” ambiguo → preguntar; no abrir visor.
+        try {
+          if (isAmbiguousNombresAsk(spokenRaw)) {
+            const hint = inferNombresThreadHint(messagesRef.current);
+            pendingNombresClarifyRef.current = {
+              askedAt: Date.now(),
+              hint,
+            };
+            const ask = buildAmbiguousNombresAskReply(hint);
+            recordTokenConsumption(null, spokenRaw, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask, {
+              userText: spokenRaw,
+              followUps: NOMBRES_FOLLOW_UPS,
+            });
+            return;
+          }
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+        }
+
+        // Personas de un área (RH / TI…) → abrir visor Personas filtrado.
         try {
           const detectText = normalizeChatSpelling(spokenRaw) || spokenRaw;
-          if (
-            detectViewerOverview(detectText) === "personas" &&
-            items.length
-          ) {
+          const areaPeopleAsk =
+            detectAreaPersonasAsk(detectText, items, null) ||
+            detectAreaPersonasAsk(spokenRaw, items, null);
+          const areaPeopleFocus =
+            areaPeopleAsk?.status === "ok" && areaPeopleAsk.area
+              ? areaPeopleAsk.area.name
+              : undefined;
+          const wantsPersonasOverview =
+            !isAmbiguousNombresAsk(detectText) &&
+            (Boolean(areaPeopleFocus) ||
+              detectViewerOverview(detectText) === "personas");
+          if (wantsPersonasOverview && items.length) {
             const ctxVista = getContextoVista();
             const overviewFocus =
+              areaPeopleFocus ||
               resolveOverviewFocus(detectText, items) ||
               (ctxVista?.tipo === "origen" && ctxVista.valor
                 ? ctxVista.valor
                 : undefined);
-            const localReply = buildLocalOverviewReply(
-              "personas",
-              items,
-              overviewFocus,
-              detectText,
-            );
-            if (localReply) {
-              recordTokenConsumption(null, spokenRaw, localReply);
-              await ensureTypingPause(localReply);
-              finishBotReply(sessionId, botId, localReply, {
-                resultItems: [],
-                qr: [],
-                viewerOverview: "personas",
-                viewerFocus: overviewFocus,
-                userText: spokenRaw,
-              });
-              return;
+            const scoped = areaPeopleFocus
+              ? rowsForAreaExact(items, areaPeopleFocus, CHAT_SIDE_RESULT_CAP)
+              : filterInventoryByOverviewFocus(items, overviewFocus);
+            const personCounts = new Map<string, number>();
+            for (const row of scoped) {
+              const p = String(row.persona ?? "").trim();
+              if (p) personCounts.set(p, (personCounts.get(p) || 0) + 1);
             }
+            const topPeople = [...personCounts.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 8)
+              .map(([name, count]) => ({ name, count }));
+            const focusLabel = overviewFocus || areaPeopleFocus || "";
+            const fallback =
+              (areaPeopleAsk?.status === "ok" && areaPeopleAsk.area
+                ? buildAreaPersonasReply(areaPeopleAsk.area)
+                : null) ||
+              buildLocalOverviewReply(
+                "personas",
+                items,
+                focusLabel || undefined,
+                detectText,
+              ) ||
+              `Hay **${personCounts.size}** persona${personCounts.size === 1 ? "" : "s"}` +
+                (focusLabel ? ` en **${focusLabel}**` : "") +
+                `. El listado está a la derecha.`;
+            let reply = fallback;
+            try {
+              const polished = await polishInventoryReply({
+                userText: spokenRaw,
+                kind: "personas_overview",
+                fallback,
+                facts: {
+                  origen: focusLabel || null,
+                  area: areaPeopleFocus || focusLabel || null,
+                  personas_count: personCounts.size,
+                  registros_count: scoped.length,
+                  top_personas: topPeople,
+                  pedir_nombres: /\bnombres?\b/i.test(detectText),
+                  estilo:
+                    "Prosa natural y cercana (gpt). PROHIBIDO plantillas fijas tipo «Listo:», «Empiezan:», «Mira la plantilla…». Varía el cierre.",
+                },
+                sessionId,
+              });
+              reply = polished.reply || fallback;
+            } catch {
+              /* fallback local */
+            }
+            recordTokenConsumption(null, spokenRaw, reply);
+            await ensureTypingPause(reply);
+            if (areaPeopleFocus) {
+              activeAreaContextRef.current = {
+                name: areaPeopleFocus,
+                at: Date.now(),
+              };
+            }
+            finishBotReply(sessionId, botId, reply, {
+              resultItems: [],
+              qr: [],
+              viewerOverview: "personas",
+              viewerFocus: focusLabel || undefined,
+              userText: spokenRaw,
+              skipExpand: true,
+              apiViewer: {
+                tipo: "personas",
+                valor: areaPeopleFocus || focusLabel || "general",
+              },
+            });
+            return;
           }
         } catch (err) {
           if (
@@ -13263,7 +14233,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             memory: memoryBlock || undefined,
             model: activeLlmMeta.model,
             sessionId,
-            contextoVista: getContextoVista(),
+            contextoVista: getContextoVista(spokenRaw),
           });
           if (
             requestGen !== chatRequestGenRef.current ||
@@ -13308,7 +14278,49 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             ? await buildExportFilesFromApiItems(sideItems, exportFocus)
             : undefined;
 
-          if (ctxNull && !exportFiles?.length && !data.mutated) {
+          // Personas/nombres de un área → plantilla Personas (aunque el agente
+          // haya contestado solo en prosa sin contexto_vista/items).
+          {
+            const areaPeopleAsk =
+              detectAreaPersonasAsk(
+                normalizeChatSpelling(spokenRaw) || spokenRaw,
+                items,
+                null,
+              ) || detectAreaPersonasAsk(spokenRaw, items, null);
+            if (
+              areaPeopleAsk?.status === "ok" &&
+              areaPeopleAsk.area &&
+              items.length
+            ) {
+              activeAreaContextRef.current = {
+                name: areaPeopleAsk.area.name,
+                at: Date.now(),
+              };
+              finishBotReply(sessionId, botId, replyText, {
+                resultItems: [],
+                qr: data.qr || [],
+                viewerOverview: "personas",
+                viewerFocus: areaPeopleAsk.area.name,
+                exportFiles,
+                apiViewer: {
+                  tipo: "personas",
+                  valor: areaPeopleAsk.area.name,
+                },
+                userText: spokenRaw,
+                followUps: apiFollowUps.length ? apiFollowUps : undefined,
+                skipExpand: true,
+              });
+              return;
+            }
+          }
+
+          // Charla sin datos → ocultar visor. Con items reales → abrir panel.
+          if (
+            ctxNull &&
+            !exportFiles?.length &&
+            !data.mutated &&
+            !(sideItems.length > 0)
+          ) {
             finishBotReply(sessionId, botId, replyText, {
               userText: spokenRaw,
               followUps: apiFollowUps.length ? apiFollowUps : undefined,
@@ -13321,6 +14333,46 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           let sideComparacion: ChatComparacionVista | null = null;
           let resultItems = sideItems;
 
+          // Prioridad: área concreta pedida (TI) por encima de panorama/ranking.
+          // No si pidieron personas/nombres del área (eso abre plantilla Personas).
+          const localAreaAsk = detectAreaPersonasAsk(spokenRaw, items, null)
+            ? undefined
+            : findMatchingAreasForPrompt(spokenRaw, items);
+          if (
+            localAreaAsk &&
+            !localAreaAsk.uncertain &&
+            localAreaAsk.candidates.length === 1 &&
+            !wantsGlobalAreasRanking(spokenRaw)
+          ) {
+            const single = localAreaAsk.candidates[0];
+            const localRows = rowsForAreaNeedle(
+              items,
+              single.name,
+              CHAT_SIDE_RESULT_CAP,
+            );
+            sideFocus = single.name;
+            sideOverview = "areaTotal";
+            resultItems = (localRows.length ? localRows : single.rows).map(
+              (row) => rowToChatApiItem(row),
+            );
+            activeAreaContextRef.current = {
+              name: single.name,
+              at: Date.now(),
+            };
+            finishBotReply(sessionId, botId, replyText, {
+              resultItems,
+              qr: data.qr || [],
+              viewerOverview: "areaTotal",
+              viewerFocus: single.name,
+              exportFiles,
+              apiViewer: { tipo: "area", valor: single.name },
+              userText: spokenRaw,
+              followUps: apiFollowUps.length ? apiFollowUps : undefined,
+              skipExpand: true,
+            });
+            return;
+          }
+
           if (ctx?.tipo === "comparacion") {
             sideOverview = "comparacion";
             sideComparacion =
@@ -13332,12 +14384,100 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ) {
             sideOverview = "areas";
             resultItems = [];
+          } else if (ctx?.tipo === "etiquetas" || ctx?.tipo === "registros") {
+            // Plantilla Etiquetas (overview vacío) con listado completo.
+            const focusLabel = String(ctx.valor || "").trim();
+            sideFocus = focusLabel || undefined;
+            sideOverview = undefined;
+            resultItems = sideItems;
+            if (resultItems.length < CHAT_SIDE_RESULT_CAP) {
+              const fold = (s: string) =>
+                s
+                  .toLowerCase()
+                  .normalize("NFD")
+                  .replace(/\p{M}/gu, "")
+                  .trim();
+              const want = fold(focusLabel);
+              const isAll =
+                !want ||
+                want === "todo el inventario" ||
+                want === "inventario";
+              const localRows = items.filter((row) => {
+                if (isAll) return true;
+                return fold(String(row.origen ?? "")) === want;
+              });
+              if (localRows.length > resultItems.length) {
+                resultItems = localRows
+                  .slice(0, CHAT_SIDE_RESULT_CAP)
+                  .map((row) => rowToChatApiItem(row));
+              }
+            }
           } else if (ctx?.tipo === "persona" && ctx.valor) {
             sideFocus = ctx.valor;
             sideOverview = ctx.lista_limitada ? undefined : "personTotal";
+          } else if (
+            ctx?.tipo === "personas" ||
+            (ctx?.tipo === "area" &&
+              ctx.valor &&
+              Boolean(detectAreaPersonasAsk(spokenRaw, items, null)))
+          ) {
+            // Nombres/personas de un área → plantilla Personas filtrada.
+            const areaPeopleAsk = detectAreaPersonasAsk(
+              spokenRaw,
+              items,
+              null,
+            );
+            const focusName =
+              (areaPeopleAsk?.status === "ok" && areaPeopleAsk.area?.name) ||
+              (ctx?.tipo === "personas" || ctx?.tipo === "area"
+                ? String(ctx.valor || "").trim()
+                : "") ||
+              "";
+            sideFocus = focusName || undefined;
+            sideOverview = "personas";
+            resultItems = [];
+            if (focusName) {
+              activeAreaContextRef.current = {
+                name: focusName,
+                at: Date.now(),
+              };
+            }
           } else if (ctx?.tipo === "area" && ctx.valor) {
+            // Área concreta (TI → Sistemas y TI): siempre plantilla areaTotal
+            // con el listado completo local (no preview recortada).
             sideFocus = ctx.valor;
-            sideOverview = ctx.lista_limitada ? undefined : "areaTotal";
+            sideOverview = "areaTotal";
+            activeAreaContextRef.current = {
+              name: ctx.valor,
+              at: Date.now(),
+            };
+            const localAreaRows = rowsForAreaNeedle(
+              items,
+              ctx.valor,
+              CHAT_SIDE_RESULT_CAP,
+            );
+            if (localAreaRows.length >= resultItems.length) {
+              resultItems = localAreaRows.map((row) => rowToChatApiItem(row));
+            } else if (
+              resultItems.length < CHAT_SIDE_RESULT_CAP &&
+              localAreaRows.length > 0
+            ) {
+              resultItems = localAreaRows.map((row) => rowToChatApiItem(row));
+            }
+          } else if (
+            isEtiquetasRegistrosListAsk(spokenRaw) ||
+            ctx?.tipo === "etiquetas" ||
+            ctx?.tipo === "registros"
+          ) {
+            sideFocus = undefined;
+            sideOverview = undefined;
+            resultItems = sideItems;
+            if (resultItems.length < CHAT_SIDE_RESULT_CAP) {
+              const localRows = items.slice(0, CHAT_SIDE_RESULT_CAP);
+              if (localRows.length > resultItems.length) {
+                resultItems = localRows.map((row) => rowToChatApiItem(row));
+              }
+            }
           } else if (ctx?.tipo === "origen" && ctx.valor) {
             sideFocus = ctx.valor;
             sideOverview = "full";
@@ -13410,13 +14550,24 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 }
               : null,
             userText: spokenRaw,
-            followUps: apiFollowUps.length
-              ? apiFollowUps
-              : undefined,
+            // Con visor/items → chips locales contextuales; si no, backend o nombres.
+            followUps: looksLikeNombresClarifyReply(replyText)
+              ? NOMBRES_FOLLOW_UPS
+              : sideOverview || sideItems.length
+                ? undefined
+                : apiFollowUps.length
+                  ? apiFollowUps
+                  : undefined,
             skipExpand:
               Boolean(ctx?.lista_limitada) ||
               sideOverview === "areas" ||
-              sideOverview === "comparacion",
+              sideOverview === "personas" ||
+              sideOverview === "comparacion" ||
+              isEtiquetasRegistrosListAsk(spokenRaw) ||
+              ctx?.tipo === "etiquetas" ||
+              ctx?.tipo === "registros" ||
+              ctx?.tipo === "personas" ||
+              sideOverview === undefined && sideItems.length > 0,
           });
           return;
         } catch (err) {
@@ -13685,7 +14836,12 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       const keepLocal = shouldKeepLocalWritePipeline(
         intentText || userText || text,
         items,
-        { pendingNewInventario: Boolean(pendingNewInventarioRef.current) },
+        {
+          pendingNewInventario: Boolean(pendingNewInventarioRef.current),
+          pendingChatImport: Boolean(
+            pendingChatImportRef.current?.length || pendingChatImport?.length,
+          ),
+        },
       );
       if (preferN8nConsultas && !keepLocal) {
         const memoryBlock = [
@@ -13864,58 +15020,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 1b0-catalog. “qué inventarios tenemos / dame todos los inventarios”.
-    {
-      const nCat = normalizeChatIntent(userText || text);
-      const asksCatalog =
-        detectListInventariosAsk(userText || text) ||
-        (/\b(inventarios?)\b/.test(nCat) &&
-          /\b(tenemos|hay|existen|hechos|creados|cual|cuales|list|muestra|dime|dame|todos)\b/.test(
-            nCat,
-          ) &&
-          (/\b(crear|creamos|podremos|podemos|nuevo|siguiente)\b/.test(nCat) ||
-            /\b(tenemos|hay|existen|hechos|creados|cuales?\s+hay|todos)\b/.test(
-              nCat,
-            )));
-      if (asksCatalog) {
-        try {
-          const existing = listExistingOrigens(items);
-          const counts = existing.map((origen) => ({
-            origen: canonicalizeOrigenLabel(origen),
-            n: items.filter((r) =>
-              origensMatch(String(r.origen ?? ""), origen),
-            ).length,
-          }));
-          const next = nextInventarioName(existing);
-          const bits = counts
-            .map((c) => `**${c.origen}** (${c.n.toLocaleString("es-MX")})`)
-            .join(", ");
-          const localReply =
-            !items.length || counts.length === 0
-              ? pickChatVariant(
-                  [
-                    `En este momento **no hay inventarios**. El primero podría ser **${next}**: ¿lo creamos o importas un Excel?`,
-                    `Todavía no hay nada que listar. Si quieres, empezamos con **${next}** o subimos un archivo.`,
-                    `Ahora mismo el inventario está vacío. ¿Preparo **${next}** o cargas un Excel?`,
-                  ],
-                  "catalog-empty",
-                )
-              : pickChatVariant(
-                  [
-                    `Estos son los inventarios: ${bits}. En total **${items.length.toLocaleString("es-MX")}** registros. El siguiente disponible sería **${next}**.`,
-                    `Tienes ${bits}. **${items.length.toLocaleString("es-MX")}** fichas en total. ¿Creamos **${next}**, importamos ahí o agregamos un registro?`,
-                  ],
-                  "catalog-list",
-                );
-          recordTokenConsumption(null, userText || text, localReply);
-          await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply);
-          return;
-        } catch {
-          /* abort */
-        }
-      }
-    }
+    // Listar inventarios (“cuántos/qué inventarios hay”) → agente gpt-4o-mini
+    // (sin plantilla fija). keepLocal ya no intercepta detectListInventariosAsk.
 
     // Export Excel: sin atajo local → backend preparar/confirmar_exportacion_excel.
 
@@ -14003,6 +15109,114 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           return;
         } catch {
           /* abort / nuevo mensaje */
+        }
+      }
+    }
+
+    // 1b-copy-multi. “crea Inv 2 y agrega Inv 1 + excel 1” / “pasa excel 1 e Inv 1 a Inv 2”.
+    {
+      const multiAsk = detectMultiSourceCopyToInventarioAsk(
+        intentText,
+        listExistingOrigens(items),
+        resolvedTurn.threadEtiquetas || [],
+      );
+      if (multiAsk) {
+        try {
+          pendingNewInventarioRef.current = null;
+          const foldOrig = (o: string) =>
+            o
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/\p{M}/gu, "")
+              .replace(/\s+/g, " ")
+              .trim();
+          const destFold = foldOrig(multiAsk.dest);
+          const destEtq = new Set(
+            items
+              .filter((row) => foldOrig(String(row.origen ?? "")) === destFold)
+              .map((row) => String(row.etiqueta ?? "").trim().toLowerCase())
+              .filter(Boolean),
+          );
+          const breakdown = multiAsk.sources.map((source) => {
+            const sourceFold = foldOrig(source);
+            const rows = items.filter(
+              (row) =>
+                foldOrig(String(row.origen ?? "")) === sourceFold &&
+                String(row.etiqueta ?? "").trim(),
+            );
+            const seen = new Set<string>();
+            let willCopy = 0;
+            let already = 0;
+            for (const row of rows) {
+              const key = String(row.etiqueta ?? "").trim().toLowerCase();
+              if (!key || seen.has(key)) continue;
+              seen.add(key);
+              if (destEtq.has(key)) already += 1;
+              else willCopy += 1;
+            }
+            return { source, total: seen.size, willCopy, already };
+          });
+          let tagWill = 0;
+          let tagAlready = 0;
+          if (multiAsk.etiquetas.length) {
+            const picked = pickSourceRowsForEtiquetas(
+              items,
+              multiAsk.etiquetas,
+              multiAsk.dest,
+            );
+            tagWill = picked.found.length;
+            tagAlready = picked.alreadyInDest.length;
+          }
+          const totalCopy =
+            breakdown.reduce((a, b) => a + b.willCopy, 0) + tagWill;
+          const totalAlready =
+            breakdown.reduce((a, b) => a + b.already, 0) + tagAlready;
+          const lines = [
+            ...breakdown.map(
+              (b) =>
+                `• **${b.source}**: ${b.total.toLocaleString("es-MX")} registros` +
+                (b.willCopy
+                  ? ` → copiaría **${b.willCopy.toLocaleString("es-MX")}** nuevos`
+                  : " → nada nuevo") +
+                (b.already
+                  ? ` (omite ${b.already.toLocaleString("es-MX")} que ya están)`
+                  : ""),
+            ),
+            ...(multiAsk.etiquetas.length
+              ? [
+                  `• etiquetas ${multiAsk.etiquetas.map((e) => `**${e}**`).join(", ")}` +
+                    (tagWill
+                      ? ` → **${tagWill}** nuevas`
+                      : " → nada nuevo") +
+                    (tagAlready ? ` (omite ${tagAlready} ya en destino)` : ""),
+                ]
+              : []),
+          ].join("\n");
+          pendingOrigenMergeRef.current = {
+            dest: multiAsk.dest,
+            sources: multiAsk.sources,
+            etiquetas: multiAsk.etiquetas,
+            createDest: multiAsk.createDest,
+            askedAt: Date.now(),
+          };
+          const createNote = multiAsk.createDest
+            ? `Primero creo **${multiAsk.dest}** (aún no existe) y luego copio ahí. `
+            : "";
+          const ask =
+            createNote +
+            `Voy a concentrar registros en **${multiAsk.dest}** desde:\n${lines}\n\n` +
+            `En total serían **${totalCopy.toLocaleString("es-MX")}** altas nuevas` +
+            (totalAlready
+              ? ` y **${totalAlready.toLocaleString("es-MX")}** etiquetas se omitirían para no duplicar`
+              : "") +
+            `. Los orígenes originales se conservan: solo se **copian** al destino, con procedencia del inventario más reciente de cada etiqueta. ` +
+            `¿Lo confirmo? Responde **sí** / **confirmo** para ejecutarlo, o **no** para cancelar.`;
+          recordTokenConsumption(null, spokenText, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask);
+          return;
+        } catch {
+          /* abort */
         }
       }
     }
@@ -14204,7 +15418,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
 
           const payload = toCopy.map((row) =>
-            rowToNewInventarioItem(row, personCopy.dest),
+            rowToNewInventarioItem(row, personCopy.dest, items),
           );
           setPendingChatImportSafe(null);
           const saved: InventarioRow[] = [];
@@ -14415,7 +15629,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               return;
             }
             const payload = picked.found.map((row) =>
-              rowToNewInventarioItem(row, tagCopy.dest),
+              rowToNewInventarioItem(row, tagCopy.dest, items),
             );
             setPendingChatImportSafe(null);
             const saved: InventarioRow[] = [];
@@ -14489,7 +15703,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 1b-copy-tag. “agrega esa / etiqueta 283586 a Inventario 2” (usa hilo de arriba).
+    // 1b-copy-tag. “agrega etiqueta X a Inventario 2” (solo códigos del mensaje del usuario).
     {
       const tagCopy = detectCopyEtiquetasToInventarioAsk(
         intentText,
@@ -14539,7 +15753,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
 
           const payload = picked.found.map((row) =>
-            rowToNewInventarioItem(row, tagCopy.dest),
+            rowToNewInventarioItem(row, tagCopy.dest, items),
           );
           setPendingChatImportSafe(null);
           const saved: InventarioRow[] = [];
@@ -14730,7 +15944,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
 
           const payload = toCopy.map((row) =>
-            rowToNewInventarioItem(row, bulkCopy.dest),
+            rowToNewInventarioItem(row, bulkCopy.dest, items),
           );
           // Importa y luego, si hay “ya existían”, el mensaje de import no las lista:
           // hacemos el import y añadimos nota en un segundo finish… runBulkChatImport
@@ -15020,13 +16234,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           setAddModalDestino(createAsk.name);
           setIsAddModalOpen(true);
           const ask =
-            `Listo: **${createAsk.name}** queda preparado. Te abrí el formulario de **nuevo registro** con destino **${createAsk.name}**.\n\n` +
-            `Campos a llenar:\n` +
-            `- **Etiqueta** (obligatoria)\n` +
-            `- **Artículo**, marca, modelo, serie\n` +
-            `- **Área** y **persona**\n` +
-            `- **Cantidad**, estado, observaciones\n\n` +
-            `También puedes escanear un **QR** o importar un Excel. Al guardar, el origen será **${createAsk.name}**.`;
+            `Listo: **${createAsk.name}** queda preparado como destino. ` +
+            `Te abrí el formulario de **nuevo registro** para que completes etiqueta (obligatoria), artículo, marca, modelo, serie, área, persona, cantidad, estado y observaciones. ` +
+            `También puedes escanear un **QR** o importar un Excel; al guardar, el origen quedará como **${createAsk.name}**.`;
           recordTokenConsumption(null, prompt, ask);
           await ensureTypingPause(ask);
           finishBotReply(sessionId, botId, ask);
@@ -15037,12 +16247,26 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
 
       // Creación sin contenido en el mismo mensaje → preguntar qué meter.
+      // Guarda pendingTargetInventory (= pendingNewInventarioRef) para el siguiente turno.
       if (createAsk && (!fill || fill.kind === "unclear")) {
         try {
+          pendingTargetInventoryRef.current = {
+            name: createAsk.name,
+            askedAt: Date.now(),
+          };
+          const sampleEtq = items
+            .map((r) => String(r.etiqueta ?? "").trim())
+            .filter(Boolean)
+            .slice(0, 3);
           const ask = createAsk.alreadyExists
-            ? `**${createAsk.name}** ya existe. Puedo meterle registros ahora.\n\n` +
-              `Dime etiquetas, **todo** otro inventario, o **vacío** si no quieres agregar nada.`
-            : buildCreateInventarioAskReply(createAsk.name, origensNow);
+            ? `**${createAsk.name}** ya existe, así que no lo vuelvo a crear. ` +
+              `Si quieres, le meto registros ahora: dime etiquetas vigentes, pide **todo** de otro inventario, ` +
+              `o responde **vacío** si solo quieres dejarlo como está sin agregar nada.`
+            : buildCreateInventarioAskReply(
+                createAsk.name,
+                origensNow,
+                sampleEtq,
+              );
           recordTokenConsumption(null, prompt, ask);
           await ensureTypingPause(ask);
           finishBotReply(sessionId, botId, ask);
@@ -15056,14 +16280,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         const dest = pending.name;
         try {
           if (fill.kind === "empty") {
-            pendingNewInventarioRef.current = {
+            pendingTargetInventoryRef.current = {
               ...pending,
               emptyOk: true,
               askedAt: Date.now(),
             };
             const ask =
-              `Listo: **${dest}** queda preparado **vacío**. ` +
-              `Cuando quieras, mándame etiquetas o “pasa todo Inventario N” y las meto ahí.`;
+              `Listo: **${dest}** queda preparado **vacío**, sin registros por ahora. ` +
+              `Cuando quieras llenarlo, mándame etiquetas vigentes o dime “pasa todo Inventario N” y las copio ahí sin duplicar. ` +
+              `También puedes subir un Excel dirigido a ese origen.`;
             recordTokenConsumption(null, prompt, ask);
             await ensureTypingPause(ask);
             finishBotReply(sessionId, botId, ask);
@@ -15071,9 +16296,39 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
 
           if (fill.kind === "unclear") {
+            const liveSamples = items
+              .map((r) => String(r.etiqueta ?? "").trim())
+              .filter(Boolean)
+              .slice(0, 2);
+            const tagHint = liveSamples.length
+              ? ` etiquetas como ${liveSamples.map((e) => `**${e}**`).join(", ")}`
+              : " etiquetas";
             const ask =
-              `Para **${dest}** necesito saber qué meter: etiquetas (ej. \`283586\`), ` +
-              `“pasa todo Inventario 1”, o **vacío**.`;
+              `Para **${dest}** todavía no tengo claro qué meter. ` +
+              `Puedes indicarme${tagHint}, pedir “pasa todo Inventario 1” (u otro origen), ` +
+              `o responder **vacío** si solo quieres dejarlo creado sin registros.`;
+            recordTokenConsumption(null, prompt, ask);
+            await ensureTypingPause(ask);
+            finishBotReply(sessionId, botId, ask);
+            return;
+          }
+
+          // Varios orígenes → mismo flujo de confirmación multi hacia el destino pendiente.
+          if (fill.kind === "copy_origens") {
+            pendingOrigenMergeRef.current = {
+              dest,
+              sources: fill.sources,
+              etiquetas: [],
+              createDest: !origensNow.some((o) => origensMatch(o, dest)),
+              askedAt: Date.now(),
+            };
+            pendingTargetInventoryRef.current = null;
+            const lines = fill.sources.map((s) => `• **${s}**`).join("\n");
+            const ask =
+              `Perfecto: el destino queda en **${dest}**. ` +
+              `Voy a copiar los registros (sin duplicar etiquetas) desde:\n${lines}\n\n` +
+              `Los orígenes originales se conservan; en el destino quedará la procedencia más reciente de cada etiqueta. ` +
+              `¿Lo confirmo? Responde **sí** / **confirmo** para ejecutarlo, o **no** para cancelar.`;
             recordTokenConsumption(null, prompt, ask);
             await ensureTypingPause(ask);
             finishBotReply(sessionId, botId, ask);
@@ -15134,7 +16389,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
 
           const payload = sourceRows.map((row) =>
-            rowToNewInventarioItem(row, dest),
+            rowToNewInventarioItem(row, dest, items),
           );
           const fromOrigens = [
             ...new Set(
@@ -15156,14 +16411,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               .map((row) => String(row.etiqueta ?? "").trim())
               .filter(Boolean),
           });
-          pendingNewInventarioRef.current = {
-            name: dest,
-            askedAt: Date.now(),
-          };
-          if (missing.length || alreadyInDest.length) {
-            // runBulkChatImport already finished the bot reply; append note via soft follow-up is hard.
-            // The import reply is enough; missing handled only when nothing saved above.
-          }
+          // Transferencia hecha → limpiar pendingTargetInventory.
+          pendingTargetInventoryRef.current = null;
           return;
         } catch {
           /* abort / nuevo mensaje */
@@ -15543,11 +16792,16 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             const localReply = buildAreaPersonasReply(ctxAsk.area);
             recordTokenConsumption(null, userText || text, localReply);
             await ensureTypingPause(localReply);
+            activeAreaContextRef.current = {
+              name: ctxAsk.area.name,
+              at: Date.now(),
+            };
             finishBotReply(sessionId, botId, localReply, {
               resultItems: [],
               qr: [],
-              viewerOverview: "areaTotal",
+              viewerOverview: "personas",
               viewerFocus: ctxAsk.area.name,
+              apiViewer: { tipo: "personas", valor: ctxAsk.area.name },
             });
             return;
           }
@@ -15841,11 +17095,21 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             const localReply = buildAreaPersonasReply(areaPeople.area);
             recordTokenConsumption(null, userText || text, localReply);
             await ensureTypingPause(localReply);
+            activeAreaContextRef.current = {
+              name: areaPeople.area.name,
+              at: Date.now(),
+            };
             finishBotReply(sessionId, botId, localReply, {
               resultItems: [],
               qr: [],
-              viewerOverview: "areaTotal",
+              viewerOverview: "personas",
               viewerFocus: areaPeople.area.name,
+              skipExpand: true,
+              userText: userText || text,
+              apiViewer: {
+                tipo: "personas",
+                valor: areaPeople.area.name,
+              },
             });
             return;
           } catch {
@@ -16005,11 +17269,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           );
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
+          activeAreaContextRef.current = {
+            name: singleArea.name,
+            at: Date.now(),
+          };
           finishBotReply(sessionId, botId, localReply, {
             resultItems: shownRows.map((row) => rowToChatApiItem(row)),
             qr: [],
             viewerOverview: "areaTotal",
             viewerFocus: singleArea.name,
+            apiViewer: { tipo: "area", valor: singleArea.name },
+            skipExpand: true,
+            userText: userText || text,
           });
         } catch {
           /* abort / nuevo mensaje */
@@ -16372,6 +17643,57 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
+    // 5-pre. QR del área activa (“dame los qr de esta área / sus qr”).
+    if (looksLikeAreaQrDeixis(userText || text) && items.length) {
+      const areaName =
+        activeAreaContextRef.current?.name ||
+        (lastConcreteSideRef.current?.viewerOverview === "areaTotal"
+          ? String(lastConcreteSideRef.current.viewerFocus || "").trim()
+          : "") ||
+        getContextoVista(userText || text)?.valor ||
+        "";
+      if (areaName) {
+        try {
+          const areaRows = rowsForAreaExact(
+            items,
+            areaName,
+            CHAT_SIDE_RESULT_CAP,
+          );
+          if (areaRows.length) {
+            const side = buildQrSideFromRows(areaRows);
+            const n = new Set(
+              areaRows
+                .map((r) => String(r.etiqueta ?? "").trim().toLowerCase())
+                .filter(Boolean),
+            ).size;
+            const localReply =
+              `Perfecto: generé **${n.toLocaleString("es-MX")}** códigos QR del área **${areaName}**` +
+              ` (etiquetas únicas; si una etiqueta está en varios inventarios, se agrupa). ` +
+              `Los tienes en el visor derecho; abre cualquiera con el botón QR. ` +
+              `Si quieres, filtramos por persona o exportamos ese mismo conjunto.`;
+            recordTokenConsumption(null, userText || text, localReply);
+            await ensureTypingPause(localReply);
+            activeAreaContextRef.current = {
+              name: areaName,
+              at: Date.now(),
+            };
+            finishBotReply(sessionId, botId, localReply, {
+              resultItems: side.resultItems,
+              qr: side.qr,
+              viewerOverview: undefined,
+              viewerFocus: areaName,
+              skipExpand: true,
+              userText: userText || text,
+              apiViewer: { tipo: "area", valor: areaName },
+            });
+            return;
+          }
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
     // 5. Anáfora: "dame esas etiquetas" / "las de arriba" → resultado anterior.
     // Nunca si es multipetición Inv N → Inv M.
     if (
@@ -16391,7 +17713,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       if (wantsThose && prevItems.length) {
         try {
           const localReply = userAskedQr(userText || text)
-            ? `Tomo las **${prevItems.length}** etiqueta${prevItems.length === 1 ? "" : "s"} del resultado anterior para QR. El detalle está en el visor.`
+            ? `Listo: armé **${prevItems.length}** códigos QR a partir del listado que veníamos viendo. Están en el panel derecho; dime si quieres acotarlos a un área o persona.`
             : buildAnaphoraEtiquetasReply(prevItems);
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
@@ -16448,12 +17770,98 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
+    // 5b. Desambiguar “dame los nombres” (sin abrir visor).
+    {
+      const pendingNombres = pendingNombresClarifyRef.current;
+      if (
+        pendingNombres &&
+        Date.now() - pendingNombres.askedAt < 10 * 60 * 1000
+      ) {
+        const choice = resolveNombresClarifyChoice(
+          userText || text,
+          pendingNombres.hint,
+        );
+        if (
+          !choice &&
+          !isAmbiguousNombresAsk(userText || text) &&
+          /\b(registros?|etiquetas?|personas?|areas?|ultimos?|qr|export)\b/i.test(
+            userText || text,
+          )
+        ) {
+          pendingNombresClarifyRef.current = null;
+        }
+        if (choice && items.length) {
+          pendingNombresClarifyRef.current = null;
+          try {
+            if (choice === "personas" || choice === "areas") {
+              const localReply = buildLocalOverviewReply(
+                choice,
+                items,
+                undefined,
+                choice === "personas" ? "dame las personas" : "dame las areas",
+              );
+              if (localReply) {
+                recordTokenConsumption(null, userText || text, localReply);
+                await ensureTypingPause(localReply);
+                finishBotReply(sessionId, botId, localReply, {
+                  resultItems: [],
+                  qr: [],
+                  viewerOverview: choice,
+                });
+                return;
+              }
+            }
+            if (choice === "articulos") {
+              const resultItems = items
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row));
+              const reply =
+                `Aquí tienes los **${resultItems.length.toLocaleString("es-MX")}** artículos/etiquetas. ` +
+                `El listado completo está en el visor derecho.`;
+              recordTokenConsumption(null, userText || text, reply);
+              await ensureTypingPause(reply);
+              finishBotReply(sessionId, botId, reply, {
+                resultItems,
+                qr: [],
+              });
+              return;
+            }
+          } catch {
+            /* abort */
+          }
+        }
+      } else if (pendingNombres) {
+        pendingNombresClarifyRef.current = null;
+      }
+
+      if (isAmbiguousNombresAsk(userText || text)) {
+        try {
+          const hint = inferNombresThreadHint(messagesRef.current);
+          pendingNombresClarifyRef.current = {
+            askedAt: Date.now(),
+            hint,
+          };
+          const ask = buildAmbiguousNombresAskReply(hint);
+          recordTokenConsumption(null, userText || text, ask);
+          await ensureTypingPause(ask);
+          finishBotReply(sessionId, botId, ask, {
+            followUps: NOMBRES_FOLLOW_UPS,
+          });
+          return;
+        } catch {
+          /* abort */
+        }
+      }
+    }
+
     // 6. Overview local (áreas / totales / personas…) sin depender del LLM.
     // Si ya acotó marcas a un área, no caer al ranking global de marcas.
     // (recientes ya se resolvieron en 1b0)
     const turnBeforeOverview = analyzeTurnQuick(userText || text, items);
     const earlyOverview =
-      turnBeforeOverview.isWriteTurn || turnBeforeOverview.discourseOnly
+      turnBeforeOverview.isWriteTurn ||
+      turnBeforeOverview.discourseOnly ||
+      isAmbiguousNombresAsk(userText || text)
         ? undefined
         : detectMarcasAreaAsk(userText || text, items)
           ? undefined
@@ -16461,21 +17869,45 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     if (earlyOverview && earlyOverview !== "recent" && items.length) {
       try {
         const overviewFocus = resolveOverviewFocus(userText || text, items);
-        const localReply = buildLocalOverviewReply(
+        let localReply = buildLocalOverviewReply(
           earlyOverview,
           items,
           overviewFocus,
           userText || text,
         );
+        if (earlyOverview === "personas" && localReply) {
+          const scoped = filterInventoryByOverviewFocus(items, overviewFocus);
+          const personCounts = new Map<string, number>();
+          for (const row of scoped) {
+            const p = String(row.persona ?? "").trim();
+            if (p) personCounts.set(p, (personCounts.get(p) || 0) + 1);
+          }
+          const topPeople = [...personCounts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 8)
+            .map(([name, count]) => ({ name, count }));
+          try {
+            const polished = await polishInventoryReply({
+              userText: userText || text,
+              kind: "personas_overview",
+              fallback: localReply,
+              facts: {
+                origen: overviewFocus || null,
+                personas_count: personCounts.size,
+                registros_count: scoped.length,
+                top_personas: topPeople,
+                pedir_nombres: /\bnombres?\b/i.test(userText || text),
+                estilo:
+                  "Prosa natural y cercana. PROHIBIDO plantillas fijas tipo «Listo:», «Empiezan:», «Mira la plantilla…».",
+              },
+              sessionId,
+            });
+            localReply = polished.reply || localReply;
+          } catch {
+            /* fallback */
+          }
+        }
         if (localReply) {
-          const openPanel =
-            shouldAttachSidePanel(userText || text, items, chatHistory) ||
-            earlyOverview === "personas" ||
-            earlyOverview === "areas" ||
-            earlyOverview === "estado" ||
-            earlyOverview === "marcas" ||
-            earlyOverview === "stats" ||
-            earlyOverview === "full";
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
           finishBotReply(sessionId, botId, localReply, {
@@ -16483,6 +17915,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             qr: [],
             viewerOverview: earlyOverview,
             viewerFocus: overviewFocus,
+            userText: userText || text,
           });
           return;
         }
@@ -16573,7 +18006,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           memory: memoryBlock,
           model: activeLlmMeta.model,
           sessionId: sessionId,
-          contextoVista: getContextoVista(),
+          contextoVista: getContextoVista(userText || text),
         });
       }
     } else {
@@ -16582,7 +18015,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         memory: memoryBlock,
         model: activeLlmMeta.model,
         sessionId: sessionId,
-        contextoVista: getContextoVista(),
+        contextoVista: getContextoVista(userText || text),
       });
     }
     if (
@@ -17147,14 +18580,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       ? await buildExportFilesFromApiItems(sideItems, exportFocus)
       : undefined;
 
-    // Charla / contexto_vista null → solo texto; visor permanece oculto.
+    // Charla / contexto_vista null → solo texto; con items → abrir visor.
     if (
       ctxNull &&
       !forceAreasOverview &&
       !forceComparacionOverview &&
       !qrPayloads.length &&
       !mutated &&
-      !exportFiles?.length
+      !exportFiles?.length &&
+      !(sideItems.length > 0)
     ) {
       finishBotReply(sessionId, botId, finalReply, {
         userText: spokenRaw || userText || text,
@@ -17182,6 +18616,19 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       sideFocus = undefined;
       sideResultItems = [];
       sideQr = [];
+    } else if (
+      isEtiquetasRegistrosListAsk(spokenRaw || userText || text) ||
+      ctx?.tipo === "etiquetas" ||
+      ctx?.tipo === "registros"
+    ) {
+      sideFocus = undefined;
+      sideOverview = undefined;
+      if (sideResultItems.length < CHAT_SIDE_RESULT_CAP) {
+        const localRows = items.slice(0, CHAT_SIDE_RESULT_CAP);
+        if (localRows.length > sideResultItems.length) {
+          sideResultItems = localRows.map((row) => rowToChatApiItem(row));
+        }
+      }
     } else if (ctx?.tipo === "persona" && ctx.valor) {
       sideFocus = ctx.valor;
       // Lista N (dame 8) → solo esos registros; total persona → plantilla personTotal.
@@ -17253,21 +18700,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             exportFiles,
             apiViewer,
             userText: spokenRaw || userText || text,
-            followUps:
-              forceAreasOverview || forceComparacionOverview
-                ? apiFollowUps.length
-                  ? apiFollowUps
-                  : undefined
-                : apiFollowUps.length
-                  ? apiFollowUps
-                  : undefined,
+            followUps: looksLikeNombresClarifyReply(finalReply)
+              ? NOMBRES_FOLLOW_UPS
+              : undefined, // buildChatFollowUps según overview/items
             // Lista N o ranking/comparación: no expandir al inventario completo.
             skipExpand:
-              limitedAsk || forceAreasOverview || forceComparacionOverview,
+              limitedAsk ||
+              forceAreasOverview ||
+              forceComparacionOverview ||
+              isEtiquetasRegistrosListAsk(spokenRaw || userText || text) ||
+              ctx?.tipo === "etiquetas" ||
+              ctx?.tipo === "registros",
           }
         : {
             userText: spokenRaw || userText || text,
-            followUps: apiFollowUps.length ? apiFollowUps : undefined,
+            followUps: looksLikeNombresClarifyReply(finalReply)
+              ? NOMBRES_FOLLOW_UPS
+              : apiFollowUps.length
+                ? apiFollowUps
+                : undefined,
             exportFiles,
           },
     );
@@ -17372,6 +18823,8 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         /* backend opcional */
       }
     }
+    // Solo reinicia el contador / memoria corta del backend.
+    // No borra el chat visible (ventana deslizante sigue activa).
     setTokenMeters((prev) => {
       const next = { ...prev };
       delete next[activeTokenMeter.meterId];
@@ -17380,8 +18833,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     });
     setTokenDetailsOpen(false);
     setTokenPopoverOpen(false);
-    startNewChat();
-  }, [activeTokenMeter.meterId, startNewChat]);
+  }, [activeTokenMeter.meterId]);
 
   const chatSessionsRef = useRef(chatSessions);
   chatSessionsRef.current = chatSessions;
@@ -17465,6 +18917,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
 
   const allVisibleSelected =
     visibleRowIds.length > 0 && visibleRowIds.every((id) => selectedRowIds.includes(id));
+  const someVisibleSelected =
+    visibleRowIds.length > 0 &&
+    visibleRowIds.some((id) => selectedRowIds.includes(id));
 
   const toggleSelectMode = () => {
     setSelectMode((current) => {
@@ -17475,6 +18930,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
       return !current;
     });
+  };
+
+  const cancelSelectMode = () => {
+    setSelectMode(false);
+    setSelectedRowIds([]);
+    setConfirmBulkDelete(false);
+    setBulkError(null);
   };
 
   const toggleRowSelection = useCallback((id: number) => {
@@ -17494,9 +18956,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
     });
   };
 
-  const clearRowSelection = () => {
-    setSelectedRowIds([]);
+  const deselectAllVisible = () => {
+    const visibleSet = new Set(visibleRowIds);
+    setSelectedRowIds((current) => current.filter((id) => !visibleSet.has(id)));
     setConfirmBulkDelete(false);
+  };
+
+  const toggleAllVisible = () => {
+    if (allVisibleSelected) deselectAllVisible();
+    else selectAllVisible();
   };
 
   const handleBulkDelete = async () => {
@@ -18670,6 +20138,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                     });
                   }}
                 >
+                  {activeTokenMeter.pctUsed >= 85 ? (
+                    <div
+                      className="chat-token-soft-warn"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      Contexto alto: sigues en la misma charla con ventana
+                      deslizante (últimos 3 turnos). El chat no se borra.
+                      <button
+                        type="button"
+                        className="chat-token-soft-warn-btn"
+                        onClick={() => {
+                          void resetTokenSession();
+                        }}
+                      >
+                        Reiniciar contador
+                      </button>
+                    </div>
+                  ) : null}
                   <form
                     className={[
                       "chat-composer",
@@ -18831,6 +20318,7 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                         ) : null}
                       </div>
                       <input
+                        ref={chatInputRef}
                         value={draft}
                         onChange={(event) => setDraft(event.target.value)}
                         placeholder={
@@ -19075,8 +20563,9 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                                 onClick={() => {
                                   void resetTokenSession();
                                 }}
+                                title="Reinicia el medidor sin borrar el chat"
                               >
-                                Reiniciar
+                                Reiniciar contador
                               </button>
                             </div>
                           </div>
@@ -19231,31 +20720,18 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                       Ver todo el inventario
                     </button>
                   ) : null}
-                  <button
-                    type="button"
-                    className={selectMode ? "btn-select-mode is-active" : "btn-select-mode"}
-                    onClick={toggleSelectMode}
-                    aria-pressed={selectMode}
-                  >
-                    <ListChecks size={15} />
-                    <span>{selectMode ? "Cancelar selección" : "Seleccionar"}</span>
-                  </button>
-                </div>
-              </div>
-
-              {selectMode || undoStack.length ? (
-                <div className="bulk-toolbar" role="toolbar" aria-label="Acciones de selección">
-                  {selectMode ? (
+                  {!selectMode ? (
+                    <button
+                      type="button"
+                      className="btn-select-mode"
+                      onClick={toggleSelectMode}
+                      aria-pressed={false}
+                    >
+                      <ListChecks size={15} />
+                      <span>Seleccionar</span>
+                    </button>
+                  ) : (
                     <>
-                      <button
-                        type="button"
-                        className="btn-bulk"
-                        onClick={allVisibleSelected ? clearRowSelection : selectAllVisible}
-                        disabled={!visibleRowIds.length || bulkBusy}
-                      >
-                        <Check size={14} />
-                        <span>{allVisibleSelected ? "Quitar todo" : "Seleccionar todo"}</span>
-                      </button>
                       <button
                         type="button"
                         className="btn-bulk is-danger"
@@ -19264,12 +20740,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                       >
                         <Trash2 size={14} />
                         <span>
-                          Eliminar
+                          Eliminar seleccionados
                           {selectedRowIds.length ? ` (${selectedRowIds.length})` : ""}
                         </span>
                       </button>
+                      <button
+                        type="button"
+                        className="btn-select-mode is-active"
+                        onClick={cancelSelectMode}
+                        aria-pressed={true}
+                      >
+                        <span>Cancelar</span>
+                      </button>
                     </>
-                  ) : null}
+                  )}
+                </div>
+              </div>
+
+              {undoStack.length || bulkError ? (
+                <div className="bulk-toolbar" role="toolbar" aria-label="Acciones de selección">
                   {undoStack.length ? (
                     <button
                       type="button"
@@ -19289,44 +20778,42 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 </div>
               ) : null}
 
-              {confirmBulkDelete ? (
-                <div className="bulk-confirm" role="alertdialog" aria-labelledby="bulk-delete-title">
-                  <div>
-                    <h3 id="bulk-delete-title">
-                      ¿Eliminar {selectedRowIds.length}{" "}
-                      {selectedRowIds.length === 1 ? "artículo" : "artículos"}?
-                    </h3>
-                    <p>
-                      Se borrarán de la base de datos. Podrás usar <strong>Deshacer</strong> justo
-                      después si fue un error.
-                    </p>
-                  </div>
-                  <div className="bulk-confirm-actions">
-                    <button
-                      type="button"
-                      className="btn-bulk"
-                      onClick={() => setConfirmBulkDelete(false)}
-                      disabled={bulkBusy}
-                    >
-                      Cancelar
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-bulk is-danger"
-                      onClick={handleBulkDelete}
-                      disabled={bulkBusy}
-                    >
-                      <Trash2 size={14} />
-                      <span>{bulkBusy ? "Eliminando..." : "Sí, eliminar"}</span>
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
               <div className="table-wrap" ref={tableRef} tabIndex={0} aria-label="Tabla de artículos">
                 <table>
                   <thead>
                     <tr>
+                      {selectMode ? (
+                        <th scope="col" className="col-select">
+                          <button
+                            type="button"
+                            className={
+                              allVisibleSelected
+                                ? "rep-checkbox-btn is-checked"
+                                : someVisibleSelected
+                                  ? "rep-checkbox-btn is-indeterminate"
+                                  : "rep-checkbox-btn"
+                            }
+                            aria-label={
+                              allVisibleSelected
+                                ? "Deseleccionar todos los visibles"
+                                : "Seleccionar todos los visibles"
+                            }
+                            aria-checked={
+                              allVisibleSelected
+                                ? true
+                                : someVisibleSelected
+                                  ? "mixed"
+                                  : false
+                            }
+                            disabled={!visibleRowIds.length || bulkBusy}
+                            onClick={toggleAllVisible}
+                          >
+                            {allVisibleSelected || someVisibleSelected ? (
+                              <Check size={12} strokeWidth={3} />
+                            ) : null}
+                          </button>
+                        </th>
+                      ) : null}
                       {COLUMNS.map(([key, label]) => (
                         <th key={label} scope="col" className={columnClassName(key)}>
                           {label}
@@ -19352,7 +20839,10 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                     })}
                     {!visible.length ? (
                       <tr>
-                        <td className="table-empty" colSpan={COLUMNS.length}>
+                        <td
+                          className="table-empty"
+                          colSpan={COLUMNS.length + (selectMode ? 1 : 0)}
+                        >
                           {query
                             ? "No se encontraron artículos con esa búsqueda."
                             : "No hay artículos para mostrar."}
@@ -19394,43 +20884,129 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         catalogItems={items}
       />
 
+      {confirmBulkDelete && selectedRowIds.length ? (
+        <ChatChoiceModal
+          titleId="bulk-delete-table-title"
+          title={
+            selectedRowIds.length > 1
+              ? `Eliminar ${selectedRowIds.length} registros`
+              : "Eliminar registro"
+          }
+          subtitle={
+            selectedRowIds.length === 1
+              ? (() => {
+                  const row = items.find(
+                    (r) => Number(r.id) === selectedRowIds[0],
+                  );
+                  const et = String(row?.etiqueta ?? "").trim() || `ID ${selectedRowIds[0]}`;
+                  const art = String(row?.articulo ?? "").trim();
+                  return art ? `${et} — ${art}` : et;
+                })()
+              : `${selectedRowIds.length.toLocaleString("es-MX")} artículos seleccionados en la tabla`
+          }
+          onDismiss={() => {
+            if (!bulkBusy) setConfirmBulkDelete(false);
+          }}
+          keep={{
+            title: "Cancelar",
+            body:
+              selectedRowIds.length > 1
+                ? "Los registros se quedan en el inventario. No se borra nada."
+                : "El registro se queda en el inventario. No se borra nada.",
+            action: "Volver a la tabla",
+            disabled: bulkBusy,
+            onClick: () => {
+              if (!bulkBusy) setConfirmBulkDelete(false);
+            },
+          }}
+          drop={{
+            title: bulkBusy ? "Eliminando…" : "Borrar",
+            body:
+              selectedRowIds.length > 1
+                ? "No podrás deshacerlo desde aquí salvo con Deshacer justo después. Salen del inventario."
+                : "No podrás deshacerlo desde aquí salvo con Deshacer justo después. El artículo sale del inventario.",
+            action:
+              selectedRowIds.length > 1
+                ? "Eliminar registros"
+                : "Eliminar registro",
+            disabled: bulkBusy,
+            onClick: () => {
+              void handleBulkDelete();
+            },
+          }}
+        />
+      ) : null}
+
       {pendingChatDeletePlan?.phase === "modal" ? (
         <ChatChoiceModal
           titleId="chat-delete-record-title"
           title={
-            pendingChatDeletePlan.wholeOrigen &&
-            planDeleteOrigens(pendingChatDeletePlan).length
-              ? `Eliminar todo ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
-              : pendingChatDeletePlan.rows.length > 1
-                ? `Eliminar ${pendingChatDeletePlan.rows.length} registros`
-                : "Eliminar registro"
-          }
-          subtitle={
-            pendingChatDeletePlan.rows.length === 1
-              ? `${String(pendingChatDeletePlan.rows[0].etiqueta ?? "").trim() || `ID ${pendingChatDeletePlan.rows[0].id}`}${
-                  pendingChatDeletePlan.rows[0].articulo
-                    ? ` — ${pendingChatDeletePlan.rows[0].articulo}`
-                    : ""
-                }`
+            pendingChatDeletePlan.wipeAllOrigens ||
+            pendingChatDeletePlan.mode === "whole_all_origens"
+              ? "Eliminar todo el inventario"
               : pendingChatDeletePlan.wholeOrigen &&
                   planDeleteOrigens(pendingChatDeletePlan).length
-                ? `${pendingChatDeletePlan.rows.length.toLocaleString("es-MX")} registros de ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
-                : pendingChatDeletePlan.rows
-                    .slice(0, 4)
-                    .map(
-                      (r) =>
-                        String(r.etiqueta ?? "").trim() || `ID ${r.id}`,
-                    )
-                    .join(", ") +
-                  (pendingChatDeletePlan.rows.length > 4
-                    ? ` y ${pendingChatDeletePlan.rows.length - 4} más`
-                    : "") +
-                  (planDeleteOrigens(pendingChatDeletePlan).length
+                ? `Eliminar todo ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
+                : pendingChatDeletePlan.rows.length > 1
+                  ? `Eliminar ${pendingChatDeletePlan.rows.length} registros`
+                  : "Eliminar registro"
+          }
+          subtitle={
+            pendingChatDeletePlan.wipeAllOrigens ||
+            pendingChatDeletePlan.mode === "whole_all_origens"
+              ? `${pendingChatDeletePlan.rows.length.toLocaleString("es-MX")} registros${
+                  planDeleteOrigens(pendingChatDeletePlan).length
                     ? ` · ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
-                    : "")
+                    : ""
+                }`
+              : pendingChatDeletePlan.rows.length === 1
+                ? `${String(pendingChatDeletePlan.rows[0].etiqueta ?? "").trim() || `ID ${pendingChatDeletePlan.rows[0].id}`}${
+                    pendingChatDeletePlan.rows[0].articulo
+                      ? ` — ${pendingChatDeletePlan.rows[0].articulo}`
+                      : ""
+                  }`
+                : pendingChatDeletePlan.wholeOrigen &&
+                    planDeleteOrigens(pendingChatDeletePlan).length
+                  ? `${pendingChatDeletePlan.rows.length.toLocaleString("es-MX")} registros de ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
+                  : pendingChatDeletePlan.rows
+                      .slice(0, 4)
+                      .map(
+                        (r) =>
+                          String(r.etiqueta ?? "").trim() || `ID ${r.id}`,
+                      )
+                      .join(", ") +
+                    (pendingChatDeletePlan.rows.length > 4
+                      ? ` y ${pendingChatDeletePlan.rows.length - 4} más`
+                      : "") +
+                    (planDeleteOrigens(pendingChatDeletePlan).length
+                      ? ` · ${formatOrigensListEs(planDeleteOrigens(pendingChatDeletePlan))}`
+                      : "")
           }
           onDismiss={() => {
-            if (!chatDeleteBusy) setPendingChatDeletePlanSafe(null);
+            if (!chatDeleteBusy) {
+              setPendingChatDeletePlanSafe(null);
+              clearDeleteSideViewer();
+              const sid = activeChatIdRef.current;
+              if (sid) {
+                const bid = chatId.current++;
+                const cancelReply =
+                  "De acuerdo, cancelé el borrado. No toqué ningún registro.";
+                const next = [
+                  ...messagesRef.current,
+                  {
+                    id: bid,
+                    from: "bot" as const,
+                    text: cancelReply,
+                    at: Date.now(),
+                    resultItems: [] as ChatApiItem[],
+                    qr: [] as ChatQrPayload[],
+                  },
+                ];
+                messagesRef.current = next;
+                setMessages(next);
+                upsertChatSession(sid, next);
+              }
+            }
           }}
           keep={{
             title: "Cancelar",
@@ -19440,7 +21016,30 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 : "El registro se queda en el inventario. No se borra nada.",
             action: "Volver al chat",
             disabled: chatDeleteBusy,
-            onClick: () => setPendingChatDeletePlanSafe(null),
+            onClick: () => {
+              setPendingChatDeletePlanSafe(null);
+              clearDeleteSideViewer();
+              const sid = activeChatIdRef.current;
+              if (sid) {
+                const bid = chatId.current++;
+                const cancelReply =
+                  "De acuerdo, cancelé el borrado. No toqué ningún registro.";
+                const next = [
+                  ...messagesRef.current,
+                  {
+                    id: bid,
+                    from: "bot" as const,
+                    text: cancelReply,
+                    at: Date.now(),
+                    resultItems: [] as ChatApiItem[],
+                    qr: [] as ChatQrPayload[],
+                  },
+                ];
+                messagesRef.current = next;
+                setMessages(next);
+                upsertChatSession(sid, next);
+              }
+            },
           }}
           drop={{
             title: chatDeleteBusy ? "Eliminando…" : "Borrar",

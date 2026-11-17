@@ -128,7 +128,9 @@ export type ChatContextoVista = {
     | "origen"
     | "areas"
     | "areas_general"
-    | "comparacion";
+    | "comparacion"
+    | "etiquetas"
+    | "registros";
   valor: string;
   ranking?: Array<{
     area?: string;

@@ -4,7 +4,10 @@
  *
  * No depende del LLM: descompone en pasos locales ejecutables.
  */
-import { detectBulkCopyBetweenInventariosAsk } from "@/lib/inventario-origen";
+import {
+  detectBulkCopyBetweenInventariosAsk,
+  detectMultiSourceCopyToInventarioAsk,
+} from "@/lib/inventario-origen";
 import { looksLikeTransferVerb, normalizeChatSpelling } from "@/lib/chat-spell";
 
 export type ChatPlanStep =
@@ -79,6 +82,25 @@ export function detectInventarioMultiPlan(
   // “registros/etiquetas” solos NO bastan (chocan con comparar / últimos N).
   if (!transfer) return null;
 
+  // Multi-fuente (Inv1+excel1 → Inv2) tiene prioridad.
+  const multi = detectMultiSourceCopyToInventarioAsk(raw, existingOrigens);
+  if (multi && multi.sources.length) {
+    const skipExisting = hasSkipExisting(n) || true;
+    const primaryText = `pasa ${multi.sources.join(" y ")} a ${multi.dest}${
+      skipExisting ? " omitiendo las que ya existan" : ""
+    }`;
+    return {
+      steps: multi.sources.map((source) => ({
+        kind: "bulk_copy" as const,
+        source,
+        dest: multi.dest,
+        skipExisting: Boolean(skipExisting),
+        excludeEtiquetas: [] as string[],
+      })),
+      primaryText,
+    };
+  }
+
   // Necesita al menos 2 inventarios o “del 2 al 3”
   let bulk = detectBulkCopyBetweenInventariosAsk(raw, existingOrigens);
   if (!bulk) {
@@ -112,9 +134,14 @@ export function detectInventarioMultiPlan(
         existingOrigens.find((o) =>
           new RegExp(`\\binventario\\s*${num}\\b`, "i").test(o),
         ) || `Inventario ${num}`;
+      // Con “a/al/hacia” el último es destino (evita invertir por “crea inv 2”).
+      const destNum = /\b(?:a|al|hacia)\s+(?:el\s+)?inventari/.test(n)
+        ? uniq[uniq.length - 1]
+        : uniq[1];
+      const srcNum = uniq.find((x) => x !== destNum) ?? uniq[0];
       bulk = {
-        source: resolve(uniq[0]),
-        dest: resolve(uniq[1]),
+        source: resolve(srcNum),
+        dest: resolve(destNum),
         notifyExisting: true,
       };
     }

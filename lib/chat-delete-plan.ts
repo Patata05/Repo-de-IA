@@ -75,18 +75,29 @@ export function extractDeleteOrigens(
     if (!c) return;
     if (!found.some((o) => origensMatch(o, c))) found.push(c);
   };
+  /** “excel N”: legado si existe; si no → Inventario N. */
+  const addFileOrInv = (num: number) => {
+    if (!Number.isFinite(num) || num <= 0) return;
+    const wantExcel = `excel ${num}`;
+    const legacy = existing.find((o) => origensMatch(o, wantExcel));
+    if (legacy) {
+      add(legacy);
+      return;
+    }
+    add(resolveOrigenName(num, existing));
+  };
 
   // Cadenas: "excel 1 y 2", "excel 1, 2 y 3"
   for (const m of n.matchAll(
     /\b(excel|csv|xls|xlsx)\s*((?:\d+\s*(?:y|,|e|and)\s*)*\d+)\b/g,
   )) {
     for (const num of m[2].matchAll(/\d+/g)) {
-      add(`excel ${Number(num[0])}`);
+      addFileOrInv(Number(num[0]));
     }
   }
   // Explícitos: "excel 1 y excel 2"
   for (const m of n.matchAll(/\b(excel|csv|xls|xlsx)\s*(\d+)\b/g)) {
-    add(`excel ${Number(m[2])}`);
+    addFileOrInv(Number(m[2]));
   }
 
   // "inventario 1 y 2" / "Inventario 1 y Inventario 2"
@@ -128,7 +139,7 @@ function fold(raw: string): string {
   return normalizeChatSpelling(raw);
 }
 
-/** “elimina todos los inventarios / vacía todos los orígenes”. */
+/** “elimina todos los inventarios / todo el inventario / borra todo”. */
 export function looksLikeWipeAllInventariosAsk(text: string): boolean {
   const n = fold(text);
   if (!n) return false;
@@ -137,20 +148,96 @@ export function looksLikeWipeAllInventariosAsk(text: string): boolean {
       n,
     );
   if (!verb) return false;
+  // “todo Inventario 2” / “todo excel 1” → whole_origen, no wipe global.
+  if (
+    /\binventari\w*\s*\d+\b/.test(n) ||
+    /\b(excel|csv|xls|xlsx)\s*\d+\b/.test(n)
+  ) {
+    return false;
+  }
   return (
     /\b(todos|todas)\s+(los\s+|las\s+)?inventarios?\b/.test(n) ||
     /\b(todos|todas)\s+(los\s+|las\s+)?origenes?\b/.test(n) ||
-    /\binventarios?\s+(completos?|enteros?|todos)\b/.test(n)
+    /\binventarios?\s+(completos?|enteros?|todos)\b/.test(n) ||
+    /\btodo\s+(el\s+)?inventario\b/.test(n) ||
+    /\b(elimina|eliminar|borra|borrar|quita|quitar|vacia|vaciar|limpia|limpiar)\s+todo\b/.test(
+      n,
+    )
+  );
+}
+
+/**
+ * Agradecimiento / cierre casual: NUNCA es intención de borrado ni
+ * debe reactivar un plan (p. ej. “gracias” tras borrar una etiqueta).
+ */
+export function isCasualThanksOrClosingAck(text: string): boolean {
+  const n = fold(text);
+  if (!n) return true;
+  // Si trae verbo de borrado / confirmar borrado → no es solo cortesía.
+  if (
+    /\b(elimina|eliminar|elimine|borra|borrar|borre|quita|quitar|suprimir|confirmar?\s+(el\s+)?borrado)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  if (
+    /^(gracias|thanks|thank you|ty|thx|de nada|muchas gracias|mil gracias)([.!\s]*)$/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  // “ok gracias”, “listo gracias”, “perfecto muchas gracias”, …
+  const toks = n.split(/\s+/).filter(Boolean);
+  if (
+    toks.length <= 6 &&
+    /\b(gracias|thanks|thank you|thx|ty|de nada)\b/.test(n) &&
+    !/\b(inventari\w*|excel|csv|xls|xlsx|etiqueta|etiquetas|registro|registros|origen|archivo)\b/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** “elimina ambos / los dos exceles”. */
+export function looksLikeDeleteAmbosAsk(text: string): boolean {
+  const n = fold(text);
+  if (!n) return false;
+  if (isCasualThanksOrClosingAck(text)) return false;
+  const verb =
+    /\b(elimina|eliminar|elimine|elimines|eliminaras|borra|borrar|borre|quita|quitar|suprimir)\b/.test(
+      n,
+    );
+  if (!verb) return false;
+  return /\b(ambos|ambas|los\s+dos|las\s+dos|los\s+2|las\s+2)\b/.test(n);
+}
+
+/** “elimínala / bórralo / quítalas” → deixis a etiqueta(s), no al excel entero. */
+export function looksLikeDeleteDeixisSingular(text: string): boolean {
+  const n = fold(text);
+  if (!n) return false;
+  return (
+    /\b(elimina|borrar?|quita|suprimir)(la|lo|las|los)\b/.test(n) ||
+    /\b(elimina|borra|quita)\s+(esta|este|esa|ese|la|lo)\b/.test(n) ||
+    /\b(elimina|borra|quita)\s+(esta|este|esa|ese)\s+(etiqueta|registro|articulo|equipo|ficha)\b/.test(
+      n,
+    )
   );
 }
 
 export function looksLikeDeleteInventoryAsk(text: string): boolean {
   const n = fold(text);
   if (!n) return false;
+  if (isCasualThanksOrClosingAck(text)) return false;
   if (/\b(chat|busqueda|conversacion|mensaje|historial)\b/.test(n)) {
     return false;
   }
   if (looksLikeWipeAllInventariosAsk(text)) return true;
+  if (looksLikeDeleteAmbosAsk(text)) return true;
+  if (looksLikeDeleteDeixisSingular(text)) return true;
   const verb =
     /\b(elimina|eliminar|elimine|elimines|eliminaras|borra|borrar|borre|quita|quitar|suprimir)\b/.test(
       n,
@@ -164,6 +251,21 @@ export function looksLikeDeleteInventoryAsk(text: string): boolean {
     /\b(excel|csv|xls|xlsx)\s*\d+\b/.test(n) ||
     /\b\d{3,}\b/.test(n)
   );
+}
+
+/** excel/csv N existentes, ordenados por número. */
+function listExcelLikeOrigens(existing: string[]): string[] {
+  const found: string[] = [];
+  for (const o of existing) {
+    const c = canonicalizeOrigenLabel(String(o || "").trim());
+    if (!c || !/^(?:excel|csv|xls|xlsx)\s*\d+$/i.test(c)) continue;
+    if (!found.some((x) => origensMatch(x, c))) found.push(c);
+  }
+  return found.sort((a, b) => {
+    const na = Number(a.match(/\d+/)?.[0] || 0);
+    const nb = Number(b.match(/\d+/)?.[0] || 0);
+    return na - nb;
+  });
 }
 
 function resolveOrigenName(
@@ -215,17 +317,22 @@ export function detectChatDeleteIntent(
   text: string,
   existingOrigens: string[] = [],
 ): Omit<ChatDeletePlan, "rows" | "phase" | "askedAt"> | null {
+  if (isCasualThanksOrClosingAck(text)) return null;
   if (!looksLikeDeleteInventoryAsk(text)) return null;
   const n = fold(text);
   const existing = existingOrigens.length
     ? existingOrigens
     : listExistingOrigens([]);
 
-  // “elimina todos los inventarios” ≠ la etiqueta del panel.
+  // “elimina todo el inventario / borra todo” ≠ etiqueta previa del panel.
   if (looksLikeWipeAllInventariosAsk(text)) {
+    const allOrigens = existing
+      .map((o) => canonicalizeOrigenLabel(String(o || "").trim()))
+      .filter(Boolean);
     return {
       mode: "whole_all_origens",
       origen: undefined,
+      origenes: allOrigens.length ? allOrigens : undefined,
       etiquetas: [],
       includeScopedList: false,
       wholeOrigen: true,
@@ -251,20 +358,35 @@ export function detectChatDeleteIntent(
   const etiquetas = extractDeleteEtiquetas(text);
 
   // Uno o varios: “excel 1 y 2”, “Inventario 1 y Inventario 2”.
-  const origenes = extractDeleteOrigens(text, existing);
+  let origenes = extractDeleteOrigens(text, existing);
+  // “elimina ambos” → los 2 exceles presentes (o los 2 de menor N).
+  if (looksLikeDeleteAmbosAsk(text) && origenes.length < 2) {
+    const files = listExcelLikeOrigens(existing);
+    if (files.length >= 2) origenes = files.slice(0, 2);
+  }
   const origen = origenes[0];
+
+  // “elimínala (del excel 1)” / “borra esa” → NUNCA vaciar el origen entero.
+  const deixisSingular =
+    looksLikeDeleteDeixisSingular(text) || deixisSingularItem;
 
   const namedWholeCue =
     origenes.length > 0 &&
     etiquetas.length === 0 &&
     !includeScopedList &&
+    !deixisSingular &&
     (/\b(todo|toda|todos|todas|completo|completa|entero|entera)\b/.test(n) ||
       /\b(vacia|vaciar|limpia|limpiar)\b/.test(n) ||
       /\b(el|la)\s+inventari/.test(n) ||
       /\b(el|la)\s+(excel|csv|xls|xlsx)\b/.test(n) ||
-      /\b(excel|csv|xls|xlsx)\s*\d+\b/.test(n) ||
-      /\binventari\w*\s*\d+\b/.test(n) ||
-      origenes.length >= 2);
+      // Solo “excel N” / “inventario N” CON verbo de vaciar el contenedor,
+      // no por mencionar el origen junto a “elimínala”.
+      (/\b(excel|csv|xls|xlsx|inventari\w*)\s*\d+\b/.test(n) &&
+        /\b(todo|toda|completo|completa|entero|entera|vacia|vaciar|limpia|limpiar|archivo|origen)\b/.test(
+          n,
+        )) ||
+      origenes.length >= 2 ||
+      looksLikeDeleteAmbosAsk(text));
 
   const wholeOrigen = namedWholeCue;
 
@@ -370,27 +492,125 @@ export function resolveChatDeleteRows(opts: {
 }
 
 /** Hechos crudos para compose (la prosa la redacta OpenAI). */
+/**
+ * Si el agente ya pidió “confirma con sí” para borrar excel/Inventario N,
+ * recupera un plan FE para abrir el modal (sin llamar confirmar_eliminacion_origen).
+ */
+export function recoverDeletePlanFromBotConfirm(
+  botText: string,
+  inventory: InventarioRow[],
+  userText?: string,
+): ChatDeletePlan | null {
+  // Cortesía del usuario (“gracias”) → nunca reconstruir plan viejo.
+  if (userText != null && isCasualThanksOrClosingAck(userText)) return null;
+  const raw = String(botText || "").trim();
+  if (!raw) return null;
+  const n = fold(raw);
+  // Éxito / cancelación ya consumidos → no reabrir fantasma.
+  if (
+    /\b(elimin[eé]|eliminaron|borr[eé]|borraron|cancel[eé]|cancele|cancele\s+el\s+borrado|listo:\s*elimin|se\s+ha\s+realizado|se\s+han\s+realizado|exito|éxito|con\s+exito|con\s+éxito|ya\s+se\s+(elimino|borro)|no\s+toque\s+ningun)\b/.test(
+      n,
+    )
+  ) {
+    return null;
+  }
+  if (
+    !/\b(elimina|eliminar|borrado|borrar|eliminacion|eliminaran|eliminaranse)\b/.test(
+      n,
+    )
+  ) {
+    return null;
+  }
+  // Pedido activo de confirmación (sí/no), no “cancela” suelto.
+  if (
+    !/\b(confirm[aeo]|confirmar|responde?\s+con\s+['\"]?s[ií]|responde?\s+s[ií]|con\s+['\"]?s[ií]|borra\s+o\s+cancelar|borrar\s+o\s+cancelar)\b/.test(
+      n,
+    )
+  ) {
+    return null;
+  }
+  const existing = listExistingOrigens(inventory);
+  // Soft-confirm de wipe global (“todo el inventario”).
+  // No confundir con “todo Inventario 2”.
+  if (
+    !/\binventari\w*\s*\d+\b/.test(n) &&
+    !/\b(excel|csv|xls|xlsx)\s*\d+\b/.test(n) &&
+    (/\bwipe_all\b/.test(n) ||
+      /\btodo\s+(el\s+)?inventario\b/.test(n) ||
+      /\b(todos|todas)\s+(los\s+|las\s+)?inventarios?\b/.test(n) ||
+      /\beliminar?\s+todo\b/.test(n))
+  ) {
+    if (!inventory.length) return null;
+    const allOrigens = existing
+      .map((o) => canonicalizeOrigenLabel(String(o || "").trim()))
+      .filter(Boolean);
+    return {
+      mode: "whole_all_origens",
+      origen: undefined,
+      origenes: allOrigens.length ? allOrigens : undefined,
+      etiquetas: [],
+      includeScopedList: false,
+      wholeOrigen: true,
+      wipeAllOrigens: true,
+      phase: "await_yes",
+      rows: [...inventory],
+      askedAt: Date.now(),
+    };
+  }
+  let origenes = extractDeleteOrigens(raw, existing);
+  if (origenes.length < 1) {
+    // “'excel 1'” / «Inventario 2» en prosa del agente
+    for (const m of raw.matchAll(
+      /['"«»]?\b((?:excel|csv|xls|xlsx|inventario)\s*\d+)\b['"»]?/gi,
+    )) {
+      const c = canonicalizeOrigenLabel(m[1]);
+      if (c && !origenes.some((o) => origensMatch(o, c))) origenes.push(c);
+    }
+  }
+  if (!origenes.length) return null;
+  const rows = inventory.filter((row) =>
+    origenes.some((o) => sameOrigen(row, o)),
+  );
+  if (!rows.length) return null;
+  return {
+    mode: "whole_origen",
+    origen: origenes[0],
+    origenes,
+    etiquetas: [],
+    includeScopedList: false,
+    wholeOrigen: true,
+    wipeAllOrigens: false,
+    phase: "await_yes",
+    rows,
+    askedAt: Date.now(),
+  };
+}
+
 export function formatDeleteSoftConfirm(plan: ChatDeletePlan): string {
   const n = plan.rows.length;
   const origenes = planDeleteOrigens(plan);
-  const sample = plan.rows
-    .slice(0, 3)
-    .map((r) => {
-      const et = String(r.etiqueta ?? "").trim() || `ID ${r.id}`;
-      const art = String(r.articulo ?? "").trim();
-      return art ? `${et} (${art})` : et;
-    })
-    .join(", ");
+  const wipeAll =
+    Boolean(plan.wipeAllOrigens) || plan.mode === "whole_all_origens";
+  const sample = wipeAll
+    ? ""
+    : plan.rows
+        .slice(0, 3)
+        .map((r) => {
+          const et = String(r.etiqueta ?? "").trim() || `ID ${r.id}`;
+          const art = String(r.articulo ?? "").trim();
+          return art ? `${et} (${art})` : et;
+        })
+        .join(", ");
   return [
     `count=${n}`,
     origenes.length ? `origenes=${origenes.join("|")}` : null,
-    plan.wipeAllOrigens || plan.mode === "whole_all_origens"
-      ? "wipe_all=true"
-      : null,
+    wipeAll ? "wipe_all=true" : null,
     plan.wholeOrigen ? "whole_origen=true" : null,
     `mode=${plan.mode}`,
     sample ? `sample=${sample}` : null,
     "accion=pedir_confirmacion_borrado_si_no",
+    "estilo=prosa_desarrollada_3_a_5_oraciones",
+    "explicar=que_se_borra_impacto_y_pedir_si_no",
   ]
     .filter(Boolean)
     .join("; ");
@@ -401,14 +621,37 @@ export function formatDeleteModalPrompt(plan: ChatDeletePlan): string {
   const origenes = planDeleteOrigens(plan);
   const origenLabel = formatOrigensListEs(origenes);
   const dest = origenLabel ? ` en **${origenLabel}**` : "";
+  if (plan.wipeAllOrigens || plan.mode === "whole_all_origens") {
+    return (
+      `Perfecto, abrí el aviso final para eliminar **todo el inventario** ` +
+      `(**${n.toLocaleString("es-MX")}** registros` +
+      `${origenLabel ? ` en ${origenLabel}` : ""}). ` +
+      `Si confirmas con **Borrar**, se vaciarán todos los orígenes y el contador quedará en 0; ` +
+      `si prefieres no hacerlo, pulsa **Cancelar** y no tocaré nada.`
+    );
+  }
   if (n === 1) {
     const et = String(plan.rows[0]?.etiqueta ?? "").trim() || "el registro";
-    return `Perfecto. Abro el aviso para eliminar **${et}**${dest}. Confirma con **Borrar** o **Cancelar**.`;
+    const art = String(plan.rows[0]?.articulo ?? "").trim();
+    return (
+      `Listo: abrí el aviso para eliminar **${et}**` +
+      `${art ? ` (${art})` : ""}${dest}. ` +
+      `Revisa el detalle y confirma con **Borrar** si quieres sacarlo del inventario, ` +
+      `o **Cancelar** si mejor lo dejamos como está.`
+    );
   }
   if (plan.wholeOrigen && origenLabel) {
-    return `De acuerdo. Abro el aviso para eliminar **todo ${origenLabel}** (${n.toLocaleString("es-MX")} registros). Confirma con **Borrar** o **Cancelar**.`;
+    return (
+      `De acuerdo: abrí el aviso para vaciar **todo ${origenLabel}** ` +
+      `(**${n.toLocaleString("es-MX")}** registros). ` +
+      `Al confirmar con **Borrar**, esos artículos salen de ese origen; ` +
+      `con **Cancelar** dejo todo igual.`
+    );
   }
-  return `De acuerdo. Abro el aviso para eliminar **${n.toLocaleString("es-MX")}** registros${dest}. Confirma con **Borrar** o **Cancelar**.`;
+  return (
+    `De acuerdo: abrí el aviso para eliminar **${n.toLocaleString("es-MX")}** registros${dest}. ` +
+    `Confirma con **Borrar** para aplicar el borrado o **Cancelar** si quieres detenerlo.`
+  );
 }
 
 export function formatDeleteDoneFallback(plan: {
@@ -416,6 +659,8 @@ export function formatDeleteDoneFallback(plan: {
   origen?: string;
   origenes?: string[];
   wholeOrigen?: boolean;
+  wipeAllOrigens?: boolean;
+  mode?: ChatDeleteMode;
   deletedCount: number;
 }): string {
   const n = plan.deletedCount;
@@ -423,26 +668,37 @@ export function formatDeleteDoneFallback(plan: {
   const origenLabel = formatOrigensListEs(origenes);
   const dest = origenLabel ? ` de **${origenLabel}**` : " del inventario";
   const qty = countWordsEs(n);
+  if (plan.wipeAllOrigens || plan.mode === "whole_all_origens") {
+    const variants = [
+      `Listo: eliminé todo el inventario (**${n.toLocaleString("es-MX")}** registros). Ya no queda ningún artículo en Supabase y el contador está en 0. Si quieres, podemos importar un Excel nuevo o empezar a armar inventarios desde cero.`,
+      `Hecho: se borraron todos los inventarios (**${n.toLocaleString("es-MX")}**). La base quedó vacía y limpia. ¿Importamos de nuevo o prefieres crear un Inventario vacío?`,
+      `Confirmado: inventario vacío (${qty} eliminados). Todo quedó en cero. Dime si seguimos con una importación o con otra consulta.`,
+    ];
+    return variants[n % variants.length];
+  }
   if (plan.wholeOrigen && origenLabel) {
     const variants = [
-      `Listo: eliminé todos los registros${dest} (${n.toLocaleString("es-MX")}). ¿Quieres revisar otro inventario o importar de nuevo?`,
-      `Hecho: **${origenLabel}** quedó vacío (${n.toLocaleString("es-MX")} borrados). ¿Seguimos con otra consulta?`,
-      `Confirmado: se eliminaron ${qty}${dest}. ¿Te ayudo con algo más?`,
+      `Listo: eliminé todos los registros${dest} (**${n.toLocaleString("es-MX")}**). Ese origen quedó vacío y el resto del inventario sigue intacto. ¿Revisamos otro inventario o importamos de nuevo?`,
+      `Hecho: **${origenLabel}** quedó vacío (**${n.toLocaleString("es-MX")}** borrados). Si quieres, seguimos con otra consulta o con una carga de Excel.`,
+      `Confirmado: se eliminaron ${qty}${dest}. ¿Te ayudo a revisar lo que quedó o a crear un inventario nuevo?`,
     ];
     return variants[n % variants.length];
   }
   if (n === 1) {
     const et = String(plan.rows[0]?.etiqueta ?? "").trim() || "el registro";
     const art = String(plan.rows[0]?.articulo ?? "").trim();
-    return `Listo: eliminé **${et}**${art ? ` — ${art}` : ""}${dest}.`;
+    return (
+      `Listo: eliminé **${et}**${art ? ` — ${art}` : ""}${dest}. ` +
+      `Ya no aparece en el inventario. ¿Quieres revisar otra etiqueta o seguir con otra consulta?`
+    );
   }
   const sample = plan.rows
     .slice(0, 2)
     .map((r) => `**${String(r.etiqueta ?? "").trim() || r.id}**`)
     .join(", ");
   const variants = [
-    `Listo: eliminé ${qty}${dest}. Entre ellas ${sample}. ¿Otra acción?`,
-    `Hecho: se borraron **${n.toLocaleString("es-MX")}** registros${dest}. ¿Quieres ver el inventario actualizado o exportar Excel?`,
+    `Listo: eliminé ${qty}${dest}. Entre ellas ${sample}. El inventario ya refleja esos cambios. ¿Otra acción?`,
+    `Hecho: se borraron **${n.toLocaleString("es-MX")}** registros${dest}. Si quieres, vemos el inventario actualizado o exportamos un Excel.`,
     `Confirmado: ${qty} ya no están${dest}. ¿Seguimos con otra consulta?`,
   ];
   return variants[n % variants.length];

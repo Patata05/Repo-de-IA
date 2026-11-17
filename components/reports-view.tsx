@@ -36,6 +36,7 @@ import {
   indexMatchesPrepared,
   prepareSearch,
 } from "@/lib/inventario-search";
+import { buildInventarioExcelFile } from "@/lib/export-inventario-excel";
 
 interface ReportsViewProps {
   items: InventarioRow[];
@@ -219,6 +220,7 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
   // Modal para agregar productos adicionales
   const [isAddPickerOpen, setIsAddPickerOpen] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
+  const [excelBusy, setExcelBusy] = useState(false);
 
   // Ancla visual para no perder la posición al seleccionar/deseleccionar
   const listAnchorRef = useRef<HTMLElement | null>(null);
@@ -446,57 +448,36 @@ export default function ReportsView({ items, onSelectProduct }: ReportsViewProps
     setDebouncedSearch("");
   };
 
-  // Exportar reporte a CSV (SOLO LOS SELECCIONADOS)
-  const handleExportCSV = () => {
-    if (!reportIncludedItems.length) {
-      alert("No hay ningún artículo seleccionado para exportar.");
+  // Exportar reporte a Excel .xlsx (SOLO LOS SELECCIONADOS) — misma lógica del chat.
+  const handleExportExcel = async () => {
+    if (!reportIncludedItems.length || excelBusy) {
+      if (!reportIncludedItems.length) {
+        alert("No hay ningún artículo seleccionado para exportar.");
+      }
       return;
     }
-
-    const headers = [
-      "Etiqueta",
-      "Artículo",
-      "Marca",
-      "Modelo",
-      "Serie",
-      "Área",
-      "Persona Asignada",
-      "Cantidad",
-      "Origen",
-      "Observaciones",
-      "Fecha Alta",
-    ];
-
-    const escapeCsv = (str: unknown) => {
-      const val = String(str ?? "").replace(/"/g, '""');
-      return `"${val}"`;
-    };
-
-    const rows = reportIncludedItems.map((r) => [
-      escapeCsv(r.etiqueta),
-      escapeCsv(r.articulo),
-      escapeCsv(r.marca),
-      escapeCsv(r.modelo),
-      escapeCsv(r.serie),
-      escapeCsv(r.area),
-      escapeCsv(r.persona),
-      r.cantidad ?? 1,
-      escapeCsv(r.origen),
-      escapeCsv(r.observaciones),
-      escapeCsv(r.created_at ? new Date(r.created_at).toLocaleDateString("es-MX") : ""),
-    ]);
-
-    const csvContent =
-      "\uFEFF" + [headers.join(","), ...rows.map((row) => row.join(","))].join("\r\n");
-
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    const dateStr = new Date().toISOString().slice(0, 10);
-    link.href = url;
-    link.download = `reporte_inventario_${dateStr}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
+    setExcelBusy(true);
+    try {
+      const titlePreset = buildReportTitle(filterArea, filterPerson, filterOrigen);
+      const file = await buildInventarioExcelFile(reportIncludedItems, {
+        focus: titlePreset || "Reporte",
+        kind: "Reporte",
+        sheetName: "Reporte",
+        suffix: new Date().toISOString().slice(0, 10),
+      });
+      const link = document.createElement("a");
+      link.href = file.dataUrl;
+      link.download = file.name;
+      link.click();
+    } catch (err) {
+      alert(
+        err instanceof Error
+          ? err.message
+          : "No se pudo generar el Excel del reporte.",
+      );
+    } finally {
+      setExcelBusy(false);
+    }
   };
 
   // Imprimir reporte formal (SOLO LOS SELECCIONADOS)
@@ -880,12 +861,18 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
           <button
             type="button"
             className="btn-rep-primary"
-            onClick={handleExportCSV}
-            disabled={totalReportRecords === 0}
-            title="Descargar tabla en formato CSV para Microsoft Excel"
+            onClick={() => {
+              void handleExportExcel();
+            }}
+            disabled={totalReportRecords === 0 || excelBusy}
+            title="Descargar reporte en formato Excel (.xlsx)"
           >
             <Download size={15} />
-            <span>Exportar CSV ({totalReportRecords})</span>
+            <span>
+              {excelBusy
+                ? "Generando Excel…"
+                : `Exportar Excel (${totalReportRecords})`}
+            </span>
           </button>
         </div>
       </section>
@@ -985,7 +972,7 @@ ${areaBreakdown.map(([area, data]) => `- ${area}: ${data.units} unidades (${data
             </h2>
             <p>
               {viewMode === "incluidos"
-                ? "Esta es la lista exacta de artículos que se exportarán en CSV o se imprimirán. Puedes quitar artículos con el botón de la derecha."
+                ? "Esta es la lista exacta de artículos que se exportarán en Excel o se imprimirán. Puedes quitar artículos con el botón de la derecha."
                 : "Marca o desmarca los artículos para agregarlos o quitarlos del reporte según lo que necesites."}
             </p>
           </div>

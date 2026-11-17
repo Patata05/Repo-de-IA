@@ -109,10 +109,11 @@ export function buildBulkTransferConfirmReply(input: {
         })`
       : "";
   return (
-    `Voy a cambiar **${fieldLabel}** de **${input.fromLabel}** → **${input.toValue}** ` +
+    `Voy a actualizar el campo **${fieldLabel}**: de **${input.fromLabel}** pasará a **${input.toValue}** ` +
     `en **${input.count.toLocaleString("es-MX")}** registro` +
-    `${input.count === 1 ? "" : "s"}${sample}.\n\n` +
-    `¿Confirmas? Responde **sí** para aplicarlos o **no** para cancelar.`
+    `${input.count === 1 ? "" : "s"}${sample}. ` +
+    `Los demás datos de cada ficha se mantienen igual; solo cambia esa asignación. ` +
+    `¿Lo aplico? Responde **sí** para confirmar o **no** para cancelar sin tocar nada.`
   );
 }
 
@@ -124,9 +125,10 @@ export function buildBulkTransferDoneReply(input: {
 }): string {
   const fieldLabel = input.field === "persona" ? "persona" : "área";
   return (
-    `Listo: actualicé **${fieldLabel}** de **${input.fromLabel}** → **${input.toValue}** ` +
+    `Listo: actualicé **${fieldLabel}** de **${input.fromLabel}** a **${input.toValue}** ` +
     `en **${input.count.toLocaleString("es-MX")}** registro` +
-    `${input.count === 1 ? "" : "s"}.`
+    `${input.count === 1 ? "" : "s"}. ` +
+    `El inventario ya refleja ese cambio. ¿Quieres revisar esas fichas o seguimos con otra consulta?`
   );
 }
 

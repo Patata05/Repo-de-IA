@@ -792,13 +792,13 @@ html:not(.theme-dark) .sidebar-backdrop {
   min-width: 148px;
   gap: 2px;
   padding: 10px 8px;
-  border: 0;
-  border-radius: 20px;
-  background: #282a2d;
+  border: 1px solid rgba(51, 65, 85, 0.7);
+  border-radius: 12px;
+  background: #0f172a;
   box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.28),
-    0 12px 32px rgba(0, 0, 0, 0.42);
-  color: #e8eaed;
+    0 20px 25px -5px rgba(0, 0, 0, 0.4),
+    0 8px 10px -6px rgba(0, 0, 0, 0.4);
+  color: #e2e8f0;
 }
 
 .sidebar-history-menu.is-floating {
@@ -816,32 +816,40 @@ html:not(.theme-dark) .sidebar-backdrop {
   min-height: 44px;
   padding: 10px 14px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 10px;
   background: transparent;
-  color: #e8eaed;
+  color: #e2e8f0;
   cursor: pointer;
   font-size: 14px;
   font-weight: 500;
   letter-spacing: 0.01em;
   text-align: left;
+  transition: background-color 140ms ease, color 140ms ease;
 }
 
 .sidebar-history-menu button:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(244, 63, 94, 0.15);
+  color: #fb7185;
 }
 
 .sidebar-history-menu-chevron {
   margin-left: auto;
-  color: #9aa0a6;
+  color: #94a3b8;
 }
 
 .sidebar-history-menu button.is-danger {
-  color: #e8eaed;
+  color: #e2e8f0;
+}
+
+.sidebar-history-menu button.is-danger:hover {
+  background: rgba(244, 63, 94, 0.15);
+  color: #fb7185;
 }
 
 html:not(.theme-dark) .sidebar-history-menu {
   background: var(--surface-raised);
   color: var(--text);
+  border-color: var(--border);
   box-shadow: var(--shadow);
 }
 
@@ -849,8 +857,10 @@ html:not(.theme-dark) .sidebar-history-menu button {
   color: var(--text);
 }
 
-html:not(.theme-dark) .sidebar-history-menu button:hover {
-  background: var(--blue-soft);
+html:not(.theme-dark) .sidebar-history-menu button:hover,
+html:not(.theme-dark) .sidebar-history-menu button.is-danger:hover {
+  background: rgba(244, 63, 94, 0.12);
+  color: #e11d48;
 }
 
 .sidebar-history-empty {
@@ -1548,6 +1558,21 @@ button.stat-card:focus-visible {
   gap: 8px;
 }
 
+.col-select {
+  width: 44px;
+  min-width: 44px;
+  max-width: 48px;
+  padding-left: 12px;
+  padding-right: 8px;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.col-select .rep-checkbox-btn {
+  margin: 0 auto;
+  flex-shrink: 0;
+}
+
 .table-select-cell {
   display: inline-flex;
   align-items: center;
@@ -1561,7 +1586,7 @@ button.stat-card:focus-visible {
 
 .table-row-selectable {
   cursor: pointer;
-  transition: background-color 0.15s ease;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .table-row-selectable:hover {
@@ -1569,11 +1594,24 @@ button.stat-card:focus-visible {
 }
 
 .table-row-selectable.is-selected {
-  background: color-mix(in srgb, var(--blue) 16%, transparent) !important;
+  background: var(--blue-selected-background) !important;
+  box-shadow: inset 3px 0 0 var(--blue);
 }
 
-.table-row-selectable .rep-checkbox-btn.is-checked svg {
+.table-row-selectable.is-selected:hover {
+  background: color-mix(in srgb, var(--blue) 22%, transparent) !important;
+}
+
+.table-row-selectable .rep-checkbox-btn.is-checked svg,
+.col-select .rep-checkbox-btn.is-checked svg,
+.col-select .rep-checkbox-btn.is-indeterminate svg {
   color: #fff;
+}
+
+.rep-checkbox-btn.is-indeterminate {
+  background: color-mix(in srgb, var(--blue) 70%, var(--surface));
+  border-color: var(--blue);
+  opacity: 0.9;
 }
 
 .sheet-heading p {
@@ -3851,11 +3889,51 @@ html.theme-dark .chat-composer input::placeholder {
   contain: style;
 }
 
+.chat-token-soft-warn {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+html:not(.theme-dark) .chat-token-soft-warn {
+  border-color: rgba(185, 28, 28, 0.28);
+  background: rgba(254, 226, 226, 0.92);
+  color: #7f1d1d;
+}
+
+.chat-token-soft-warn-btn {
+  margin-left: auto;
+  padding: 3px 8px;
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chat-token-soft-warn-btn:hover {
+  background: rgba(248, 113, 113, 0.18);
+}
+
 .chat-token-meter-wrap {
   position: relative;
   display: inline-flex;
   align-items: center;
   flex: none;
+  /* Ancla fija del popover (bottom-full) sin desalinear al scroll. */
+  isolation: isolate;
 }
 
 .chat-token-meter-btn {
@@ -3943,9 +4021,16 @@ html:not(.theme-dark) .chat-token-ring-fill {
 .chat-token-popover {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 12px);
+  /* bottom-full mb-2: anclado al trigger, no salta al expandir Detalle técnico */
+  bottom: 100%;
+  margin-bottom: 0.5rem;
   z-index: 60;
-  width: 298px;
+  width: 20rem; /* w-80 */
+  max-width: min(20rem, calc(100vw - 1.5rem));
+  max-height: 80vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 12px 14px;
   border: 1px solid rgba(107, 140, 255, 0.3);
   border-radius: 16px;
@@ -4071,6 +4156,7 @@ html:not(.theme-dark) .chat-token-popover-grid span {
   font-size: 11.5px;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .chat-token-popover-grid-clean {
@@ -4088,6 +4174,14 @@ html:not(.theme-dark) .chat-token-details {
 }
 
 .chat-token-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.375rem; /* gap-1.5 */
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  text-align: left;
   cursor: pointer;
   list-style: none;
   font-size: 11px;
@@ -4095,19 +4189,34 @@ html:not(.theme-dark) .chat-token-details {
   letter-spacing: 0.02em;
   color: rgba(186, 198, 214, 0.78);
   user-select: none;
+  box-sizing: border-box;
 }
 
 .chat-token-details > summary::-webkit-details-marker {
   display: none;
 }
 
+/* Caret fijo a la izquierda; el texto queda alineado con Usados / Restantes */
 .chat-token-details > summary::before {
-  content: "▸ ";
+  content: "▸";
+  flex: 0 0 0.7rem;
+  width: 0.7rem;
+  margin: 0;
+  padding: 0;
   color: #55d7c4;
+  line-height: 1;
+  text-align: center;
 }
 
 .chat-token-details[open] > summary::before {
-  content: "▾ ";
+  content: "▾";
+}
+
+.chat-token-details > :not(summary) {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
 html:not(.theme-dark) .chat-token-details > summary {
@@ -4271,10 +4380,16 @@ html:not(.theme-dark) .chat-token-model-check {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding-top: 8px;
   border-top: 1px solid rgba(148, 163, 184, 0.16);
   font-size: 10.5px;
   color: rgba(186, 198, 214, 0.72);
+}
+
+.chat-token-popover-foot > span {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 html:not(.theme-dark) .chat-token-popover-foot {

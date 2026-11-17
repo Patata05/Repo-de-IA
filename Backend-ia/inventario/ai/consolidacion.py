@@ -69,7 +69,13 @@ def _normalize_tramos(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _row_to_insert(row: dict, destino: str) -> dict[str, Any]:
+def _row_to_insert(
+    row: dict,
+    destino: str,
+    all_rows: list[dict] | None = None,
+) -> dict[str, Any]:
+    import re
+
     payload: dict[str, Any] = {"origen": destino}
     for k in _COPY_FIELDS:
         if row.get(k) is not None and str(row.get(k)).strip() != "":
@@ -80,6 +86,34 @@ def _row_to_insert(row: dict, destino: str) -> dict[str, Any]:
         payload["area"] = str(row.get("area") or "General").strip() or "General"
     if not payload.get("etiqueta"):
         payload["etiqueta"] = str(row.get("etiqueta") or "").strip()
+    # Procedencia: inventario más reciente con esa etiqueta (excluye destino).
+    etq = str(payload.get("etiqueta") or "").strip().lower()
+    dest_f = str(destino or "").strip().lower()
+    best_rank = -1
+    best_origen = str(row.get("origen") or "").strip()
+    for r in all_rows or []:
+        if str(r.get("etiqueta") or "").strip().lower() != etq:
+            continue
+        o = str(r.get("origen") or "").strip()
+        if not o or o.lower() == dest_f:
+            continue
+        rank = 1_000
+        m_inv = re.match(r"(?i)^inventario\s+(\d+)\s*$", o)
+        m_ex = re.match(r"(?i)^(excel|csv|xls|xlsx)\s*(\d+)\s*$", o)
+        if m_inv:
+            rank = 1_000_000 + int(m_inv.group(1))
+        elif m_ex:
+            rank = 100_000 + int(m_ex.group(2))
+        if rank > best_rank:
+            best_rank = rank
+            best_origen = o
+    if best_origen:
+        prev = str(payload.get("observaciones") or "").strip()
+        prev = re.sub(
+            r"(^|\n)\s*Copiado desde[^\n]*", "", prev, flags=re.IGNORECASE
+        ).strip()
+        note = f"Copiado desde {best_origen}."
+        payload["observaciones"] = f"{prev}\n{note}".strip() if prev else note
     try:
         source_id = int(row.get("id"))
     except (TypeError, ValueError):
@@ -103,7 +137,7 @@ def preparar_consolidacion(
     if not tramos_n:
         return {
             "ok": False,
-            "error": "Indica al menos un tramo con origen (ej. excel 1, Inventario 2).",
+            "error": "Indica al menos un tramo con origen (ej. Inventario 1, Inventario 2).",
             "needs_confirm": False,
         }
 
@@ -167,7 +201,7 @@ def preparar_consolidacion(
                 omitidos_tramo += 1
                 continue
             lote_etq.add(etq)
-            lote.append(_row_to_insert(row, destino_final))
+            lote.append(_row_to_insert(row, destino_final, all_rows))
             tomados += 1
         tramos_resumen.append(
             {

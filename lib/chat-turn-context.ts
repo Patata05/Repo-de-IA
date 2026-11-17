@@ -199,8 +199,7 @@ function firstUserMessage(messages: ChatHistoryMsg[]): ChatHistoryMsg | null {
 
 /**
  * Une el mensaje actual con el hilo (pregunta del bot / tema previo).
- * Ej.: bot habló de etiqueta 283586 + usuario “agrega esa a inventario 2”
- * → effective “agrega etiqueta 283586 a Inventario 2”.
+ * Las etiquetas solo se toman del mensaje actual del usuario (nunca del bot).
  */
 export function resolveChatTurnContext(input: {
   userText: string;
@@ -224,11 +223,8 @@ export function resolveChatTurnContext(input: {
   const botTopic = lastBot ? detectTopicFromText(lastBot.text) : "unknown";
   const botInvs = lastBot ? inventariosInText(lastBot.text) : [];
   const userInvs = inventariosInText(raw);
-  const threadEtiquetas = etiquetasFromMessages([
-    ...historyWithoutCurrent.slice(-8),
-    { from: "user", text: raw },
-  ]);
-  const priorEtiquetas = etiquetasFromMessages(historyWithoutCurrent.slice(-8));
+  // SOLO mensaje actual del usuario (nunca del asistente ni del hilo bot).
+  const threadEtiquetas = extractEtiquetasFromThreadText(raw);
 
   let effectiveText = raw;
   let topic: ChatTopicKind = directTopic !== "unknown" ? directTopic : botTopic;
@@ -240,14 +236,14 @@ export function resolveChatTurnContext(input: {
       spelled,
     );
 
-  // “omite esa e importa Inventario 2 → 3” (NO convertir en “agrega 283586”).
+  // “omite esa e importa Inventario 2 → 3” — solo si el usuario ya citó la etiqueta.
   if (
     wantsOmit &&
     looksLikeTransferVerb(spelled) &&
     userInvs.length >= 1 &&
-    priorEtiquetas[0]
+    threadEtiquetas[0]
   ) {
-    const tag = priorEtiquetas[0];
+    const tag = threadEtiquetas[0];
     const dest = userInvs[userInvs.length - 1];
     const source =
       userInvs.length >= 2
@@ -277,18 +273,18 @@ export function resolveChatTurnContext(input: {
     ) &&
       /\b(demas|otros|inventarios?)\b/.test(spelled));
 
-  // “agrega esa / esa etiqueta a Inventario 2” → etiqueta del mensaje de arriba
-  // (solo si NO pidió omitir/excluir ni un merge masivo).
+  // “agrega esa etiqueta …” solo si el usuario ya escribió el código en ESTE mensaje.
+  // Prohibido tomar etiquetas de mensajes del asistente.
   if (
     !fromContext &&
     !wantsOmit &&
     !wantsAllOthersMerge &&
     looksLikeTransferVerb(spelled) &&
     userInvs.length >= 1 &&
-    (looksLikeEtiquetaAnaphora(spelled) ||
-      (!/\b\d{4,}\b/.test(spelled) && priorEtiquetas.length > 0))
+    threadEtiquetas[0] &&
+    looksLikeEtiquetaAnaphora(spelled)
   ) {
-    const tag = priorEtiquetas[0];
+    const tag = threadEtiquetas[0];
     const dest = userInvs[userInvs.length - 1];
     if (tag && dest) {
       effectiveText = `agrega etiqueta ${tag} a ${dest}`;
@@ -328,8 +324,8 @@ export function resolveChatTurnContext(input: {
     ) {
       topic = botTopic;
       fromContext = true;
-    } else if (botTopic === "etiqueta_origen" && priorEtiquetas[0]) {
-      effectiveText = `etiqueta ${priorEtiquetas[0]} de que inventario venia`;
+    } else if (botTopic === "etiqueta_origen" && threadEtiquetas[0]) {
+      effectiveText = `etiqueta ${threadEtiquetas[0]} de que inventario venia`;
       topic = "etiqueta_origen";
       fromContext = true;
     }
@@ -367,15 +363,15 @@ export function resolveChatTurnContext(input: {
       ? `Primer mensaje del chat: “${String(firstUser.text).replace(/\s+/g, " ").slice(0, 160)}”.`
       : "",
     topic !== "unknown" ? `Tema activo: ${topic}.` : "",
-    priorEtiquetas.length
-      ? `Etiquetas recientes en el hilo: ${priorEtiquetas.slice(0, 5).join(", ")}.`
+    threadEtiquetas.length
+      ? `Etiquetas citadas por el usuario en este turno: ${threadEtiquetas.slice(0, 5).join(", ")}.`
       : "",
-    "Si el usuario dice «esa/ese/esa etiqueta», se refiere a la etiqueta del mensaje de arriba.",
+    "No uses etiquetas inventadas ni códigos de mensajes anteriores del asistente.",
     "No cambies de tema (áreas, personas, recientes) salvo que el usuario lo pida claro.",
     "Tolera faltas de ortografía; interpreta la intención más cercana al inventario.",
     isFirstUserTurn
       ? "Es el primer mensaje del chat: responde con coherencia y una sola intención clara."
-      : "Usa el contexto de arriba para interpretar afirmaciones cortas (sí, esa, agregala a Inventario N).",
+      : "Usa el contexto de inventarios del hilo; no inventes etiquetas.",
   ]
     .filter(Boolean)
     .join(" ");
