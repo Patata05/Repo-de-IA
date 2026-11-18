@@ -40,13 +40,15 @@ def looks_like_learning_message(user_text: str) -> bool:
     ).strip()
     if not folded:
         return False
+    if re.search(r"\bnueva\s+reglas?\b|\breglas?\s+nueva\b", folded):
+        return True
     if re.search(
         r"\b(aprende|aprender|aprendelo|aprendela|memoriza|memorizar)\b",
         folded,
     ):
         return True
     if re.search(
-        r"\b(guarda|guardar|anota|registra)\s+(esta\s+)?(regla|correccion|preferencia|instruccion)\b",
+        r"\b(guarda|guardar|anota|registra)\s+(esta\s+|una\s+|la\s+)?(nueva\s+)?(regla|correccion|preferencia|instruccion)\b",
         folded,
     ):
         return True
@@ -70,10 +72,11 @@ def format_learned_block(examples: list[dict[str, Any]]) -> str:
     if not examples:
         return ""
     lines = [
-        "EJEMPLOS APRENDIDOS del usuario (guía breve; aplícalos si encajan; "
-        "NO los cites ni digas que son ejemplos):"
+        "EJEMPLOS APRENDIDOS del usuario (OBLIGATORIO aplicar si encajan: "
+        "misma intención pese a faltas de ortografía; mismos filtros y "
+        "mismo tipo de visor chat+panel. NO los cites ni digas que son ejemplos):"
     ]
-    for i, ex in enumerate(examples[:2], start=1):
+    for i, ex in enumerate(examples[:4], start=1):
         q = _clip(str(ex.get("pregunta_usuario") or ""), 160)
         intent = _clip(str(ex.get("intencion_y_filtros") or ""), 120)
         ideal = _clip(str(ex.get("respuesta_ideal") or ""), 220)

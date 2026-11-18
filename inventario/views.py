@@ -345,6 +345,22 @@ def chat(request):
             pass
 
     items_out = items or []
+    # Señal FE: abrir modal de borrado (preparar_eliminacion_origen).
+    eliminacion_pendiente = None
+    if isinstance(viewer, dict):
+        ep = viewer.get("eliminacion_pendiente")
+        if isinstance(ep, dict) and str(ep.get("origen") or "").strip():
+            raw_ids = ep.get("ids") if isinstance(ep.get("ids"), list) else []
+            eliminacion_pendiente = {
+                "origen": str(ep.get("origen") or "").strip(),
+                "count": int(ep.get("count") or 0),
+                "kind": str(ep.get("kind") or "").strip(),
+                "ids": [
+                    int(x)
+                    for x in raw_ids
+                    if str(x).strip().lstrip("-").isdigit()
+                ],
+            }
     # contexto_vista: null = charla/sin datos (visor oculto); objeto = mostrar/sincronizar.
     contexto_out = None
     if isinstance(viewer, dict) and viewer.get("tipo"):
@@ -371,6 +387,12 @@ def chat(request):
                 "tipo": tipo_v,
                 "valor": valor_v,
                 "lista_limitada": bool(viewer.get("lista_limitada")),
+            }
+        elif eliminacion_pendiente and not contexto_out:
+            contexto_out = {
+                "tipo": "origen",
+                "valor": eliminacion_pendiente["origen"],
+                "lista_limitada": False,
             }
 
     # Crear/juntar/mover inventarios ≠ exportar Excel.
@@ -527,6 +549,8 @@ def chat(request):
         "acciones_sugeridas": acciones,
         # Solo true tras confirmar_exportacion_excel (o pedido ya confirmado).
         "exportar_excel": bool(export_authorized),
+        # Modal FE de borrado (origen + count + ids); null si no hay pendiente.
+        "eliminacion_pendiente": eliminacion_pendiente,
         "contexto_vista": contexto_out,
         # Alias retrocompatible.
         "viewer": (

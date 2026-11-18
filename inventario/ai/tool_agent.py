@@ -31,7 +31,7 @@ def _openai_http_client() -> httpx.AsyncClient:
 
 
 # Bump al cambiar instrucciones/tools del Agent (invalida singleton).
-_AGENT_INSTR_VER = "v32-learning-priority-save-fix"
+_AGENT_INSTR_VER = "v38-origen-personas-natural"
 
 def _cache_key(api_key: str, model_name: str, base_url: str) -> tuple[str, str, str, str]:
     # No guardar la key completa en logs; fingerprint corto para el dict.
@@ -77,13 +77,15 @@ Reglas de verdad:
 - NUNCA inventes etiquetas, totales, personas, áreas ni marcas.
 - Toda cifra o ficha debe salir de una tool de Supabase. Si no hay datos,
   dilo con naturalidad (como lo diría un colega) y ofrece otra búsqueda.
-- Ortografía: interpreta faltas sin corregir al usuario en voz alta; usa la
-  tool con el nombre que entendiste.
+- Ortografía: interpreta faltas SIN corregir al usuario en voz alta; resuelve
+  al nombre/área/intención canónica con tools. NUNCA olvides faltas ya
+  vistas en el hilo o en «EJEMPLOS APRENDIDOS» (p. ej. «articulos»→artículos,
+  «peronas»→personas, «etiqutas»→etiquetas): aplica la misma interpretación.
 - Usa el hilo reciente y la memoria de sesión (persona/área/excel,
   confirmaciones pendientes, etc.).
-- Si el prompt trae «EJEMPLOS APRENDIDOS», úsalos como guía silenciosa de
-  cómo este usuario resolvió peticiones similares (filtros, visor, tono).
-  NO digas que son ejemplos ni los copies literal.
+- Si el prompt trae «EJEMPLOS APRENDIDOS», OBLIGATORIO aplicarlos en chat Y
+  en el visor (tipo/valor correctos: persona→tipo=persona, etc.). Guía
+  silenciosa; NO digas que son ejemplos ni los copies literal.
 - APRENDIZAJE (prioridad máxima): si el mensaje EMPIEZA o CONTIENE
   «Aprende esta regla», «Aprende:», «Recuerda que», «Guarda esta regla»,
   «Así no:» o «cuando yo diga/pida», OBLIGATORIO llamar PRIMERO y ÚNICAMENTE
@@ -184,7 +186,10 @@ Consolidación / Inventario N (Supabase directo):
 
 Eliminación explícita:
 - Solo con pedido claro (“elimina el Inventario 5”, “borra el excel 1” legado).
-- preparar_eliminacion_origen(origen) → cuenta + pide confirmación.
+- Etiqueta individual (ej. 235263 / “elimina esta etiqueta”) → NO uses
+  preparar_eliminacion_origen. El front confirma por id/etiqueta; origen
+  Inventario N o vacío es válido. “nuevo registro” NO es un origen.
+- preparar_eliminacion_origen(origen) → SOLO vaciar excel/Inventario N entero.
 - sí → confirmar_eliminacion_origen. Tras borrar un excel N legado, renumerar
   automáticamente los excel restantes (más viejo→excel 1, etc.).
 
@@ -219,13 +224,25 @@ Tools (elige la mínima necesaria; solo datos):
   El visor derecho abre la plantilla Personas filtrada por esa área (no
   areaTotal ni ranking global). “dame las personas” SIN área → ranking
   global de personas (viewer tipo=personas, valor=general).
+  “todas las personas”, “personas del inventario”, “personas en general”
+  (SIN área y SIN Inventario N) → ranking GLOBAL (viewer tipo=personas,
+  valor=general). PROHIBIDO plantilla fija “En todo el inventario hay…”.
+  “personas / peronas del Inventario N” → filtrar por origen Inventario N;
+  responde NATURAL y VARIADO (“Aquí están las personas de Inventario N…”);
+  viewer tipo=personas, valor=«Inventario N» (solo esas personas).
+  “nueva regla / guarda esta regla / aprende…” → SOLO registrar_aprendizaje
+  (no consultas de área/personas).
 - contar_por_campo(campo=persona|area|origen|marca|..., valor=...) →
   persona (“registros de Eduardo”) O UN área concreta (TI → Sistemas y TI).
   Columna area SIN acento. No busques “ti” como texto libre.
   Si filtraste por PERSONA → viewer/filtro tipo=persona (NUNCA uses el área
-  de un artículo). Si filtraste por ÁREA puntual y pidieron el área/equipos
-  → viewer tipo=area. Si pidieron nombres/personas del área → tipo=personas.
-  Si además acotaron un Inventario N → añade origen al viewer.
+  de un artículo). “artículos/registros de Paola” → tipo=persona + valor
+  canónico; NO generes QR salvo que pidan QR.
+  “dame/genera los QR de [persona]” → OBLIGATORIO generar_qr(query=nombre) y
+  viewer tipo=persona con la lista completa en qr (visor); chat máx 5 ejemplos.
+  Si filtraste por ÁREA puntual y pidieron el área/equipos → viewer tipo=area.
+  Si pidieron nombres/personas del área → tipo=personas. Inventario N explícito
+  → añade origen al viewer.
 - buscar_inventario(query, limit) → listados con filtro real (persona, área,
   marca, código…). NO uses meta-palabras (etiquetas/registros/inventario) como query.
 - obtener_por_etiqueta → ficha exacta.
@@ -1938,6 +1955,8 @@ def preparar_eliminacion_origen_data(
     session_id: str | None,
 ) -> dict[str, Any]:
     """Prepara borrado de un origen (excel N o Inventario N). Requiere confirmación."""
+    import re
+
     from inventario import supabase_client as db
     from inventario.ai import pending_eliminacion as pending
 
@@ -1949,6 +1968,40 @@ def preparar_eliminacion_origen_data(
             "needs_confirm": False,
         }
 
+    # Etiqueta individual (235263) ≠ vaciar un origen completo.
+    if re.fullmatch(r"\d{3,12}", raw) or re.fullmatch(
+        r"[A-Za-z]{1,6}[-_]?\d{2,8}", raw
+    ):
+        return {
+            "ok": False,
+            "error": (
+                f"«{raw}» es una etiqueta, no un inventario. "
+                "Para borrar esa ficha usa el flujo de etiqueta "
+                "(Confirmar borrado); no prepares eliminación de origen."
+            ),
+            "needs_confirm": False,
+            "etiqueta": raw,
+        }
+
+    folded_raw = re.sub(r"\s+", " ", raw.lower())
+    if folded_raw in {
+        "nuevo registro",
+        "nuevo",
+        "nuevos registros",
+        "nuevo registros",
+        "nuevos registro",
+    }:
+        return {
+            "ok": False,
+            "error": (
+                "«nuevo registro» no es un origen a vaciar. "
+                "Si el usuario quiere borrar una etiqueta concreta "
+                "(aunque diga que es un registro nuevo), confirma el borrado "
+                "de esa etiqueta/id; acepta origen Inventario N o vacío."
+            ),
+            "needs_confirm": False,
+        }
+
     all_rows, err, _ = db.read_inventario()
     if err:
         return {"ok": False, "error": err, "needs_confirm": False}
@@ -1957,6 +2010,20 @@ def preparar_eliminacion_origen_data(
     resolved = db.resolve_origen_label(canon, all_rows) or db.resolve_origen_label(
         raw, all_rows
     )
+    # Inventario N / excel N explícitos: aceptar aunque el catálogo fuzzy falle.
+    if not resolved:
+        m_inv = re.match(r"(?i)^inventario\s*(\d+)\s*$", canon or raw)
+        m_ex = re.match(
+            r"(?i)^(excel|csv|xls|xlsx)\s*(\d+)\s*$", canon or raw
+        )
+        if m_inv:
+            resolved = f"Inventario {int(m_inv.group(1))}"
+        elif m_ex:
+            num = int(m_ex.group(2))
+            resolved = (
+                db.resolve_origen_label(f"Inventario {num}", all_rows)
+                or f"Inventario {num}"
+            )
     if not resolved:
         return {
             "ok": False,
@@ -1998,6 +2065,14 @@ def preparar_eliminacion_origen_data(
         "origen": resolved,
         "kind": kind,
         "count": len(ids),
+        "ids": ids,
+        # Señal FE: abrir modal visual con origen + cantidad.
+        "eliminacion_pendiente": {
+            "origen": resolved,
+            "count": len(ids),
+            "kind": kind,
+            "ids": ids,
+        },
         "renumerara_excel": kind == "excel",
         "exportar_excel": False,
         "mensaje_agente": (
@@ -2099,6 +2174,8 @@ class ToolAgentDeps:
     lista_limitada: bool = False
     # Autorizar tarjeta Excel en el frontend (solo tras confirmar_exportacion).
     exportar_excel: bool = False
+    # Señal FE: modal de confirmación de borrado (preparar_eliminacion_origen).
+    pending_delete: dict[str, Any] | None = None
 
 
 def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
@@ -2106,6 +2183,18 @@ def _absorb(deps: ToolAgentDeps, result: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "resultado inválido"}
     if result.get("mutated"):
         deps.mutated = True
+    ep = result.get("eliminacion_pendiente")
+    if isinstance(ep, dict) and ep.get("origen") and result.get("needs_confirm"):
+        deps.pending_delete = {
+            "origen": str(ep.get("origen") or "").strip(),
+            "count": int(ep.get("count") or result.get("count") or 0),
+            "kind": str(ep.get("kind") or ""),
+            "ids": [
+                int(x)
+                for x in (ep.get("ids") or result.get("ids") or [])
+                if str(x).strip().lstrip("-").isdigit()
+            ],
+        }
     items = result.get("items")
     if isinstance(items, list):
         for row in items:
@@ -2372,21 +2461,37 @@ def build_contexto_vista_payload(
                 }
             # Origen acotado (área ∩ Inventario N) → visor no expande a todos.
             origen_v = str(viewer.get("origen") or "").strip()
-            if not origen_v and items:
-                origens = {
-                    str(r.get("origen") or "").strip()
-                    for r in items
-                    if isinstance(r, dict) and str(r.get("origen") or "").strip()
-                }
-                if len(origens) == 1:
-                    origen_v = next(iter(origens))
             um = (user_message or "").lower()
-            if not origen_v and re.search(
-                r"\binventario\s*\d+\b|\bexcel\s*\d+\b", um
-            ):
-                m_orig = re.search(r"\b((?:inventario|excel)\s*\d+)\b", um)
-                if m_orig:
-                    origen_v = m_orig.group(1).strip()
+            user_named_origen = bool(
+                re.search(r"\binventario\s*\d+\b|\bexcel\s*\d+\b", um)
+            )
+            # Persona: NUNCA inferir origen por payload (tumba personTotal → 0 QR).
+            # Área: sí se puede inferir un origen único del payload.
+            if tipo == "persona":
+                if origen_v and not user_named_origen:
+                    origen_v = ""
+                if not origen_v and user_named_origen:
+                    m_orig = re.search(
+                        r"\b((?:inventario|excel)\s*\d+)\b", um
+                    )
+                    if m_orig:
+                        origen_v = m_orig.group(1).strip()
+            else:
+                if not origen_v and items:
+                    origens = {
+                        str(r.get("origen") or "").strip()
+                        for r in items
+                        if isinstance(r, dict)
+                        and str(r.get("origen") or "").strip()
+                    }
+                    if len(origens) == 1:
+                        origen_v = next(iter(origens))
+                if not origen_v and user_named_origen:
+                    m_orig = re.search(
+                        r"\b((?:inventario|excel)\s*\d+)\b", um
+                    )
+                    if m_orig:
+                        origen_v = m_orig.group(1).strip()
             if origen_v and tipo in {"area", "persona"}:
                 out["origen"] = origen_v
                 out["lista_limitada"] = True
@@ -2965,9 +3070,11 @@ def _build_agent(api_key: str, model_name: str, base_url: str = ""):
     ) -> dict[str, Any]:
         """Prepara borrar un excel N o Inventario N (pide confirmación)."""
         try:
-            return preparar_eliminacion_origen_data(
+            result = preparar_eliminacion_origen_data(
                 origen=origen, session_id=ctx.deps.session_id
             )
+            # Propaga señal al FE (modal) sin cambiar el flujo de confirmación.
+            return _absorb(ctx.deps, result)
         except Exception as exc:  # noqa: BLE001
             logger.exception("preparar_eliminacion_origen excepción")
             return {"ok": False, "error": str(exc), "needs_confirm": False}
@@ -4051,7 +4158,7 @@ def run_tool_agent(
         )
 
         learned = search_similar_examples(
-            message or "", limit=2, threshold=0.80
+            message or "", limit=4, threshold=0.72
         )
         block = format_learned_block(learned)
         if block:
@@ -4097,6 +4204,18 @@ def run_tool_agent(
             if not isinstance(ctx, dict):
                 ctx = {"tipo": "origen", "valor": "Todo el inventario"}
             ctx = {**ctx, "exportar_excel": True}
+        if isinstance(deps.pending_delete, dict) and deps.pending_delete.get(
+            "origen"
+        ):
+            if not isinstance(ctx, dict):
+                ctx = {
+                    "tipo": "origen",
+                    "valor": str(deps.pending_delete.get("origen") or ""),
+                }
+            ctx = {
+                **ctx,
+                "eliminacion_pendiente": deps.pending_delete,
+            }
         side_items = _filter_collected_for_contexto(
             deps.collected, ctx, message or ""
         )
