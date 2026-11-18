@@ -88,6 +88,12 @@ import {
 } from "@/lib/asistente";
 import { parseInventarioImportFile } from "@/lib/import-inventario-file";
 import {
+  formatNoticeTime,
+  loadInventoryNotices,
+  prependInventoryNotice,
+  type InventoryNotice,
+} from "@/lib/inventory-notices";
+import {
   buildCreateInventarioAskReply,
   detectBulkCopyAllOthersToInventarioAsk,
   detectBulkCopyBetweenInventariosAsk,
@@ -4729,13 +4735,16 @@ function looksLikeRecordMutationAsk(userText: string) {
 function looksLikeLearningCorrectionAsk(userText: string): boolean {
   const n = normalizeChatIntent(userText);
   if (!n) return false;
+  if (/\bnueva\s+reglas?\b/.test(n) || /\breglas?\s+nueva\b/.test(n)) {
+    return true;
+  }
   if (
     /\b(aprende|aprender|aprendelo|aprendela|memoriza|memorizar)\b/.test(n)
   ) {
     return true;
   }
   if (
-    /\b(guarda|guardar|anota|anotar|registra|registrar)\s+(esta\s+)?(regla|correccion|preferencia|instruccion)\b/.test(
+    /\b(guarda|guardar|anota|anotar|registra|registrar)\s+(esta\s+|una\s+|la\s+)?(nueva\s+)?(regla|correccion|preferencia|instruccion)\b/.test(
       n,
     )
   ) {
@@ -6585,7 +6594,12 @@ function detectOrigenPersonasAsk(
     return undefined;
   }
   if (isAmbiguousNombresAsk(userText)) return undefined;
+  // “personas del Inventario 3” / “peronas del Inventario 3” (sin verbo).
+  const bareOrigenPeople =
+    /\bpersonas?\s+(del|de|en)\s+(el\s+)?(inventario|excel)\s*\d+\b/.test(n) ||
+    /\b(inventario|excel)\s*\d+\b[\s\S]{0,24}\bpersonas?\b/.test(n);
   if (
+    !bareOrigenPeople &&
     !intentHas(
       n,
       "cuantas",
@@ -6611,7 +6625,8 @@ function detectOrigenPersonasAsk(
   // Ranking global de personas (sin inventario concreto).
   if (
     intentHas(n, "todas", "todos", "ranking", "top") &&
-    !/\binventarios?\s*\d+\b/.test(n)
+    !/\binventarios?\s*\d+\b/.test(n) &&
+    !/\bexcel\s*\d+\b/.test(n)
   ) {
     return undefined;
   }
@@ -6815,12 +6830,18 @@ function buildOrigenPersonasReply(
           .slice(0, -1)
           .map((n) => `**${n}**`)
           .join(", ")} y **${shown[shown.length - 1]}**`;
-  return (
-    `En **${origen}** hay **${fmt(people.length)}** persona` +
-    `${people.length === 1 ? "" : "s"} ` +
-    `(sobre **${fmt(rows.length)}** registro${rows.length === 1 ? "" : "s"}): ${namesProse}` +
-    (showAll ? "" : `, y **${fmt(people.length - shown.length)}** más`) +
-    `. Si quieres el inventario de alguna, dime su nombre.`
+  const label = canonicalizeOrigenLabel(origen);
+  const more = showAll
+    ? ""
+    : `, y **${fmt(people.length - shown.length)}** más`;
+  return pickChatVariant(
+    [
+      `Aquí están las personas de **${label}**: ${namesProse}${more}. Son **${fmt(people.length)}** en total. El detalle está en el panel derecho.`,
+      `En **${label}** aparecen **${fmt(people.length)}** persona${people.length === 1 ? "" : "s"}: ${namesProse}${more}. Te dejé el listado en el visor.`,
+      `Estas son las personas registradas en **${label}** (**${fmt(people.length)}**): ${namesProse}${more}. ¿Abrimos el inventario de alguna?`,
+      `Listo: las personas de **${label}** son ${namesProse}${more}. Hay **${fmt(people.length)}** nombres distintos en ese inventario.`,
+    ],
+    `${label}:${people.length}:${shown.join("|")}`,
   );
 }
 
@@ -9991,7 +10012,25 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
   const [addModalDestino, setAddModalDestino] = useState<string | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<InventarioRow | null>(null);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
+  const [inventoryNotices, setInventoryNotices] = useState<InventoryNotice[]>(
+    [],
+  );
   const collapseSidebarRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    setInventoryNotices(loadInventoryNotices());
+  }, []);
+
+  const pushInventoryNotice = useCallback(
+    (input: {
+      kind: InventoryNotice["kind"];
+      title: string;
+      body: string;
+    }) => {
+      setInventoryNotices((prev) => prependInventoryNotice(prev, input));
+    },
+    [],
+  );
 
   const handleProductUpdated = (updated: InventarioRow) => {
     setItems((prev) =>
@@ -11768,6 +11807,22 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           .map((r) => r.etiqueta || r.id)
           .join(", ")}`,
       });
+      if (wipeAll) {
+        pushInventoryNotice({
+          kind: "inventarios_eliminados",
+          title: "Inventarios eliminados",
+          body: `Se eliminaron todos los inventarios (${deletedRows.length.toLocaleString("es-MX")} registro${deletedRows.length === 1 ? "" : "s"}).`,
+        });
+      } else if (plan.wholeOrigen && origenes.length) {
+        pushInventoryNotice({
+          kind: "inventario_eliminado",
+          title: "Inventario eliminado",
+          body:
+            origenes.length === 1
+              ? `Se eliminó **${canonicalizeOrigenLabel(origenes[0])}** (${deletedRows.length.toLocaleString("es-MX")} registro${deletedRows.length === 1 ? "" : "s"}).`
+              : `Se eliminaron ${origenesLabel} (${deletedRows.length.toLocaleString("es-MX")} registro${deletedRows.length === 1 ? "" : "s"}).`,
+        });
+      }
       const fallback = formatDeleteDoneFallback({
         rows: deletedRows,
         origen: plan.origen,
@@ -12034,6 +12089,27 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             items.some((r) => areaMatchesNeedle(String(r.area ?? ""), focusName))))
       ) {
         activeAreaContextRef.current = { name: focusName, at: Date.now() };
+      }
+    }
+    // Persona sin QR → personTotal. Persona + “dame los qr…” → lista QR.
+    if (
+      resolvedSide &&
+      (resolvedSide.viewerOverview === "personTotal" ||
+        resolvedSide.apiViewer?.tipo === "persona")
+    ) {
+      if (userAskedQr(resolvedSide.userText || "")) {
+        const keepQr = Array.isArray(resolvedSide.qr) ? resolvedSide.qr : [];
+        resolvedSide = {
+          ...resolvedSide,
+          viewerOverview: keepQr.length ? undefined : "personTotal",
+          qr: keepQr,
+        };
+      } else {
+        resolvedSide = {
+          ...resolvedSide,
+          viewerOverview: "personTotal",
+          qr: [],
+        };
       }
     }
     const followUps =
@@ -12337,6 +12413,15 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
         ids: saved.map((row) => row.id).filter((id): id is number => id != null),
         chatId: sessionId,
         fact: `Import “${sourceLabel}”${destLabel ? ` → ${destLabel}` : ""}: +${saved.length} (antes ${totalBefore} → ahora ${totalAfter})`,
+      });
+      pushInventoryNotice({
+        kind: "excel",
+        title: "Excel importado",
+        body:
+          `Se subió “${sourceLabel}”` +
+          (destLabel ? ` a **${destLabel}**` : "") +
+          `: +${saved.length.toLocaleString("es-MX")} registro` +
+          `${saved.length === 1 ? "" : "s"}.`,
       });
       const skipped = total - saved.length;
       const skipNote =
@@ -12720,6 +12805,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
                 .filter((id): id is number => id != null),
               chatId: sessionId,
               fact: `Merge ${pendingMerge.sources.join("+")}→${pendingMerge.dest}: +${savedAll.length}`,
+            });
+            pushInventoryNotice({
+              kind: "excel",
+              title: "Inventario actualizado",
+              body:
+                `Se cargaron datos en **${pendingMerge.dest}**: +${savedAll.length.toLocaleString("es-MX")} registro` +
+                `${savedAll.length === 1 ? "" : "s"}.`,
             });
             const lines = [
               ...mergeSources.map((s) => `• **${s}**`),
@@ -14324,6 +14416,76 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           }
         }
 
+        // Personas de Inventario N → IA (prosa natural) + visor Personas del origen.
+        try {
+          const origenPeopleAsk =
+            detectOrigenPersonasAsk(spokenRaw, items) ||
+            (() => {
+              const f = detectOrigenFieldAsk(spokenRaw, items);
+              return f?.field === "persona" ? f.origen : undefined;
+            })();
+          if (origenPeopleAsk && items.length) {
+            const origenLabel = canonicalizeOrigenLabel(origenPeopleAsk);
+            const sourceRows = items.filter((row) =>
+              origensMatch(String(row.origen ?? ""), origenPeopleAsk),
+            );
+            const memoryBlock = [
+              formatChatMemoryForPrompt(),
+              resolvedTurn.threadHint,
+              `Pedido: personas del origen «${origenLabel}». ` +
+                `Responde NATURAL y VARIADO (prohibido plantillas fijas tipo ` +
+                `"En todo el inventario hay…"). Lista SOLO personas de ese inventario. ` +
+                `Visor: tipo=personas valor=${origenLabel}.`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            const data = await askInventoryChat(spokenRaw, history, {
+              signal: controller.signal,
+              memory: memoryBlock || undefined,
+              model: activeLlmMeta.model,
+              sessionId,
+              contextoVista: { tipo: "origen", valor: origenLabel },
+            });
+            if (
+              requestGen !== chatRequestGenRef.current ||
+              controller.signal.aborted
+            ) {
+              return;
+            }
+            if (data.error === "aborted") return;
+            let replyText = (data.reply || "").trim();
+            if (
+              !replyText ||
+              /\ben todo el inventario hay\b/i.test(replyText)
+            ) {
+              replyText = buildOrigenPersonasReply(origenPeopleAsk, items);
+            }
+            recordTokenConsumption(data.usage ?? null, spokenRaw, replyText);
+            await ensureTypingPause(replyText);
+            const apiFollowUps = mapAccionesSugeridas(data.acciones_sugeridas);
+            finishBotReply(sessionId, botId, replyText, {
+              resultItems: sourceRows
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row)),
+              qr: [],
+              viewerOverview: "personas",
+              viewerFocus: origenLabel,
+              userText: spokenRaw,
+              skipExpand: true,
+              apiViewer: { tipo: "personas", valor: origenLabel },
+              followUps: apiFollowUps.length ? apiFollowUps : undefined,
+            });
+            return;
+          }
+        } catch (err) {
+          if (
+            (err instanceof DOMException && err.name === "AbortError") ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+        }
+
         // Personas de un área (RH / TI…) → abrir visor Personas filtrado.
         // “dame las personas” SIN área → no interceptar aquí (ranking global).
         try {
@@ -14621,7 +14783,20 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             }
           } else if (ctx?.tipo === "persona" && ctx.valor) {
             sideFocus = ctx.valor;
-            sideOverview = ctx.lista_limitada ? undefined : "personTotal";
+            const askedPersonQr = userAskedQr(spokenRaw);
+            const personLimited =
+              Boolean(ctx.lista_limitada) &&
+              Boolean(
+                ctx.origen ||
+                  /\binventario\s*\d+\b|\bexcel\s*\d+\b/i.test(spokenRaw || ""),
+              );
+            sideOverview =
+              askedPersonQr || personLimited ? undefined : "personTotal";
+            if (!personLimited && !resultItems.length) {
+              resultItems = rowsForPersonName(items, ctx.valor)
+                .slice(0, CHAT_SIDE_RESULT_CAP)
+                .map((row) => rowToChatApiItem(row));
+            }
           } else if (
             ctx?.tipo === "personas" ||
             (ctx?.tipo === "area" &&
@@ -14761,10 +14936,29 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             }
           }
 
+          const askedQr = userAskedQr(spokenRaw);
+          const personQrMode =
+            askedQr &&
+            (sideOverview === "personTotal" ||
+              ctx?.tipo === "persona" ||
+              Boolean(findPersonInText(spokenRaw, items)));
+          let qrForSide = personQrMode
+            ? data.qr || []
+            : sideOverview === "personTotal"
+              ? []
+              : data.qr || [];
+          if (personQrMode && !qrForSide.length) {
+            const rows = resolveQrRowsFromPrompt(spokenRaw, replyText, items);
+            if (rows.length) {
+              const recovered = buildQrSideFromRows(rows);
+              qrForSide = recovered.qr;
+              if (!resultItems.length) resultItems = recovered.resultItems;
+            }
+          }
           finishBotReply(sessionId, botId, replyText, {
             resultItems,
-            qr: data.qr || [],
-            viewerOverview: sideOverview,
+            qr: qrForSide,
+            viewerOverview: personQrMode ? undefined : sideOverview,
             viewerFocus: sideFocus,
             viewerComparacion: sideComparacion,
             exportFiles,
@@ -15239,6 +15433,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             };
             setAddModalDestino(dest);
             setIsAddModalOpen(true);
+            pushInventoryNotice({
+              kind: "inventario_creado",
+              title: "Inventario creado",
+              body: `Se creó **${canonicalizeOrigenLabel(dest)}** y quedó listo para altas.`,
+            });
             const ask =
               `Perfecto: **${dest}** queda listo para altas. Te abrí el formulario de **nuevo registro**.\n\n` +
               `Llena al menos **etiqueta** y **artículo**; también área, persona, marca, modelo, serie, cantidad y estado. ` +
@@ -15331,15 +15530,29 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     }
 
-    // 1b. Personas de un inventario concreto (Inventario 1…) — texto, sin visor.
+    // 1b. Personas de un inventario concreto (Inventario N) + visor Personas.
     {
       const origenPeople = detectOrigenPersonasAsk(userText || text, items);
       if (origenPeople) {
         try {
+          const origenLabel = canonicalizeOrigenLabel(origenPeople);
+          const sourceRows = items.filter((row) =>
+            origensMatch(String(row.origen ?? ""), origenPeople),
+          );
           const localReply = buildOrigenPersonasReply(origenPeople, items);
           recordTokenConsumption(null, userText || text, localReply);
           await ensureTypingPause(localReply);
-          finishBotReply(sessionId, botId, localReply);
+          finishBotReply(sessionId, botId, localReply, {
+            resultItems: sourceRows
+              .slice(0, CHAT_SIDE_RESULT_CAP)
+              .map((row) => rowToChatApiItem(row)),
+            qr: [],
+            viewerOverview: "personas",
+            viewerFocus: origenLabel,
+            skipExpand: true,
+            userText: userText || text,
+            apiViewer: { tipo: "personas", valor: origenLabel },
+          });
           return;
         } catch {
           /* abort / nuevo mensaje */
@@ -16467,6 +16680,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           };
           setAddModalDestino(createAsk.name);
           setIsAddModalOpen(true);
+          if (!createAsk.alreadyExists) {
+            pushInventoryNotice({
+              kind: "inventario_creado",
+              title: "Inventario creado",
+              body: `Se creó **${canonicalizeOrigenLabel(createAsk.name)}** y quedó listo para altas.`,
+            });
+          }
           const ask =
             `Listo: **${createAsk.name}** queda preparado como destino. ` +
             `Te abrí el formulario de **nuevo registro** para que completes etiqueta (obligatoria), artículo, marca, modelo, serie, área, persona, cantidad, estado y observaciones. ` +
@@ -16488,6 +16708,13 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
             name: createAsk.name,
             askedAt: Date.now(),
           };
+          if (!createAsk.alreadyExists) {
+            pushInventoryNotice({
+              kind: "inventario_creado",
+              title: "Inventario creado",
+              body: `Se creó **${canonicalizeOrigenLabel(createAsk.name)}** y quedó listo para recibir registros.`,
+            });
+          }
           const sampleEtq = items
             .map((r) => String(r.etiqueta ?? "").trim())
             .filter(Boolean)
@@ -16519,6 +16746,11 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
               emptyOk: true,
               askedAt: Date.now(),
             };
+            pushInventoryNotice({
+              kind: "inventario_creado",
+              title: "Inventario creado",
+              body: `Se creó **${canonicalizeOrigenLabel(dest)}** vacío y quedó listo para recibir registros.`,
+            });
             const ask =
               `Listo: **${dest}** queda preparado **vacío**, sin registros por ahora. ` +
               `Cuando quieras llenarlo, mándame etiquetas vigentes o dime “pasa todo Inventario N” y las copio ahí sin duplicar. ` +
@@ -18601,14 +18833,28 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       qrPayloads = [];
     } else if (focusPerson) {
       openSidePanel = true;
-      overview = "personTotal";
       viewerFocus = focusPerson;
-      const personRows = rowsForPersonName(items, focusPerson).slice(
-        0,
-        CHAT_SIDE_RESULT_CAP,
-      );
-      if (personRows.length) {
-        sideItems = personRows.map((row) => rowToChatApiItem(row));
+      const personRows = rowsForPersonName(items, focusPerson);
+      const askedPersonQr = userAskedQr(userText || text);
+      if (askedPersonQr) {
+        overview = undefined;
+        if (!qrPayloads.length && personRows.length) {
+          const recovered = buildQrSideFromRows(personRows);
+          qrPayloads = recovered.qr;
+          sideItems = recovered.resultItems;
+        } else if (personRows.length) {
+          sideItems = personRows
+            .slice(0, CHAT_SIDE_RESULT_CAP)
+            .map((row) => rowToChatApiItem(row));
+        }
+      } else {
+        overview = "personTotal";
+        if (personRows.length) {
+          sideItems = personRows
+            .slice(0, CHAT_SIDE_RESULT_CAP)
+            .map((row) => rowToChatApiItem(row));
+        }
+        qrPayloads = [];
       }
     } else if (focusArea) {
       openSidePanel = true;
@@ -18865,12 +19111,31 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
       }
     } else if (ctx?.tipo === "persona" && ctx.valor) {
       sideFocus = ctx.valor;
-      // Lista N (dame 8) → solo esos registros; total persona → plantilla personTotal.
-      sideOverview = limitedAsk ? undefined : "personTotal";
-      if (!limitedAsk && !sideResultItems.length) {
+      const askedPersonQr = userAskedQr(spokenRaw || userText || text);
+      const personLimited =
+        limitedAsk &&
+        Boolean(
+          ctx.origen ||
+            /\binventario\s*\d+\b|\bexcel\s*\d+\b/i.test(
+              spokenRaw || userText || text || "",
+            ),
+        );
+      sideOverview =
+        askedPersonQr || personLimited ? undefined : "personTotal";
+      if (!personLimited && !sideResultItems.length) {
         sideResultItems = rowsForPersonName(items, ctx.valor)
           .slice(0, CHAT_SIDE_RESULT_CAP)
           .map((row) => rowToChatApiItem(row));
+      }
+      if (!askedPersonQr && !personLimited) {
+        sideQr = [];
+      } else if (askedPersonQr && !sideQr.length) {
+        const rows = rowsForPersonName(items, ctx.valor);
+        if (rows.length) {
+          const recovered = buildQrSideFromRows(rows);
+          sideQr = recovered.qr;
+          if (!sideResultItems.length) sideResultItems = recovered.resultItems;
+        }
       }
     } else if (ctx?.tipo === "area" && ctx.valor) {
       sideFocus = ctx.valor;
@@ -19527,13 +19792,40 @@ export default function InventoryView({ rows }: { rows: InventarioRow[] }) {
           ) : null}
 
           {rail === "avisos" ? (
-            <section className="panel notice" aria-labelledby="notice-title">
-              <span className="notice-icon" aria-hidden="true"><Bell size={20} /></span>
-              <div>
-                <h2 id="notice-title">Bandeja de avisos</h2>
-                <p>No hay avisos disponibles con los datos actuales.</p>
-              </div>
-            </section>
+            <div className="notice-stack" aria-label="Bandeja de avisos">
+              {inventoryNotices.length === 0 ? (
+                <section className="panel notice" aria-labelledby="notice-title">
+                  <span className="notice-icon" aria-hidden="true">
+                    <Bell size={20} />
+                  </span>
+                  <div>
+                    <h2 id="notice-title">Bandeja de avisos</h2>
+                    <p>No hay avisos disponibles con los datos actuales.</p>
+                  </div>
+                </section>
+              ) : (
+                inventoryNotices.map((notice) => (
+                  <section
+                    key={notice.id}
+                    className="panel notice"
+                    aria-label={notice.title}
+                  >
+                    <span className="notice-icon" aria-hidden="true">
+                      <Bell size={20} />
+                    </span>
+                    <div>
+                      <h2>{notice.title}</h2>
+                      <p>
+                        {notice.body.replace(/\*\*/g, "")}
+                        {notice.at
+                          ? ` · ${formatNoticeTime(notice.at)}`
+                          : ""}
+                      </p>
+                    </div>
+                  </section>
+                ))
+              )}
+            </div>
           ) : null}
 
           {rail === "personas" ? (

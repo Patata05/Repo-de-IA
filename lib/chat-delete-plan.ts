@@ -9,6 +9,7 @@ import {
   inventarioNumber,
   listExistingOrigens,
   matchOrigenFromPrompt,
+  origenCurrencyRank,
   origensMatch,
 } from "@/lib/inventario-origen";
 import { normalizeChatSpelling } from "@/lib/chat-spell";
@@ -116,10 +117,27 @@ export function extractDeleteOrigens(
     add(resolveOrigenName(value, existing));
   }
 
-  // Fallback: un solo origen nombrado por matchOrigenFromPrompt
+  // Fallback: un solo origen nombrado por matchOrigenFromPrompt.
+  // No uses “nuevo registro” / fuzzy libre aquí: bloquea borrados de etiqueta
+  // en Inventario N (el texto “es un nuevo registro” ≠ origen).
   if (!found.length) {
     const one = matchOrigenFromPrompt(text, existing);
-    if (one) add(one);
+    if (one) {
+      const foldOne = String(one)
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{M}/gu, "")
+        .trim();
+      if (
+        inventarioNumber(one) != null ||
+        /^(excel|csv|xls|xlsx)\s*\d+$/i.test(String(one).trim()) ||
+        foldOne === "s/o" ||
+        foldOne === "s o" ||
+        foldOne === "so"
+      ) {
+        add(one);
+      }
+    }
   }
 
   return found;
@@ -221,8 +239,11 @@ export function looksLikeDeleteDeixisSingular(text: string): boolean {
   if (!n) return false;
   return (
     /\b(elimina|borrar?|quita|suprimir)(la|lo|las|los)\b/.test(n) ||
-    /\b(elimina|borra|quita)\s+(esta|este|esa|ese|la|lo)\b/.test(n) ||
-    /\b(elimina|borra|quita)\s+(esta|este|esa|ese)\s+(etiqueta|registro|articulo|equipo|ficha)\b/.test(
+    /\b(elimina\w*|borra\w*|quita\w*)\s+(esta|este|esa|ese|la|lo)\b/.test(n) ||
+    /\b(elimina\w*|borra\w*|quita\w*)\s+(esta|este|esa|ese)\s+(etiqueta|registro|articulo|equipo|ficha)\b/.test(
+      n,
+    ) ||
+    /\b(sea\s+)?eliminad[oa]s?\s+(esta|este|esa|ese)\s+(etiqueta|registro|articulo|equipo|ficha)\b/.test(
       n,
     )
   );
@@ -239,7 +260,7 @@ export function looksLikeDeleteInventoryAsk(text: string): boolean {
   if (looksLikeDeleteAmbosAsk(text)) return true;
   if (looksLikeDeleteDeixisSingular(text)) return true;
   const verb =
-    /\b(elimina|eliminar|elimine|elimines|eliminaras|borra|borrar|borre|quita|quitar|suprimir)\b/.test(
+    /\b(elimina\w*|eliminar|borra\w*|borrar|quita\w*|quitar|suprimir\w*)\b/.test(
       n,
     );
   if (!verb) return false;
@@ -364,6 +385,14 @@ export function detectChatDeleteIntent(
     const files = listExcelLikeOrigens(existing);
     if (files.length >= 2) origenes = files.slice(0, 2);
   }
+  // Etiqueta concreta → origen solo si es Inventario N / excel N explícito.
+  if (etiquetas.length && origenes.length) {
+    origenes = origenes.filter(
+      (o) =>
+        inventarioNumber(o) != null ||
+        /^(excel|csv|xls|xlsx)\s*\d+$/i.test(String(o).trim()),
+    );
+  }
   const origen = origenes[0];
 
   // “elimínala (del excel 1)” / “borra esa” → NUNCA vaciar el origen entero.
@@ -389,6 +418,19 @@ export function detectChatDeleteIntent(
       looksLikeDeleteAmbosAsk(text));
 
   const wholeOrigen = namedWholeCue;
+
+  // “necesito eliminarla” / “elimínala” → 1 ficha del contexto, NUNCA vaciar Inventario N.
+  if (deixisSingular && !wholeOrigen) {
+    return {
+      mode: "etiquetas",
+      origen: undefined,
+      origenes: undefined,
+      etiquetas,
+      includeScopedList: false,
+      wholeOrigen: false,
+      wipeAllOrigens: false,
+    };
+  }
 
   if (!wholeOrigen && !includeScopedList && !etiquetas.length) {
     // “elimina un registro” sin dato → aún así intentamos (caller pide etiqueta)
@@ -475,17 +517,40 @@ export function resolveChatDeleteRows(opts: {
     const candidates = inventory.filter(
       (r) => String(r.etiqueta ?? "").trim().toLowerCase() === needle,
     );
+    if (!candidates.length) continue;
+
     if (intent.origen) {
       const hit = candidates.find((r) => sameOrigen(r, intent.origen!));
-      if (hit) add(hit);
-    } else if (candidates.length === 1) {
-      add(candidates[0]);
-    } else if (candidates.length > 1) {
-      // Varias copias: sin origen, no adivinar — skip (caller avisa)
-      // Preferir no borrar todas a ciegas; solo si hay una.
-    } else {
-      // no encontrada
+      if (hit) {
+        add(hit);
+        continue;
+      }
+      // Origen pedido no matcheó (Inventario N / vacío / “nuevo registro”):
+      // igual borramos por etiqueta/id encontrado.
     }
+
+    if (candidates.length === 1) {
+      add(candidates[0]);
+      continue;
+    }
+
+    // Varias copias: contexto del visor → luego Inventario N más reciente.
+    const fromCtx = contextRows.find(
+      (c) => String(c.etiqueta ?? "").trim().toLowerCase() === needle,
+    );
+    if (fromCtx) {
+      const exact = candidates.find((r) => Number(r.id) === Number(fromCtx.id));
+      add(exact || fromCtx);
+      continue;
+    }
+    const ranked = [...candidates].sort((a, b) => {
+      const d =
+        origenCurrencyRank(String(b.origen ?? "")) -
+        origenCurrencyRank(String(a.origen ?? ""));
+      if (d !== 0) return d;
+      return Number(b.id || 0) - Number(a.id || 0);
+    });
+    add(ranked[0]);
   }
 
   return [...byId.values()];
@@ -557,6 +622,31 @@ export function recoverDeletePlanFromBotConfirm(
       askedAt: Date.now(),
     };
   }
+  // Si el bot habló de UNA etiqueta concreta (212894), recuperar solo esa ficha —
+  // NUNCA vaciar Inventario N entero (evita borrar 199 al decir “sí”).
+  const etFromBot = extractDeleteEtiquetas(raw);
+  if (etFromBot.length === 1) {
+    const needle = etFromBot[0].toLowerCase();
+    const hit =
+      inventory.find(
+        (r) => String(r.etiqueta ?? "").trim().toLowerCase() === needle,
+      ) || null;
+    if (hit?.id != null && Number.isFinite(Number(hit.id))) {
+      return {
+        mode: "etiquetas",
+        origen: String(hit.origen ?? "").trim() || undefined,
+        origenes: undefined,
+        etiquetas: [String(hit.etiqueta ?? "").trim() || etFromBot[0]],
+        includeScopedList: false,
+        wholeOrigen: false,
+        wipeAllOrigens: false,
+        phase: "await_yes",
+        rows: [hit],
+        askedAt: Date.now(),
+      };
+    }
+  }
+
   let origenes = extractDeleteOrigens(raw, existing);
   if (origenes.length < 1) {
     // “'excel 1'” / «Inventario 2» en prosa del agente
@@ -568,6 +658,8 @@ export function recoverDeletePlanFromBotConfirm(
     }
   }
   if (!origenes.length) return null;
+  // “etiqueta X … Inventario N” con varias etiquetas → no adivinar wipe.
+  if (etFromBot.length > 1) return null;
   const rows = inventory.filter((row) =>
     origenes.some((o) => sameOrigen(row, o)),
   );

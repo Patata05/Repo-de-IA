@@ -151,6 +151,14 @@ export type ChatContextoVista = {
   };
 };
 
+/** Señal BE → abrir modal visual de borrado (preparar_eliminacion_origen). */
+export type ChatEliminacionPendiente = {
+  origen: string;
+  count?: number;
+  kind?: string;
+  ids?: number[];
+};
+
 export type ChatApiResponse = {
   reply?: string;
   error?: string | null;
@@ -171,6 +179,8 @@ export type ChatApiResponse = {
   viewer?: ChatContextoVista | null;
   /** true solo tras confirmar_exportacion_excel → FE genera la tarjeta .xlsx. */
   exportar_excel?: boolean;
+  /** Si viene, abrir modal de confirmación de borrado (origen + ids). */
+  eliminacion_pendiente?: ChatEliminacionPendiente | null;
 };
 
 /** Vacío = mismo origen (Next proxy → Backend-ia). */
@@ -359,6 +369,21 @@ export async function askInventoryChat(
     : parseContexto(data.viewer) ?? null;
   const viewer = contexto_vista;
 
+  const epRaw = data.eliminacion_pendiente;
+  const eliminacion_pendiente: ChatEliminacionPendiente | null =
+    epRaw && typeof epRaw === "object" && String(epRaw.origen || "").trim()
+      ? {
+          origen: String(epRaw.origen || "").trim(),
+          count: Number(epRaw.count) || undefined,
+          kind: String(epRaw.kind || "").trim() || undefined,
+          ids: Array.isArray(epRaw.ids)
+            ? epRaw.ids
+                .map((x) => Number(x))
+                .filter((n) => Number.isFinite(n))
+            : undefined,
+        }
+      : null;
+
   return {
     reply: data.reply || "Sin respuesta del asistente.",
     error: data.error ?? null,
@@ -373,6 +398,7 @@ export async function askInventoryChat(
     exportar_excel: Boolean(
       (data as { exportar_excel?: boolean }).exportar_excel,
     ),
+    eliminacion_pendiente,
   };
 }
 

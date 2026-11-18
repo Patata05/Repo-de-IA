@@ -66,9 +66,17 @@ export async function addInventarioBulkAction(
     const { data, error } = await createInventarioMany(normalized);
 
     if (error || !data?.length) {
+      const raw = String(error || "").trim();
+      const lower = raw.toLowerCase();
+      const friendly =
+        lower.includes("failed to fetch") ||
+        lower.includes("fetch failed") ||
+        lower.includes("network")
+          ? "No se pudo conectar a Supabase al importar. Revisa internet, el proyecto en Supabase y Frontend-ia/.env.local; reinicia npm run dev."
+          : raw || "No se pudieron importar los artículos.";
       return {
         success: false,
-        error: error || "No se pudieron importar los artículos.",
+        error: friendly,
       };
     }
 
@@ -77,7 +85,11 @@ export async function addInventarioBulkAction(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     const lower = message.toLowerCase();
-    if (lower.includes("fetch failed") || lower.includes("network")) {
+    if (
+      lower.includes("failed to fetch") ||
+      lower.includes("fetch failed") ||
+      lower.includes("network")
+    ) {
       return {
         success: false,
         error:

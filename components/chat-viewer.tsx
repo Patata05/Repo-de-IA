@@ -294,6 +294,7 @@ function ChatViewer({
   onSelectPersonOption,
 }: ChatViewerProps) {
   const hasQr = qrCards.some((card) => card.dataUrl || card.text);
+  // Pedido QR → lista QR gana. Sin QR, personTotal/areaTotal muestran panorama.
   const showOverview = Boolean(overview) && !hasQr;
   const hasResults = !showOverview && (resultItems.length > 0 || hasQr);
   const showStats = overview === "stats";
@@ -838,7 +839,7 @@ function ChatViewer({
     };
   };
 
-  /** QR: filtro estricto por área del foco + agrupación por etiqueta. */
+  /** QR: filtro por área SOLO en areaTotal (nunca con foco de persona). */
   const qrGroups = useMemo(() => {
     if (!hasQr) return [] as Array<{
       key: string;
@@ -847,7 +848,8 @@ function ChatViewer({
     }>;
     const focusNorm = foldText(parsedFocus.label || focusArea);
     const areaScoped =
-      focusNorm &&
+      overview === "areaTotal" &&
+      Boolean(focusNorm) &&
       !/^(todo el inventario|en el inventario|general|etiquetas)$/i.test(
         String(parsedFocus.label || focusArea || "").trim(),
       );
@@ -874,9 +876,21 @@ function ChatViewer({
     };
     const byEtiqueta = new Map<string, Acc>();
     for (const card of cards) {
-      const etKey = textOf(card.etiqueta).toLowerCase();
+      // Recuperar etiqueta desde text (INV:######) si el payload vino incompleto.
+      const etFromText =
+        String(card.text || "").match(
+          /(?:INV\s*:\s*|etiqueta\s*[:=]\s*)([A-Za-z0-9/_-]{2,})/i,
+        )?.[1] ||
+        String(card.text || "").match(/\b(\d{4,10})\b/)?.[1] ||
+        "";
+      const etKey = (
+        textOf(card.etiqueta) || textOf(etFromText)
+      ).toLowerCase();
       if (!etKey) continue;
-      const item = resolveQrCardItem(card);
+      const item = {
+        ...resolveQrCardItem(card),
+        etiqueta: textOf(card.etiqueta) || etFromText || null,
+      };
       const origen = canonicalizeOrigenLabel(
         textOf(card.origen) || textOf(item.origen),
       );
@@ -935,6 +949,7 @@ function ChatViewer({
     inventory,
     parsedFocus.label,
     focusArea,
+    overview,
   ]);
 
   const listItems: ChatApiItem[] = hasQr

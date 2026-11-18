@@ -180,7 +180,9 @@ export function extractEtiquetaPrefix(raw: string, n: string): string | undefine
     !p ||
     p.length > 6 ||
     DISCOURSE.has(p) ||
-    /^(id|area|activo|codigo|etiqueta|folio|tag|de)$/.test(p)
+    /^(id|area|activo|activa|inactivo|inactiva|codigo|etiqueta|folio|tag|de|otra|otro)$/.test(
+      p,
+    )
   ) {
     return undefined;
   }
@@ -189,6 +191,8 @@ export function extractEtiquetaPrefix(raw: string, n: string): string | undefine
 
 export function extractEtiquetaCandidates(raw: string): string[] {
   const found = new Set<string>();
+  const skipToken =
+    /^(inactivo|inactiva|inactivos|inactivas|activo|activa|activos|activas|otra|otro|otras|otros|alguna|algun|todas|todos)$/i;
   for (const m of String(raw || "").matchAll(
     /\b([A-Za-z]{1,10}[-_/]?[A-Za-z0-9]*\d{2,8}|\d{4,10})\b/g,
   )) {
@@ -197,7 +201,9 @@ export function extractEtiquetaCandidates(raw: string): string[] {
   for (const m of String(raw || "").matchAll(
     /(?:etiqueta|tag|folio|codigo)\s*[:=]?\s*\*{0,2}([A-Za-z0-9/_-]{2,})\*{0,2}/gi,
   )) {
-    found.add(m[1]);
+    const tok = String(m[1] || "").trim();
+    if (!tok || skipToken.test(tok)) continue;
+    found.add(tok);
   }
   return [...found];
 }
@@ -213,9 +219,18 @@ function inferPatches(raw: string, n: string): Array<{ field: string; value: str
     patches.push({ field: "observaciones", value: quoted[0] });
   }
 
-  if (/\b(inactivo|inactiva|dar\s+de\s+baja|dado\s+de\s+baja)\b/.test(n)) {
+  // Consulta/listado (“hay alguna etiqueta inactiva”) ≠ mutar estado.
+  const estadoQueryAsk =
+    /\b(hay|alguna|algun|otra|otras|otro|otros|cuant[oa]s|lista|listar|muestra|mostrar|ver|dame|todas|todos|busca|buscar)\b/.test(
+      n,
+    );
+  if (
+    !estadoQueryAsk &&
+    /\b(inactivo|inactiva|dar\s+de\s+baja|dado\s+de\s+baja)\b/.test(n)
+  ) {
     patches.push({ field: "estado", value: "Inactivo" });
   } else if (
+    !estadoQueryAsk &&
     /\b(activo|activa|reactivar|activar)\b/.test(n) &&
     !/\b(cuantos|cuantas|totales?|salud|porcentaje|ranking)\b/.test(n)
   ) {

@@ -722,7 +722,17 @@ export default function AddProductModal({
 
       const result = await addInventarioBulkAction(parsed.items);
       if (!result.success || !result.data?.length) {
-        setErrorMessage(result.error || "No se pudo importar el archivo.");
+        const rawErr = String(result.error || "").trim();
+        const lowerErr = rawErr.toLowerCase();
+        setErrorMessage(
+          !rawErr
+            ? "No se pudo importar el archivo."
+            : lowerErr.includes("failed to fetch") ||
+                lowerErr.includes("fetch failed") ||
+                lowerErr.includes("network")
+              ? "No se pudo conectar a Supabase al importar el archivo. Revisa internet, que el proyecto no esté pausado, y Frontend-ia/.env.local (URL + anon key). Reinicia npm run dev e inténtalo de nuevo."
+              : rawErr,
+        );
         setIsImporting(false);
         return;
       }
@@ -741,8 +751,11 @@ export default function AddProductModal({
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : "No se pudo leer el archivo.";
       const lower = raw.toLowerCase();
+      // Browser: "Failed to fetch" (no "fetch failed").
       const msg =
-        lower.includes("fetch failed") || lower.includes("network")
+        lower.includes("failed to fetch") ||
+        lower.includes("fetch failed") ||
+        lower.includes("network")
           ? "No se pudo conectar a Supabase al importar el archivo. Revisa internet, que el proyecto no esté pausado, y Frontend-ia/.env.local (URL + anon key). Reinicia npm run dev e inténtalo de nuevo."
           : raw;
       setErrorMessage(msg);

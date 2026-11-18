@@ -2109,9 +2109,18 @@ tbody tr:last-child td {
   font-size: 12px;
 }
 
+.notice-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 620px;
+  width: 100%;
+}
+
 .notice {
   display: flex;
   max-width: 620px;
+  width: 100%;
   align-items: center;
   gap: 14px;
   padding: 23px;
