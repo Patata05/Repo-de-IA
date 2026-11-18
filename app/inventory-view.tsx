@@ -674,7 +674,13 @@ function parseEtiquetaListAsk(userText: string): number | null {
 /** QR del área del hilo: “dame los qr de esta área / sus qr / de aquí”. */
 function looksLikeAreaQrDeixis(userText: string): boolean {
   const n = normalizeChatIntent(userText);
-  if (!n || !userAskedQr(userText)) return false;
+  if (!n) return false;
+  // QR inline (NO userAskedQr): evita ciclo
+  // looksLikeAreaQrDeixis → userAskedQr → parseEtiquetaListAsk →
+  // looksLikeResultAnaphora → looksLikeAreaQrDeixis.
+  if (!(/\bqr\b/.test(n) || /\bcodigos?\s*qr\b/.test(n) || /\bqr\s*codigos?\b/.test(n))) {
+    return false;
+  }
   return (
     /\b(esta|esa|la)\s+areas?\b/.test(n) ||
     /\b(de|del)\s+(esta|esa|la)\s+areas?\b/.test(n) ||
@@ -4258,8 +4264,11 @@ function isPendingDeleteConfirmCue(userText: string): boolean {
 }
 
 function userAskedQr(userText: string): boolean {
-  if (parseEtiquetaListAsk(userText) != null) return false;
   const n = normalizeChatIntent(userText);
+  if (!n) return false;
+  // “dame N etiquetas” (sin QR) ≠ pedido de códigos QR.
+  // Inline (NO parseEtiquetaListAsk): evita el mismo ciclo de stack.
+  if (/\betiquet/.test(n) && !/\bqr\b/.test(n)) return false;
   return (
     /\bqr\b/.test(n) ||
     /\bcodigos?\s*qr\b/.test(n) ||
